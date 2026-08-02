@@ -1,0 +1,126 @@
+{
+  "_comment": "Shape reference AND smoke test for the renderer. Copy this to output/<segment>/concepts.json and replace the contents with real step-3/4 output. Every line here is claim-safe felt-experience language; the one quote is verbatim from the desk-workers evidence file so qa.py's quote check passes.",
+
+  "segment": "desk_workers_posture",
+  "awareness": "problem-aware",
+  "evidence_file": "projects/montisella/evidence/desk_workers_posture.txt",
+
+  "concepts": [
+    {
+      "id": "C01",
+      "angle": "failed-solution: the pillow flattens, so they rebuild it nightly",
+      "style": "educational",
+      "framework": "Pain -> Promise",
+      "template": "double_hook_proof_chip",
+      "format": "4x5",
+      "slots": {
+        "eyebrow": "If you sit at a desk all day",
+        "hook": "Your pillow gave up at 2am.<br><em>Again.</em>",
+        "headline": "One height. All night.",
+        "subhead": "Latex springs back instead of sinking through, so you are not rebuilding it in the dark.",
+        "proof_chip": "Holds its height",
+        "cta": "Find your loft",
+        "image": "plates/C01_pillow_dark.png"
+      }
+    },
+    {
+      "id": "C02",
+      "angle": "failed-solution: stacking and folding is a workaround, not an answer",
+      "style": "comparison",
+      "framework": "Comparison -> Advantage -> CTA",
+      "template": "split_screen_comparison",
+      "format": "4x5",
+      "slots": {
+        "eyebrow": "The 11pm ritual",
+        "hook": "Stacking two pillows is not a fix.<br>It is a workaround.",
+        "left_tag": "What you do now",
+        "left_copy": "Fold one, stack another, wedge a towel under it. Rebuild it every night.",
+        "right_tag": "What this does",
+        "right_copy": "One piece of latex, set to one height, that is still that height in the morning.",
+        "cta": "See the loft guide",
+        "left_image": "plates/C02_stack.png",
+        "right_image": "plates/C02_single.png"
+      }
+    },
+    {
+      "id": "C03",
+      "angle": "pain-led: the day's tightness follows them to bed",
+      "style": "UGC-static",
+      "framework": "Claim -> Proof",
+      "template": "ugc_quote_card",
+      "format": "4x5",
+      "slots": {
+        "eyebrow": "From r/desk life",
+        "hook": "You already know why your shoulders feel like that.",
+        "stars": "★★★★★",
+        "quote": "Chances are, you are tight in your upper back from sitting at a desk all day.",
+        "reviewer_name": "Reddit, r/Posture",
+        "reviewer_meta": "Verbatim from segment evidence",
+        "cta": "Find your loft",
+        "avatar": "plates/C03_avatar.png",
+        "image": "plates/C03_bedroom.png"
+      }
+    },
+    {
+      "id": "C04",
+      "angle": "objection-busting: burned before by foam that softened",
+      "style": "demonstration",
+      "framework": "Objection -> Reframe",
+      "template": "objection_killer_tile",
+      "format": "4x5",
+      "slots": {
+        "hook": "Heard it before?",
+        "objection_label": "What you are thinking",
+        "objection": "“It will feel great for a month, then go flat like the last one.”",
+        "answer_label": "Fair. So here is the deal",
+        "reframe": "Sleep on it for a season, not a fortnight.",
+        "subhead": "Foam softens as it ages. Latex does not. And you get a full season to find out.",
+        "risk_1": "Sleep trial",
+        "risk_2": "Free returns",
+        "risk_3": "Warranty",
+        "cta": "Read the terms",
+        "image": "plates/C04_latex_macro.png"
+      }
+    },
+    {
+      "id": "C05",
+      "angle": "desired-outcome: waking without the morning reset ritual",
+      "style": "story",
+      "framework": "Before -> After",
+      "template": "before_after_night",
+      "format": "4x5",
+      "slots": {
+        "eyebrow": "Same person. Same week.",
+        "hook": "The difference is not your morning.<br>It is your 3am.",
+        "before_stamp": "3:04am",
+        "before_copy": "Awake. Flipping it over. Folding it in half. Trying the other side.",
+        "after_stamp": "6:45am",
+        "after_copy": "Slept through. No stretching it out before you can face the screen.",
+        "cta": "Find your loft",
+        "before_image": "plates/C05_before.png",
+        "after_image": "plates/C05_after.png"
+      }
+    },
+    {
+      "id": "C06",
+      "angle": "mechanism: why it still has its shape in month six",
+      "style": "educational",
+      "framework": "Problem -> Mechanism -> Benefit",
+      "template": "problem_mechanism_benefit",
+      "format": "4x5",
+      "slots": {
+        "eyebrow": "How it holds up",
+        "hook": "Why it is still the same pillow in month six.",
+        "step_1_title": "Foam compresses",
+        "step_1_desc": "It softens as it ages. The height you bought is not the height you keep.",
+        "step_2_title": "Latex rebounds",
+        "step_2_desc": "It pushes back to the same shape every time you move.",
+        "step_3_title": "You stop adjusting",
+        "step_3_desc": "Nothing to stack, fold or replace at the six-month mark.",
+        "proof_chip": "Open-cell latex",
+        "cta": "See the build",
+        "image": "plates/C06_cutaway.png"
+      }
+    }
+  ]
+}

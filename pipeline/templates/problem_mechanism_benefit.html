@@ -1,0 +1,63 @@
+<!-- FRAMEWORK: Problem -> Mechanism -> Benefit.  Educational / feature-breakdown.
+     Three numbered steps beside the product plate. This is the highest overclaim-risk
+     layout: the mechanism slot must describe the FELT mechanism (what it does for
+     how the night feels), never a physiological one. -->
+<style>
+  .ad        { background: var(--c-surface); }
+  .body      { flex: 1 1 auto; display: flex; gap: 40px; padding: 0 var(--l-gutter); }
+  .steps     { flex: 1 1 46%; display: flex; flex-direction: column;
+               justify-content: center; gap: 34px; }
+  .step      { display: flex; gap: 22px; align-items: flex-start; }
+  .step-n    { flex: 0 0 auto; width: 52px; height: 52px; border-radius: 50%;
+               background: var(--c-accent); color: var(--c-paper);
+               font-size: 26px; font-weight: 800;
+               display: flex; align-items: center; justify-content: center; }
+  .step-t    { font-size: 30px; font-weight: 800; line-height: 1.16; margin-bottom: 8px; }
+  .step-d    { font-size: 26px; line-height: 1.34; color: var(--c-ink-soft); }
+  .art       { flex: 1 1 54%; position: relative; border-radius: var(--l-radius);
+               overflow: hidden; background: var(--c-surface-warm); }
+  .steps-box { max-height: 620px; overflow: hidden; }
+  .hook-slot { max-height: 250px; overflow: hidden; }
+  /* No plate: steps take the full width and the art column becomes a chip rail. */
+  .ad--noimg .body  { flex-direction: column; gap: 0; }
+  .ad--noimg .steps { flex: 1 1 auto; max-height: none; }
+  .ad--noimg .art   { flex: 0 0 auto; background: transparent; border-radius: 0;
+                      margin-top: 8px; }
+  .ad--noimg .art .chip { position: static !important; }
+  .ad--noimg .step-t { font-size: 34px; }
+  .ad--noimg .step-d { font-size: 29px; }
+</style>
+
+<div class="ad{{^image}} ad--noimg{{/image}}">
+  <div class="zone-hook stack gap-s">
+    {{#eyebrow}}<div class="eyebrow">{{eyebrow}}</div>{{/eyebrow}}
+    <div class="hook hook-slot" data-slot="hook">{{{hook}}}</div>
+  </div>
+
+  <div class="body">
+    <div class="steps steps-box" data-slot="steps">
+      <div class="step">
+        <div class="step-n">1</div>
+        <div><div class="step-t">{{step_1_title}}</div><div class="step-d">{{step_1_desc}}</div></div>
+      </div>
+      <div class="step">
+        <div class="step-n">2</div>
+        <div><div class="step-t">{{step_2_title}}</div><div class="step-d">{{step_2_desc}}</div></div>
+      </div>
+      <div class="step">
+        <div class="step-n">3</div>
+        <div><div class="step-t">{{step_3_title}}</div><div class="step-d">{{step_3_desc}}</div></div>
+      </div>
+    </div>
+    <div class="art">
+      {{#image}}<img class="plate" src="{{image}}" alt="">{{/image}}
+      {{#proof_chip}}<div class="chip chip--solid" style="position:absolute;left:26px;bottom:26px">{{proof_chip}}</div>{{/proof_chip}}
+    </div>
+  </div>
+
+  <div class="zone-foot">
+    <div class="logo">{{logo_text}}</div>
+    <div class="spacer"></div>
+    <div class="cta cta--accent" data-slot="cta">{{cta}}</div>
+  </div>
+</div>

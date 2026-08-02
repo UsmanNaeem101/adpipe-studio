@@ -1,0 +1,62 @@
+<!-- FRAMEWORK: Before -> After.  Two time-stamped states of the SAME felt experience
+     (last night vs this morning). Deliberately not a body/posture before-after:
+     that reads as a medical transformation claim. Keep both states subjective. -->
+<style>
+  .ad        { background: var(--c-ink); }
+  .strip     { display: flex; flex: 1 1 auto; }
+  .state     { flex: 1 1 50%; position: relative; display: flex; flex-direction: column;
+               justify-content: flex-end; overflow: hidden; }
+  .state img { position: absolute; inset: 0; width: 100%; height: 100%;
+               object-fit: cover; }
+  .state .scrim { z-index: 1; }
+  .state-body{ position: relative; z-index: 2; padding: 40px 38px; }
+  .stamp     { display: inline-block; padding: 12px 22px; border-radius: var(--l-radius-pill);
+               font-size: 23px; font-weight: 800; letter-spacing: var(--t-tracking-wide);
+               text-transform: uppercase; margin-bottom: 18px; }
+  .stamp--a  { background: var(--c-signal); color: var(--c-paper); }
+  .stamp--b  { background: var(--c-accent); color: var(--c-paper); }
+  .state-copy{ font-size: 34px; line-height: 1.24; font-weight: 700; color: var(--c-paper);
+               max-height: 200px; overflow: hidden; text-wrap: pretty; }
+  .zone-hook { background: transparent; }
+  .hook      { color: var(--c-paper); }
+  .hook-slot { max-height: 250px; overflow: hidden; }
+  /* No plate: give each state its own field so the split still reads. */
+  .state--noimg              { background: #1B1E24; }
+  .state--noimg + .state--noimg { background: #14312A; }
+  .ad--noimg .state-body     { padding: 56px 44px; }
+  .ad--noimg .state-copy     { font-size: 40px; max-height: 380px; }
+  .zone-foot { border-top: var(--l-hairline-width) solid rgba(255,255,255,0.16); }
+  .logo      { color: var(--c-paper); }
+</style>
+
+<div class="ad{{^before_image}} ad--noimg{{/before_image}}">
+  <div class="zone-hook stack gap-s">
+    {{#eyebrow}}<div class="eyebrow">{{eyebrow}}</div>{{/eyebrow}}
+    <div class="hook hook-slot" data-slot="hook">{{{hook}}}</div>
+  </div>
+
+  <div class="strip">
+    <div class="state{{^before_image}} state--noimg{{/before_image}}">
+      {{#before_image}}<img src="{{before_image}}" alt="">{{/before_image}}
+      <div class="scrim"></div>
+      <div class="state-body">
+        <div class="stamp stamp--a">{{before_stamp}}</div>
+        <div class="state-copy" data-slot="before_copy">{{{before_copy}}}</div>
+      </div>
+    </div>
+    <div class="state{{^after_image}} state--noimg{{/after_image}}">
+      {{#after_image}}<img src="{{after_image}}" alt="">{{/after_image}}
+      <div class="scrim"></div>
+      <div class="state-body">
+        <div class="stamp stamp--b">{{after_stamp}}</div>
+        <div class="state-copy" data-slot="after_copy">{{{after_copy}}}</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="zone-foot">
+    <div class="logo">{{logo_text}}</div>
+    <div class="spacer"></div>
+    <div class="cta cta--accent" data-slot="cta">{{cta}}</div>
+  </div>
+</div>

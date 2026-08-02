@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "adpipe-studio",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["pipeline/app.py"],
+      "port": 8765,
+      "env": {
+        "STUDIO_NO_BROWSER": "1"
+      }
+    }
+  ]
+}

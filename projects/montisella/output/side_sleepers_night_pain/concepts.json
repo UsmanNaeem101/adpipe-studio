@@ -1,0 +1,234 @@
+{
+  "_comment": "RAMP step 3-5. 10 concepts across the 5 angles. No numbers anywhere: facts.json is empty, so nothing is substantiated yet. Vocabulary is theirs (firm/soft/flat/height) - never 'loft', which appears twice in 636 items.",
+
+  "segment": "side_sleepers_night_pain",
+  "awareness": "problem-aware",
+  "evidence_file": "projects/montisella/evidence/side_sleepers_night_pain.txt",
+
+  "concepts": [
+    {
+      "id": "C01",
+      "angle": "A2 failed-solution: wrong height, not bad brand",
+      "style": "comparison",
+      "framework": "Comparison -> Advantage -> CTA",
+      "template": "split_screen_comparison",
+      "format": "4x5",
+      "hooks": [
+        "You didn't buy bad pillows. You bought the wrong height.",
+        "Three pillows in. Still waking up sore.",
+        "The pillow wasn't the problem. The height was."
+      ],
+      "slots": {
+        "eyebrow": "If you've bought more than one",
+        "hook": "You didn't buy bad pillows.<br>You bought the wrong <em>height</em>.",
+        "left_tag": "What you shopped on",
+        "left_copy": "Soft or firm. Then hope. Then another one in six months.",
+        "right_tag": "What actually decides it",
+        "right_copy": "How far your shoulder holds your head off the mattress.",
+        "cta": "Which height are you?"
+      }
+    },
+    {
+      "id": "C02",
+      "angle": "A2 failed-solution: wrong height, not bad brand",
+      "style": "educational",
+      "framework": "Mistake -> Fix",
+      "template": "double_hook_proof_chip",
+      "format": "4x5",
+      "hooks": [
+        "Too low squishes your shoulder. Too high bends your neck.",
+        "There is a right height. It's yours, not ours.",
+        "Both ways of getting it wrong feel like a bad pillow."
+      ],
+      "slots": {
+        "eyebrow": "Side sleepers",
+        "hook": "Too low squishes your shoulder.<br>Too high bends your <em>neck</em>.",
+        "headline": "There is a height between those.",
+        "subhead": "It's set by your shoulder, not by how the pillow feels in the shop.",
+        "proof_chip": "Pick before you buy",
+        "cta": "Find your height"
+      }
+    },
+    {
+      "id": "C03",
+      "angle": "A1 pain-led: the night decided the morning",
+      "style": "educational",
+      "framework": "Pain -> Promise",
+      "template": "double_hook_proof_chip",
+      "format": "4x5",
+      "hooks": [
+        "The sore shoulder was decided at midnight.",
+        "You didn't sleep wrong. You slept at the wrong height.",
+        "Seven hours is a long time to hold your neck at an angle."
+      ],
+      "slots": {
+        "eyebrow": "Side sleepers",
+        "hook": "The sore shoulder was decided at <em>midnight</em>.",
+        "headline": "Not by how you slept. By how high.",
+        "subhead": "Seven hours at the wrong height, then a morning spent working it out.",
+        "proof_chip": "Height, not firmness",
+        "cta": "Which height are you?"
+      }
+    },
+    {
+      "id": "C04",
+      "angle": "A1 pain-led: the night decided the morning",
+      "style": "story",
+      "framework": "Before -> After",
+      "template": "before_after_night",
+      "format": "4x5",
+      "hooks": [
+        "The morning starts the night before.",
+        "Same bed. Same person. Different height.",
+        "One of these mornings takes twenty minutes to get going."
+      ],
+      "slots": {
+        "eyebrow": "Same bed. Different height.",
+        "hook": "The morning starts the <em>night before</em>.",
+        "before_stamp": "Wrong height",
+        "before_copy": "Wake up stiff. Roll the shoulder. Wait for it to loosen off.",
+        "after_stamp": "Right height",
+        "after_copy": "Wake up and get up.",
+        "cta": "Find your height"
+      }
+    },
+    {
+      "id": "C05",
+      "angle": "A4 mechanism: your shoulder sets the height",
+      "style": "educational",
+      "framework": "Problem -> Mechanism -> Benefit",
+      "template": "problem_mechanism_benefit",
+      "format": "4x5",
+      "hooks": [
+        "Soft or firm is the wrong question.",
+        "Your shoulder already decided this.",
+        "Everyone shops on feel. Feel isn't the variable."
+      ],
+      "slots": {
+        "eyebrow": "Why height, not firmness",
+        "hook": "Soft or firm is the <em>wrong question</em>.",
+        "step_1_title": "Your shoulder sets the gap",
+        "step_1_desc": "On your side, your head sits as far off the mattress as your shoulder is wide.",
+        "step_2_title": "The pillow fills it or it doesn't",
+        "step_2_desc": "Too little and your head drops. Too much and your neck bends the other way.",
+        "step_3_title": "Firmness is a separate question",
+        "step_3_desc": "A soft one at the right height beats a firm one at the wrong height.",
+        "proof_chip": "Matched, not guessed",
+        "cta": "Which height are you?"
+      }
+    },
+    {
+      "id": "C06",
+      "angle": "A4 mechanism: the height only counts if it holds",
+      "style": "demonstration",
+      "framework": "Problem -> Mechanism -> Benefit",
+      "template": "problem_mechanism_benefit",
+      "format": "4x5",
+      "hooks": [
+        "The height only counts if it stays.",
+        "Every pillow is the right height for a while.",
+        "You didn't buy a flat pillow. It became one."
+      ],
+      "slots": {
+        "eyebrow": "Month one and month twelve",
+        "hook": "The height only counts if it <em>stays</em>.",
+        "step_1_title": "Foam softens as it ages",
+        "step_1_desc": "The height you chose is not the height you keep.",
+        "step_2_title": "Latex springs back",
+        "step_2_desc": "It returns to the same shape every time you move off it.",
+        "step_3_title": "So the fit holds",
+        "step_3_desc": "Nothing to top up, fold under, or replace once it settles.",
+        "proof_chip": "Open-cell latex",
+        "cta": "See how it's built"
+      }
+    },
+    {
+      "id": "C07",
+      "angle": "A5 objection-busting: don't buy to find out",
+      "style": "demonstration",
+      "framework": "Objection -> Reframe",
+      "template": "objection_killer_tile",
+      "format": "4x5",
+      "hooks": [
+        "Fair question.",
+        "You shouldn't have to buy it to find out.",
+        "Everyone says 'give it two weeks'. You've done that already."
+      ],
+      "slots": {
+        "hook": "Fair question.",
+        "objection_label": "What you're thinking",
+        "objection": "“I won't know if it suits me until I've slept on it for weeks.”",
+        "answer_label": "So don't guess",
+        "reframe": "Pick by your shoulder, before you spend.",
+        "subhead": "Height is a measurement, not a feeling. You can check it against yourself first.",
+        "risk_1": "Fit guide first",
+        "cta": "Check the fit guide"
+      }
+    },
+    {
+      "id": "C08",
+      "angle": "A5 objection-busting: measure instead of guessing",
+      "style": "comparison",
+      "framework": "Comparison -> Advantage -> CTA",
+      "template": "split_screen_comparison",
+      "format": "4x5",
+      "hooks": [
+        "Two ways to choose a pillow.",
+        "One of these you've already tried.",
+        "Guessing has a cost. You've paid it a few times."
+      ],
+      "slots": {
+        "eyebrow": "Before you buy another one",
+        "hook": "Two ways to choose a pillow.",
+        "left_tag": "Guess",
+        "left_copy": "Read the reviews. Pick soft or firm. Sleep on it a month. Find out.",
+        "right_tag": "Measure",
+        "right_copy": "Check your own shoulder. Match the height. Know before it ships.",
+        "cta": "Which height are you?"
+      }
+    },
+    {
+      "id": "C09",
+      "angle": "A3 desired-outcome: a night you sleep through",
+      "style": "story",
+      "framework": "Before -> After",
+      "template": "before_after_night",
+      "format": "4x5",
+      "hooks": [
+        "Straight through, or four times over.",
+        "How many times did you rearrange it last night?",
+        "The pillow you fix all night isn't working."
+      ],
+      "slots": {
+        "eyebrow": "A night, either way",
+        "hook": "Straight through, or <em>four times over</em>.",
+        "before_stamp": "Wrong height",
+        "before_copy": "Roll over. Rearrange it. Fold it under. Try the other side. Again.",
+        "after_stamp": "Right height",
+        "after_copy": "Roll over. Stay asleep.",
+        "cta": "Find your height"
+      }
+    },
+    {
+      "id": "C10",
+      "angle": "A3 desired-outcome, entered through their own words",
+      "style": "UGC-static",
+      "framework": "Claim -> Proof",
+      "template": "ugc_quote_card",
+      "format": "4x5",
+      "hooks": [
+        "This is the whole problem, in one sentence.",
+        "Somebody else wrote this before we did.",
+        "If you've thought this, the ad is for you."
+      ],
+      "slots": {
+        "eyebrow": "How side sleepers describe it",
+        "hook": "The whole problem, in one sentence.",
+        "quote": "If it’s too low I squish my shoulder and if it’s too high my neck will hurt.",
+        "reviewer_name": "Posted publicly, not by us",
+        "reviewer_meta": "Verbatim — we didn’t write it and we didn’t pay for it",
+        "cta": "Which height are you?"
+      }
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+<!-- FRAMEWORK: Story / UGC-static.  Reads as a screenshot-ish quote card rather than
+     a brand ad. Use for the desired-outcome angle in the customer's own words.
+     The quote slot must hold a REAL review or a clearly-labelled VOC phrase -
+     never a fabricated testimonial. -->
+<style>
+  .card       { margin: 0 var(--l-gutter); background: var(--c-paper);
+                border: var(--l-hairline-width) solid var(--c-hairline);
+                border-radius: var(--l-radius); padding: 46px 44px;
+                box-shadow: 0 18px 48px rgba(20,22,26,0.10); }
+  .quote      { font-size: 42px; line-height: 1.26; font-weight: 700;
+                letter-spacing: -0.015em; max-height: 340px; overflow: hidden;
+                text-wrap: pretty; }
+  .stars      { color: var(--c-signal); font-size: 32px; letter-spacing: 4px; }
+  .who        { display: flex; align-items: center; gap: 18px; margin-top: 30px; }
+  .avatar     { width: 62px; height: 62px; border-radius: 50%; object-fit: cover;
+                background: var(--c-surface-warm); flex: 0 0 auto; }
+  .who-name   { font-size: 26px; font-weight: 800; }
+  .who-meta   { font-size: 23px; color: var(--c-ink-soft); }
+  /* The card must sit ABOVE the hero plate, not be overlapped by it. */
+  .card       { position: relative; z-index: 2; margin-bottom: 34px; }
+  .zone-hero  { z-index: 1; }
+  /* Three lines of hook at 78px. Keep hooks to 2-3 lines on this layout - the
+     quote is the star here, the hook is the setup. */
+  .hook-slot  { max-height: 250px; overflow: hidden; }
+  .ad         { background: var(--c-surface); }
+  /* No plate: the quote card IS the hero. */
+  .ad--noimg .zone-hero { flex: 0 0 auto; height: 0; }
+  .ad--noimg .card      { margin-top: auto; margin-bottom: auto; padding: 60px 52px; }
+  .ad--noimg .quote     { font-size: 50px; max-height: 460px; }
+</style>
+
+<div class="ad{{^image}} ad--noimg{{/image}}">
+  <div class="zone-hook stack gap-s">
+    {{#eyebrow}}<div class="eyebrow">{{eyebrow}}</div>{{/eyebrow}}
+    <div class="hook hook-slot" data-slot="hook">{{{hook}}}</div>
+  </div>
+
+  <div class="card">
+    {{#stars}}<div class="stars">{{stars}}</div>{{/stars}}
+    <div class="quote" data-slot="quote">{{{quote}}}</div>
+    <div class="who">
+      <!-- An <img> with an empty src renders a broken-image icon, so only emit
+           the tag when there's actually an avatar; otherwise a plain disc. -->
+      {{#avatar}}<img class="avatar" src="{{avatar}}" alt="">{{/avatar}}
+      {{^avatar}}<div class="avatar"></div>{{/avatar}}
+      <div>
+        <div class="who-name">{{reviewer_name}}</div>
+        <div class="who-meta">{{reviewer_meta}}</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="zone-hero">
+    <div class="plate-wrap">{{#image}}<img class="plate" src="{{image}}" alt="">{{/image}}</div>
+  </div>
+
+  <div class="zone-foot">
+    <div class="logo">{{logo_text}}</div>
+    <div class="spacer"></div>
+    <div class="cta cta--accent" data-slot="cta">{{cta}}</div>
+  </div>
+</div>

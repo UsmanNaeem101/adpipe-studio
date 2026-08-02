@@ -1,0 +1,123 @@
+/* Shared layout grammar for every Montisella static ad template.
+   Zones are consistent across layouts: HOOK -> HERO -> PROOF -> CTA.
+   Templates position these zones differently; they never restyle the brand. */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: var(--w); height: var(--h);
+  font-family: var(--t-body-stack);
+  color: var(--c-ink);
+  background: var(--c-paper);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.ad {
+  position: relative;
+  width: var(--w); height: var(--h);
+  overflow: hidden;
+  display: flex; flex-direction: column;
+}
+
+/* ---- zones ---------------------------------------------------------- */
+
+.zone-hook {
+  padding: calc(var(--l-gutter) * 0.9) var(--l-gutter) calc(var(--l-gutter) * 0.5);
+}
+
+.zone-hero { position: relative; flex: 1 1 auto; overflow: hidden; }
+
+.zone-foot {
+  padding: calc(var(--l-gutter) * 0.55) var(--l-gutter) calc(var(--l-gutter) * 0.8);
+  display: flex; align-items: center; gap: 24px;
+}
+
+/* ---- type ------------------------------------------------------------ */
+
+.hook {
+  font-family: var(--t-display-stack);
+  font-weight: var(--t-hook-weight);
+  font-size: 78px; line-height: 1.02;
+  letter-spacing: var(--t-tracking-tight);
+  text-wrap: balance;
+}
+.hook em { font-style: normal; color: var(--c-accent); }
+.hook mark { background: var(--c-signal); color: var(--c-paper); padding: 0 .12em; }
+
+.headline {
+  font-family: var(--t-display-stack);
+  font-weight: var(--t-headline-weight);
+  font-size: 58px; line-height: 1.06;
+  letter-spacing: var(--t-tracking-tight);
+  text-wrap: balance;
+}
+
+.subhead {
+  font-size: 33px; line-height: 1.34;
+  font-weight: var(--t-body-weight);
+  color: var(--c-ink-soft);
+  max-width: 24ch;
+  text-wrap: pretty;
+}
+
+.eyebrow {
+  font-size: 22px; font-weight: 700;
+  letter-spacing: var(--t-tracking-wide);
+  text-transform: uppercase;
+  color: var(--c-accent);
+}
+
+.kicker { font-size: 26px; font-weight: 700; color: var(--c-ink-soft); }
+
+/* ---- components ------------------------------------------------------ */
+
+.chip {
+  display: inline-flex; align-items: center; gap: 12px;
+  padding: 16px 28px;
+  border-radius: var(--l-radius-pill);
+  background: var(--c-accent-soft);
+  color: var(--c-accent);
+  font-size: 26px; font-weight: 700;
+  line-height: 1;
+}
+.chip--solid { background: var(--c-accent); color: var(--c-paper); }
+.chip--warn  { background: var(--c-signal); color: var(--c-paper); }
+
+.cta {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 26px 46px;
+  border-radius: var(--l-radius-pill);
+  background: var(--c-ink); color: var(--c-paper);
+  font-size: 30px; font-weight: 800;
+  letter-spacing: -0.01em; line-height: 1;
+  white-space: nowrap;
+}
+.cta--accent { background: var(--c-accent); }
+
+.logo {
+  font-family: var(--t-display-stack);
+  font-weight: 800; font-size: 24px;
+  letter-spacing: var(--t-tracking-wide);
+  color: var(--c-ink);
+}
+
+.plate { width: 100%; height: 100%; object-fit: cover; display: block; }
+.plate-wrap { position: absolute; inset: 0; background: var(--c-surface); }
+
+.scrim {
+  position: absolute; inset: 0;
+  background: linear-gradient(180deg, transparent 34%, var(--c-overlay-scrim) 100%);
+}
+
+.rule { height: var(--l-hairline-width); background: var(--c-hairline); border: 0; }
+
+.stack { display: flex; flex-direction: column; }
+.gap-s  { gap: 16px; }  .gap-m { gap: 26px; }  .gap-l { gap: 40px; }
+.spacer { flex: 1 1 auto; }
+.on-dark { color: var(--c-paper); }
+.on-dark .subhead { color: rgba(255,255,255,0.86); }
+
+/* Overflow probe writes here; render.py reads it and fails the build on a
+   clipped hook. Never visible in the screenshot pass. */
+#__overflow__ { position: fixed; left: -99999px; top: -99999px; }

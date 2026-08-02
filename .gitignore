@@ -1,0 +1,35 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets — keys are typed into the studio UI and held in memory, never written
+# here. Belt-and-braces in case anyone adds a dotenv later.
+.env
+*.key
+
+# Derived / regenerable: reference thumbnails + the dimension cache.
+# NB: git has no inline comments in .gitignore — a trailing "# ..." becomes part
+# of the pattern and silently matches nothing. Keep comments on their own line.
+.cache/
+
+# Reference layout library: ~118MB of saved competitor creative. It's the user's
+# private swipe file, not source — kept on disk, out of the repo. .gitkeep below
+# preserves the folder so the studio's Library tab and the Remix picker still work
+# on a fresh clone (empty until you drop images back in).
+references/*
+!references/.gitkeep
+!references/README.md
+
+# Safety nets, not source. Restorable by moving files back.
+projects/_deleted/
+
+# Uploaded raw VOC dumps — tens of MB per file, and an input rather than code.
+projects/*/voc/raw/
+
+# Segment evidence: real scraped customer comments with source URLs. Same
+# category as voc/raw — an input/output of a run, not something to version.
+projects/*/evidence/
+
+# macOS
+.DS_Store

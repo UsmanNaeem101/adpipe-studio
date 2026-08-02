@@ -1,0 +1,42 @@
+{
+  "_comment": "Montisella brand tokens. These are the ONLY place brand styling is defined; every template reads them as CSS custom properties. Values marked NEEDS INPUT are neutral placeholders - replace with the real brand kit before launch.",
+
+  "brand_name": "Montisella",
+  "logo_text": "MONTISELLA",
+
+  "color": {
+    "ink": "#14161A",
+    "ink_soft": "#4A5058",
+    "paper": "#FFFFFF",
+    "surface": "#F4F2EE",
+    "surface_warm": "#EDE7DE",
+    "accent": "#1F6F5C",
+    "accent_soft": "#DCEBE5",
+    "signal": "#C4553B",
+    "hairline": "#DFDAD2",
+    "overlay_scrim": "rgba(12,14,18,0.55)"
+  },
+
+  "type": {
+    "display_stack": "\"Helvetica Neue\", \"Inter\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", Arial, sans-serif",
+    "body_stack": "\"Helvetica Neue\", \"Inter\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", Arial, sans-serif",
+    "hook_weight": 800,
+    "headline_weight": 800,
+    "body_weight": 500,
+    "tracking_tight": "-0.02em",
+    "tracking_wide": "0.08em"
+  },
+
+  "layout": {
+    "radius": "18px",
+    "radius_pill": "999px",
+    "gutter": "64px",
+    "hairline_width": "1.5px"
+  },
+
+  "formats": {
+    "4x5":  { "w": 1080, "h": 1350, "_note": "Meta feed primary - default" },
+    "1x1":  { "w": 1080, "h": 1080, "_note": "feed square" },
+    "9x16": { "w": 1080, "h": 1920, "_note": "stories / reels static" }
+  }
+}

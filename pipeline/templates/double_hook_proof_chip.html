@@ -1,0 +1,51 @@
+<!-- FRAMEWORK: Pain -> Promise.  Hook zone on top, hero plate centre, proof chip
+     overlaid on the plate, promise + CTA in the foot. The workhorse layout: use
+     when the angle is pain-led and the proof is a single hard fact. -->
+<style>
+  .zone-hook   { background: var(--c-surface); }
+  .hook-slot   { max-height: 250px; overflow: hidden; }
+  .chip-float  { position: absolute; left: var(--l-gutter); bottom: 36px; }
+  .foot-slot   { max-height: 250px; overflow: hidden; }
+  /* No plate: drop the empty hero and let the type carry the frame. The proof
+     chip moves inline with the hook so it doesn't vanish with the image. */
+  .ad--noimg .zone-hero { flex: 0 0 auto; height: 0; }
+  .ad--noimg .zone-hook { flex: 1 1 auto; display: flex; flex-direction: column;
+                          justify-content: center; }
+  .ad--noimg .hook      { font-size: 96px; }
+  .ad--noimg .hook-slot { max-height: 620px; }
+  .ad--noimg .chip-inline { margin-top: 30px; }
+  /* With no hero the foot carries headline + subhead together; 250px only fits
+     the headline. */
+  .ad--noimg .foot-slot { max-height: 340px; }
+  .ad--noimg .zone-foot { align-items: flex-end; padding-bottom: calc(var(--l-gutter) * 0.9); }
+  .foot-copy   { flex: 1 1 auto; min-width: 0; }
+</style>
+
+<div class="ad{{^image}} ad--noimg{{/image}}">
+  <div class="zone-hook stack gap-s">
+    {{#eyebrow}}<div class="eyebrow">{{eyebrow}}</div>{{/eyebrow}}
+    <div class="hook hook-slot" data-slot="hook">{{{hook}}}</div>
+    {{^image}}{{#proof_chip}}<div class="chip chip--solid chip-inline"
+      style="align-self:flex-start">{{proof_chip}}</div>{{/proof_chip}}{{/image}}
+  </div>
+
+  <div class="zone-hero">
+    <div class="plate-wrap">
+      {{#image}}<img class="plate" src="{{image}}" alt="">{{/image}}
+    </div>
+    {{#proof_chip}}
+      <div class="chip chip--solid chip-float" data-slot="proof_chip">{{proof_chip}}</div>
+    {{/proof_chip}}
+  </div>
+
+  <div class="zone-foot">
+    <div class="foot-copy stack gap-s foot-slot" data-slot="foot">
+      <div class="headline">{{{headline}}}</div>
+      {{#subhead}}<div class="subhead">{{subhead}}</div>{{/subhead}}
+    </div>
+    <div class="stack gap-s" style="align-items:flex-end">
+      <div class="cta cta--accent" data-slot="cta">{{cta}}</div>
+      <div class="logo">{{logo_text}}</div>
+    </div>
+  </div>
+</div>

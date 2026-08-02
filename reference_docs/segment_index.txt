@@ -1,0 +1,72 @@
+UPPER BACK / SHOULDER VOC — PRIMARY SEGMENT INDEX
+================================================================
+
+Method:
+- Every retained post body/comment/reply is assigned to one primary segment only.
+- Secondary attributes do not create duplicate segment evidence.
+- Exact duplicate texts are removed before assignment.
+- Low-information replies are excluded from segment reports.
+
+Raw scraped blocks: 2,944
+Parsed candidate items: 19,431
+Unique parsed items: 19,187
+High-value assigned evidence items: 4,193
+Low-information assigned items excluded: 2,030
+Unassigned / insufficient segment evidence: 12,964
+
+VALIDATED SEGMENTS
+----------------------------------------------------------------
+1. People with rotator-cuff, impingement or injury-related shoulder pain
+   Evidence items: 1,198
+   Top pain points: limited movement (124), tightness or knots (97), shoulder pain (80), weakness (64), numbness or tingling (43), clicking or popping (30)
+   File: 01_rotator_cuff_injury.txt
+
+2. Side sleepers with night and morning shoulder pain
+   Evidence items: 636
+   Top pain points: tightness or knots (63), sleep disruption (47), shoulder pain (40), numbness or tingling (39), neck pain (34), morning pain (26)
+   File: 02_side_sleepers_night_pain.txt
+
+3. Hypermobile people with shoulder instability or subluxation
+   Evidence items: 572
+   Top pain points: tightness or knots (65), headaches or migraines (34), weakness (33), numbness or tingling (21), neck pain (20), shoulder pain (19)
+   File: 03_hypermobility_instability.txt
+
+4. Athletes and active people with sport-specific shoulder pain
+   Evidence items: 516
+   Top pain points: tightness or knots (68), shoulder pain (34), weakness (25), numbness or tingling (20), limited movement (14), stiffness (12)
+   File: 04_sports_active.txt
+
+5. Gym-goers and weightlifters whose pain disrupts training
+   Evidence items: 406
+   Top pain points: pain during exercise (108), limited movement (96), tightness or knots (67), weakness (55), shoulder pain (40), numbness or tingling (19)
+   File: 05_gym_lifters.txt
+
+6. People with chronic spinal, arthritic or inflammatory upper-back pain
+   Evidence items: 399
+   Top pain points: tightness or knots (64), numbness or tingling (29), shoulder pain (27), upper-back pain (23), stiffness (23), weakness (22)
+   File: 06_spinal_inflammatory_chronic.txt
+
+7. People managing shoulder or neck pain after surgery
+   Evidence items: 236
+   Top pain points: shoulder pain (16), numbness or tingling (11), tightness or knots (10), limited movement (10), weakness (9), burning (6)
+   File: 07_post_surgery_recovery.txt
+
+8. Desk workers and screen users with posture-related pain
+   Evidence items: 154
+   Top pain points: tightness or knots (43), weakness (20), shoulder pain (10), neck pain (9), numbness or tingling (8), pain after sitting (5)
+   File: 08_desk_workers_posture.txt
+
+9. Women with bra, strap or large-bust related neck and shoulder pain
+   Evidence items: 38
+   Top pain points: tightness or knots (5), neck pain (3), shoulder pain (2), numbness or tingling (2), headaches or migraines (1), stiffness (1)
+   File: 09_bra_large_bust.txt
+
+10. People with unexplained pain seeking a diagnosis after failed care
+   Evidence items: 28
+   Top pain points: tightness or knots (3), radiating pain (1), numbness or tingling (1)
+   File: 10_diagnosis_seekers.txt
+
+11. Parents and caregivers strained by carrying, feeding or lifting
+   Evidence items: 10
+   Top pain points: tightness or knots (4), numbness or tingling (1)
+   File: 11_parents_caregivers.txt

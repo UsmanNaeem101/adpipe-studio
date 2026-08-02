@@ -1,0 +1,58 @@
+<!-- FRAMEWORK: Comparison -> Advantage -> CTA.  Two stacked panels, left/right split.
+     Use for the failed-solution angle: what they've tried vs what this does.
+     Compare against a CATEGORY ("most foam pillows"), never a named brand. -->
+<style>
+  .split      { display: flex; flex: 1 1 auto; }
+  .panel      { flex: 1 1 50%; position: relative; display: flex; flex-direction: column; }
+  .panel--old { background: var(--c-surface-warm); }
+  .panel--new { background: var(--c-accent-soft); }
+  .panel-tag  { padding: 30px var(--l-gutter) 0; font-size: 25px; font-weight: 800;
+                letter-spacing: var(--t-tracking-wide); text-transform: uppercase; }
+  .panel--old .panel-tag { color: var(--c-signal); }
+  .panel--new .panel-tag { color: var(--c-accent); }
+  .panel-copy { padding: 18px 40px 34px; font-size: 31px; line-height: 1.3;
+                font-weight: 600; max-height: 250px; overflow: hidden; }
+  .panel-img  { flex: 1 1 auto; position: relative; overflow: hidden; }
+  .divider    { width: 3px; background: var(--c-paper); }
+  /* 3 lines of hook at 78px/1.02 = 239px. Slot heights must clear whole lines or
+     descenders get sliced just under the clipping tolerance. */
+  .hook-slot  { max-height: 250px; overflow: hidden; }
+
+  /* No plate: the panels become the composition rather than a frame around a
+     void. Copy centres, type goes up, and the ad reads as a deliberate
+     colour-block comparison instead of an unfinished one. */
+  .panel--noimg .panel-tag  { padding-top: 44px; }
+  .panel--noimg .panel-copy { font-size: 38px; line-height: 1.26; max-height: 420px;
+                              padding-bottom: 52px; }
+  .panel--noimg .panel-img  { display: none; }
+  /* Let the panels fill the frame rather than floating as a centred band — with
+     no photography the two colour fields ARE the visual, and a full-bleed split
+     reads as deliberate colour blocking instead of a gap in the layout. */
+</style>
+
+<div class="ad">
+  <div class="zone-hook stack gap-s">
+    {{#eyebrow}}<div class="eyebrow">{{eyebrow}}</div>{{/eyebrow}}
+    <div class="hook hook-slot" data-slot="hook">{{{hook}}}</div>
+  </div>
+
+  <div class="split">
+    <div class="panel panel--old{{^left_image}} panel--noimg{{/left_image}}">
+      <div class="panel-tag">{{left_tag}}</div>
+      <div class="panel-copy" data-slot="left_copy">{{{left_copy}}}</div>
+      <div class="panel-img">{{#left_image}}<img class="plate" src="{{left_image}}" alt="">{{/left_image}}</div>
+    </div>
+    <div class="divider"></div>
+    <div class="panel panel--new{{^right_image}} panel--noimg{{/right_image}}">
+      <div class="panel-tag">{{right_tag}}</div>
+      <div class="panel-copy" data-slot="right_copy">{{{right_copy}}}</div>
+      <div class="panel-img">{{#right_image}}<img class="plate" src="{{right_image}}" alt="">{{/right_image}}</div>
+    </div>
+  </div>
+
+  <div class="zone-foot">
+    <div class="logo">{{logo_text}}</div>
+    <div class="spacer"></div>
+    <div class="cta" data-slot="cta">{{cta}}</div>
+  </div>
+</div>

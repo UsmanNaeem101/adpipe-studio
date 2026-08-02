@@ -1,0 +1,62 @@
+<!-- FRAMEWORK: Objection -> Reframe.  A stated doubt on top, the answer underneath,
+     backed by a risk-reversal strip. Use when the primary buying barrier (skill 27)
+     is a trust/risk barrier rather than a pain barrier.
+     If the reframe can only be written as a medical claim, the ANGLE is wrong. -->
+<style>
+  .ad          { background: var(--c-paper); }
+  .obj         { margin: 0 var(--l-gutter); padding: 34px 38px;
+                 background: var(--c-surface-warm); border-radius: var(--l-radius);
+                 border-left: 8px solid var(--c-signal); }
+  .obj-label   { font-size: 22px; font-weight: 800; letter-spacing: var(--t-tracking-wide);
+                 text-transform: uppercase; color: var(--c-signal); margin-bottom: 12px; }
+  .obj-text    { font-size: 38px; line-height: 1.22; font-weight: 700;
+                 max-height: 160px; overflow: hidden; }
+  .answer      { margin: 34px var(--l-gutter) 0; }
+  .answer-label{ font-size: 22px; font-weight: 800; letter-spacing: var(--t-tracking-wide);
+                 text-transform: uppercase; color: var(--c-accent); margin-bottom: 14px; }
+  .reassure    { max-height: 320px; overflow: hidden; }
+  .riskbar     { display: flex; gap: 14px; flex-wrap: wrap;
+                 padding: 26px var(--l-gutter) 0; }
+  .zone-hero   { margin-top: 30px; }
+  .hook-slot   { max-height: 190px; overflow: hidden; }
+  .ad--noimg .zone-hero { flex: 0 0 auto; height: 0; }
+  .ad--noimg .obj       { margin-top: 10px; }
+  .ad--noimg .answer    { margin-top: 46px; }
+  .ad--noimg .reassure  { max-height: 400px; }
+  .ad--noimg .riskbar   { padding-top: 40px; }
+</style>
+
+<div class="ad{{^image}} ad--noimg{{/image}}">
+  <div class="zone-hook stack gap-s">
+    <div class="hook hook-slot" data-slot="hook">{{{hook}}}</div>
+  </div>
+
+  <div class="obj">
+    <div class="obj-label">{{objection_label}}</div>
+    <div class="obj-text" data-slot="objection">{{{objection}}}</div>
+  </div>
+
+  <div class="answer">
+    <div class="answer-label">{{answer_label}}</div>
+    <div class="stack gap-s reassure" data-slot="reframe">
+      <div class="headline">{{{reframe}}}</div>
+      {{#subhead}}<div class="subhead">{{subhead}}</div>{{/subhead}}
+    </div>
+  </div>
+
+  <div class="riskbar">
+    {{#risk_1}}<div class="chip">{{risk_1}}</div>{{/risk_1}}
+    {{#risk_2}}<div class="chip">{{risk_2}}</div>{{/risk_2}}
+    {{#risk_3}}<div class="chip">{{risk_3}}</div>{{/risk_3}}
+  </div>
+
+  <div class="zone-hero">
+    <div class="plate-wrap">{{#image}}<img class="plate" src="{{image}}" alt="">{{/image}}</div>
+  </div>
+
+  <div class="zone-foot">
+    <div class="logo">{{logo_text}}</div>
+    <div class="spacer"></div>
+    <div class="cta" data-slot="cta">{{cta}}</div>
+  </div>
+</div>
