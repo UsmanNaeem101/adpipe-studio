@@ -35,6 +35,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 import remix  # noqa: E402
 import exifstrip  # noqa: E402
+import presets  # noqa: E402
 
 REFS = os.path.join(ROOT, "references")
 PORT = int(os.environ.get("STUDIO_PORT", "8765"))
@@ -627,7 +628,35 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
     </div>
     <div>
       <div class=card>
-        <h2>3 · Pick reference layouts</h2>
+        <h2>3 · Execution preset</h2>
+        <div style="display:flex;gap:9px;align-items:center">
+          <select id=preset_sel style=flex:1><option value="">No preset — the image
+            model decides</option></select>
+          <button class="btn ghost" id=presetauto
+            style="padding:11px 16px;white-space:nowrap">AI picks</button>
+        </div>
+        <p class=hint id=presetwhy>60 canonical presets. Each one sets how the ad
+          executes — visual direction, voice, proof, urgency — without touching what
+          your brief says. Leave it off and the image model decides for itself.</p>
+        <div id=conflictbox hidden style="background:#FFF8F1;border:1px solid #E0A87A;
+          border-radius:11px;padding:14px 16px;margin-top:12px">
+          <b style=font-size:13.5px id=cfhead></b>
+          <div id=cflist style="font-size:13px;margin:9px 0 12px;line-height:1.5"></div>
+          <label style="font-weight:500;font-size:13.5px;display:flex;gap:8px;
+            align-items:flex-start;margin:0 0 7px">
+            <input type=radio name=cfmode value=reference checked style="width:auto;margin-top:3px">
+            <span><b>Keep the reference layout.</b> Composition, panels and text
+              placement stay; the preset drives colour, mood, expression, density and
+              copy inside them.</span></label>
+          <label style="font-weight:500;font-size:13.5px;display:flex;gap:8px;
+            align-items:flex-start;margin:0">
+            <input type=radio name=cfmode value=preset style="width:auto;margin-top:3px">
+            <span><b>Follow the preset.</b> It may restructure the reference to get its
+              visual direction — expect the result to drift from the layout you picked.</span></label>
+        </div>
+      </div>
+      <div class=card>
+        <h2>4 · Pick reference layouts</h2>
         <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
           <b id=selcount style="font-size:14px">0 selected</b>
           <a href=# id=clearsel style="color:var(--soft);font-size:13px">clear</a>
@@ -896,7 +925,79 @@ $('#clearsel').onclick=e=>{e.preventDefault();selected.clear();
 function refreshRemix(){ $('#selcount').textContent=selected.size+' selected';
   const ok=product&&selected.size>0; $('#go').disabled=!ok;
   $('#gohint').textContent=ok?`Will generate ${selected.size} ad(s).`
-    :'Add a product photo and pick at least one template.'; }
+    :'Add a product photo and pick at least one template.';
+  refreshConflicts(); }
+
+/* ---------- execution presets ---------- */
+let PRESETS={}, cfTimer=null;
+const cfMode=()=>{const r=document.querySelector('input[name=cfmode]:checked');
+  return r?r.value:'reference';};
+
+fetch('/presets').then(r=>r.json()).then(j=>{
+  const sel=$('#preset_sel');
+  if(j.error){ $('#presetwhy').textContent='⚠ '+j.error; return; }
+  (j.groups||[]).forEach(g=>{
+    const og=document.createElement('optgroup'); og.label=g.label;
+    g.items.forEach(p=>{ PRESETS[p.id]=p;
+      const o=document.createElement('option'); o.value=p.id;
+      o.textContent=`${p.id} · ${p.name}`; og.appendChild(o); });
+    sel.appendChild(og);
+  });
+});
+$('#preset_sel').onchange=()=>{ describePreset(); refreshConflicts(); };
+function describePreset(note){
+  const p=PRESETS[$('#preset_sel').value], w=$('#presetwhy');
+  if(!p){ w.textContent='No preset — the image model decides execution from your '+
+    'brief and the reference alone.'; return; }
+  w.innerHTML=(note?`<b style=color:var(--accent)>${note}</b><br>`:'')+
+    `<b>${p.name}</b> — ${p.purpose}`+
+    (p.reaction?`<br><i>Reader should think: “${p.reaction}”</i>`:'')+
+    `<br><span style=color:var(--soft)>${p.visual['Visual Style']} · hero:
+      ${p.visual['Hero Image Type']} · people: ${p.visual['Human Presence']} ·
+      product: ${p.visual['Product Visibility']} · density:
+      ${p.visual['Information Density']}</span>`;
+}
+/* Debounced: selecting layouts fires this on every click. */
+function refreshConflicts(){ clearTimeout(cfTimer); cfTimer=setTimeout(doConflicts,180); }
+async function doConflicts(){
+  const box=$('#conflictbox'), id=$('#preset_sel').value;
+  if(!id||!selected.size){ box.hidden=true; return; }
+  const j=await (await fetch('/presets/conflicts',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({preset:id,references:[...selected.keys()]})})).json();
+  const rows=Object.entries(j.conflicts||{});
+  if(j.error||!rows.length){ box.hidden=true; return; }
+  box.hidden=false;
+  $('#cfhead').textContent=`⚠ Preset ${j.preset.id} ${j.preset.name} fights `+
+    `${rows.length} of your ${selected.size} layout(s)`;
+  /* Group by the clash, not by the file. The same two levers usually fight every
+     layout in a category, and listing them once per file buries the point. */
+  const agg=new Map();
+  rows.forEach(([rel,cs])=>cs.forEach(c=>{
+    const k=c.lever+'|'+c.note;
+    if(!agg.has(k)) agg.set(k,{...c,files:[]});
+    agg.get(k).files.push(rel.split('/').pop());
+  }));
+  $('#cflist').innerHTML=[...agg.values()].map(a=>
+    `<div style=margin-bottom:7px>· <b>${a.lever}</b> (${a.value}) — ${a.note}
+      <span style=color:var(--soft)>[${a.files.length} layout${a.files.length>1?'s':''}:
+      ${a.files.slice(0,2).join(', ')}${a.files.length>2?', …':''}]</span></div>`).join('');
+}
+$('#presetauto').onclick=async()=>{
+  const b=$('#presetauto'); b.disabled=true; const was=b.textContent;
+  b.textContent='thinking…';
+  try{
+    const j=await (await fetch('/presets/pick',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({brief:$('#brief').value.trim(),
+        reference:selected.size?[...selected.keys()][0]:''})})).json();
+    if(j.error){ $('#presetwhy').innerHTML=`<b style=color:var(--signal)>⚠ ${j.error}</b>`; }
+    else{ $('#preset_sel').value=j.id;
+      describePreset(`AI picked ${j.id} ${j.name} (${j.model}) — ${j.why}`);
+      refreshConflicts(); }
+  }catch(e){ $('#presetwhy').innerHTML=`<b style=color:var(--signal)>⚠ ${e}</b>`; }
+  b.disabled=false; b.textContent=was;
+};
 
 $('#go').onclick=async()=>{
   const brief=$('#brief').value.trim(), size=$('#size').value;
@@ -911,6 +1012,7 @@ $('#go').onclick=async()=>{
     try{
       const r=await fetch('/generate',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({product,reference:rel,brief,size,
+        preset:$('#preset_sel').value, conflict_mode:cfMode(),
         strip_exif:$('#stripexif')?$('#stripexif').checked:false})});
       const j=await r.json();
       if(j.error) cards[i].innerHTML=`<div class=err>✕ ${j.error}</div>`;
@@ -922,8 +1024,12 @@ $('#go').onclick=async()=>{
                title="Publishing hygiene only — does not remove C2PA credentials and does not defeat AI detection.">
                ${j.meta.stripped?'✓':'—'} ${j.meta.detail}</div>`
           : '';
+        const pres = j.preset
+          ? `<div style="font-size:11px;padding:5px 8px;border-radius:6px;margin-top:6px;
+               background:var(--accent-soft);color:var(--accent)">▣ ${j.preset}</div>`
+          : '';
         cards[i].innerHTML=`<img src="${j.image}"><div class=meta><span>${nice}</span>`+
-          `<a download="remix_${nm}.png" href="${j.image}">download</a></div>${badge}`;}
+          `<a download="remix_${nm}.png" href="${j.image}">download</a></div>${pres}${badge}`;}
     }catch(e){ cards[i].innerHTML=`<div class=err>✕ ${e}</div>`; }
   }
   $('#go').disabled=false;
@@ -1414,6 +1520,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(project_summary(n) or {}))
         if u.path == "/library":
             return self._send(200, json.dumps(library()))
+        if u.path == "/presets":
+            try:
+                items = presets.catalogue()
+            except presets.PresetError as e:
+                return self._send(200, json.dumps({"error": str(e), "groups": []}))
+            groups = []
+            for _lo, _hi, label in presets.GROUPS:
+                rows = [i for i in items if i["group"] == label]
+                if rows:
+                    groups.append({"label": label, "items": rows})
+            return self._send(200, json.dumps({"groups": groups}))
         if u.path == "/outputs":
             pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             return self._send(200, json.dumps(project_outputs(pr) if pr else {}))
@@ -1540,6 +1657,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 open(dest, "wb").write(raw)
                 saved.append(os.path.relpath(dest, REFS))
             return self._send(200, json.dumps({"saved": saved, "failed": failed}))
+        if path == "/presets/conflicts":
+            req = self._json()
+            try:
+                p = presets.by_id(req.get("preset", ""))
+            except presets.PresetError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            out = {}
+            for rel in req.get("references", [])[:400]:
+                cs = presets.conflicts(p, rel)
+                if cs:
+                    out[rel] = cs
+            return self._send(200, json.dumps(
+                {"preset": {"id": p["id"], "name": p["name"]}, "conflicts": out}))
+        if path == "/presets/pick":
+            req = self._json()
+            with _lock:
+                keys = dict(KEYS)
+            try:
+                return self._send(200, json.dumps(presets.pick(
+                    req.get("brief", ""), req.get("reference", ""), keys)))
+            except presets.PresetError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
         if path == "/generate":
             return self._generate(self._json())
         if path == "/run":
@@ -1592,13 +1731,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except remix.RemixError as e:
             return self._send(200, json.dumps({"error": str(e)}))
 
-        prompt = (
-            "Recreate this reference ad's exact layout, composition and text placement, "
-            "but replace the product with the item shown in the second image and replace "
-            "all copy with the brief below. Keep the reference's structure and "
-            "proportions. Render every word spelled exactly as written; put no text "
-            "anywhere the brief doesn't specify.\n\nBRIEF:\n"
-            + (req.get("brief") or "").strip())
+        # The preset (if any) decides how strictly the reference layout is held.
+        # Without one, the reference is the only direction there is, so it's fixed.
+        mode = "preset" if req.get("conflict_mode") == "preset" else "reference"
+        chosen = None
+        if req.get("preset"):
+            try:
+                chosen = presets.by_id(req["preset"])
+            except presets.PresetError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+
+        if chosen and mode == "preset":
+            head = ("Use this reference ad as the starting point for layout and "
+                    "composition, and the item in the second image as the product. "
+                    "Replace all copy with the brief below. You may adapt the "
+                    "reference's structure where the execution preset requires it. "
+                    "Render every word spelled exactly as written; put no text "
+                    "anywhere the brief doesn't specify.")
+        else:
+            head = ("Recreate this reference ad's exact layout, composition and text "
+                    "placement, but replace the product with the item shown in the "
+                    "second image and replace all copy with the brief below. Keep the "
+                    "reference's structure and proportions. Render every word spelled "
+                    "exactly as written; put no text anywhere the brief doesn't specify.")
+
+        prompt = head + "\n\nBRIEF:\n" + (req.get("brief") or "").strip()
+        if chosen:
+            prompt += "\n\n" + presets.prompt_block(chosen, mode)
         try:
             out = remix.remix_images(
                 prompt,
@@ -1615,7 +1774,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "detail": exifstrip.describe(removed, before, len(out))}
         self._send(200, json.dumps(
             {"image": "data:image/png;base64," + base64.b64encode(out).decode(),
-             "meta": meta}))
+             "meta": meta,
+             "preset": (f"{chosen['id']} {chosen['name']} · "
+                        f"{'preset' if mode == 'preset' else 'reference'} wins"
+                        if chosen else None)}))
 
     def _run(self, req):
         """Stream a pipeline stage's output to the browser as it runs."""

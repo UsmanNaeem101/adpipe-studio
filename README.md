@@ -5,9 +5,9 @@ the ad layouts and the compliance engine are shared; everything niche-specific
 lives in `projects/<name>/`.
 
 **Double-click `Ad Studio.command`** — that's the whole app, in your browser. Three
-tabs: **Remix** (upload a product photo, write a brief, pick reference layouts →
-finished ads), **Pipeline** (run any stage, watch the output), **Settings** (paste
-your API keys). No terminal needed.
+tabs: **Remix** (upload a product photo, write a brief, choose an execution preset,
+pick reference layouts → finished ads), **Pipeline** (run any stage, watch the
+output), **Settings** (paste your API keys). No terminal needed.
 
 The CLI still exists if you prefer it:
 
@@ -34,6 +34,43 @@ runnable on its own, and finished stages are skipped on re-run (`--force` to red
 
 Use the compositor when the copy must be exact and claim-safe. Use Remix when you
 want a specific reference layout rebuilt around your product.
+
+## Execution presets
+
+`reference_docs/execution_levers.md` defines 60 ways to **execute** a static ad —
+49 levers each across Targeting, Persuasion, Messaging, Proof, Visual Direction,
+Offer and Compliance. They don't decide the message (the brief still does that);
+they decide the psychological and visual execution of it. Pain Agitator and
+Mechanism Educator can carry the same claim and look nothing alike.
+
+On the Remix tab, **3 · Execution preset** lets you pick one, or leave it off and
+let the image model decide from the brief alone. **AI picks** hands the choice to
+a cheap text model (Haiku, or DeepSeek via OpenRouter — whichever key is set): it
+reads your brief and the layout you selected, returns one preset and its reasoning,
+and drops it into the dropdown so you can still overrule it before spending an
+image credit.
+
+A preset's Visual Direction will sometimes fight the reference you chose — Pain
+Agitator wants no product and a person's face; a Product Hero layout is built
+around the product and has neither. Those clashes are detected up front and listed
+before you generate, with the call left to you:
+
+- **Keep the reference layout** (default) — composition, panels and text placement
+  are fixed; the preset drives colour, mood, expression, density and copy inside them.
+- **Follow the preset** — it may restructure the reference, and the result will
+  drift from the layout you picked.
+
+Only the four levers that change what a layout *is* raise a warning — product
+visibility, human presence, information density, urgency (plus a text-led preset on
+an image-led layout). Stylistic differences pass silently, because a warning that
+fires on everything gets ignored.
+
+```bash
+./.venv/bin/python pipeline/presets.py --list
+```
+
+`--show 07` prints the exact block that gets appended to the image prompt, and
+`--show 07 --against 09_Offer/566.png` reports the clashes for that pairing.
 
 ## Keys
 
@@ -77,9 +114,11 @@ pipeline/
   cli.py                  stage orchestrator
   llm.py                  Claude API layer — caching, batching, cost, errors
   render.py  qa.py        compositor + compliance gate
+  presets.py              60 execution presets — parse, prompt block, conflicts
   templates/              6 shared ad layouts
   brand.json  facts.json  brand tokens · the only numbers allowed in an ad
 skills/                   27 skill files — source of truth for each stage
+reference_docs/           execution_levers.md — the 60-preset lever library
 references/               221 competitor ads by style, mapped to templates
 projects/<name>/
   project.json            niche regexes, compliance profile, model config
