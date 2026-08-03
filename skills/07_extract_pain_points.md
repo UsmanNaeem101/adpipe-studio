@@ -1,7 +1,7 @@
 # 07 Extract Pain Points
 
 **Skill ID:** `07_extract_pain_points`  
-**Version:** `2.2.0`  
+**Version:** `2.3.0`  
 **Status:** Canonical
 
 ## Purpose
@@ -11,28 +11,33 @@ Extract, normalise, coalesce, count, rank and audit the recurring unwanted state
 This skill receives one canonical segment evidence file:
 
 ```text
-{segment_slug}_evidence.md
+evidence/{segment_slug}.txt
 ```
 
-and produces:
+and produces exactly one artefact:
 
 ```text
 {segment_slug}_pain_points.md
-{segment_slug}_pain_points.yaml
-{segment_slug}_pain_points_audit.jsonl
 ```
 
 Example:
 
 ```text
-rotator_cuff_evidence.md
+evidence/rotator_cuff.txt
         ↓
 07_extract_pain_points
         ↓
 rotator_cuff_pain_points.md
-rotator_cuff_pain_points.yaml
-rotator_cuff_pain_points_audit.jsonl
 ```
+
+One document, because that is what the harness collects. The audit trail is not
+dropped — it lives *inside* the Markdown. Every retained pain point carries its
+supporting evidence IDs, its `observed`/`inferred` basis and its deduplicated
+counts, and the processing decisions (merges, retires, exclusions) are recorded
+in an Extraction Decisions section. A separate machine-readable sidecar would be
+easier to parse, but nothing downstream reads one, and a promise nothing collects
+on is not an audit trail. Keeping the evidence IDs in the document is what makes
+the "never fabricate quotations" rule verifiable by anyone reading it.
 
 ## Single Responsibility
 
@@ -91,8 +96,11 @@ Exactly one file produced by:
 Filename:
 
 ```text
-{segment_slug}_evidence.md
+evidence/{segment_slug}.txt
 ```
+
+The harness reads this file and injects its contents into the prompt, so the
+path is context rather than something to open.
 
 ### Required segment metadata
 
@@ -519,14 +527,20 @@ Each quotation must:
 - not expose unnecessary personal details
 - never present rewritten wording as verbatim
 
-### 12. Produce all canonical outputs
+### 12. Record the processing decisions
+
+Every material decision made in steps 6, 7 and 8 — candidates merged, a concept
+split, a stable ID reused, created or retired, evidence excluded, an inference
+retained, an ambiguity warning, a validation failure — is written into the
+Extraction Decisions section of the output document. A merge that is not
+recorded is indistinguishable from a pain point that was never extracted.
+
+### 13. Produce the canonical output
 
 Required:
 
 ```text
 {segment_slug}_pain_points.md
-{segment_slug}_pain_points.yaml
-{segment_slug}_pain_points_audit.jsonl
 ```
 
 ## Canonical Markdown Output
@@ -538,13 +552,14 @@ Required:
 
 - Segment ID: rotator_cuff
 - Segment name: People with rotator-cuff, impingement or injury-related shoulder pain
-- Source file: rotator_cuff_evidence.md
+- Source file: evidence/rotator_cuff.txt
 - Evidence items reviewed: 614
 - Pain points retained: 18
 - Observed concepts: 16
 - Inferred concepts: 2
 - Extraction skill: 07_extract_pain_points
-- Skill version: 2.2.0
+- Skill version: 2.3.0
+- Ranking method: score descending, then evidence count descending, then concept ID ascending
 
 ## Pain Point Summary
 
@@ -607,81 +622,68 @@ ev_000227
 **Boundary note**
 
 Includes inability to tolerate pressure on the affected shoulder. Excludes general insomnia without a shoulder-related cause.
+
+## Extraction Decisions
+
+Material processing decisions, in the order they were made.
+
+### Merges
+
+| Surviving ID | Retired IDs | Reason | Evidence IDs |
+|---|---|---|---|
+| pp_rotator_cuff_000001 | pp_rotator_cuff_000017 | Same underlying problem and practical consequence | ev_000123, ev_000184 |
+
+### Splits
+
+| Origin ID | Resulting IDs | Reason |
+|---|---|---|
+| pp_rotator_cuff_000004 | pp_rotator_cuff_000004, pp_rotator_cuff_000019 | Overhead-reach pain and behind-the-back reach pain have different practical consequences |
+
+### Stable ID continuity
+
+- Reused from prior run: 14
+- Newly created: 4
+- Retired: 1
+
+### Excluded and rejected
+
+| Item | Decision | Reason |
+|---|---|---|
+| ev_000455 | Evidence excluded | Duplicate excerpt of ev_000123; would have inflated counts |
+| "Shoulder problems" | Candidate rejected | Generic umbrella label, fails the granularity test |
+
+### Inferences retained
+
+| Concept ID | Reason retained | Supporting evidence IDs |
+|---|---|---|
+| pp_rotator_cuff_000015 | Consequence stated repeatedly without being named directly | ev_000512, ev_000774 |
+
+### Warnings
+
+- pp_rotator_cuff_000015 and pp_rotator_cuff_000016 share 71% of supporting evidence; flagged for human review.
 ```
 
-## Canonical YAML Output
+## Recording Decisions In-Document
 
-```yaml
-skill:
-  id: 07_extract_pain_points
-  version: 2.2.0
+There is no YAML sidecar and no `.jsonl` audit file. Both were dropped in 2.3.0:
+the harness collects exactly one Markdown artefact per skill, so a sidecar was
+specified but never written, and an audit trail that is never written is worse
+than none — it reads as a guarantee while guaranteeing nothing.
 
-segment:
-  segment_id: rotator_cuff
-  segment_slug: rotator_cuff
-  source_file: rotator_cuff_evidence.md
+Everything they carried is now in the document itself:
 
-extraction:
-  evidence_items_reviewed: 614
-  retained_concepts: 18
-  observed_concepts: 16
-  inferred_concepts: 2
+- the YAML mirrored the Markdown field for field, so nothing was lost with it
+- the audit log's decisions became the **Extraction Decisions** section
 
-pain_points:
-  - concept_id: pp_rotator_cuff_000001
-    rank: 1
-    canonical_name: Unable to sleep on the affected shoulder
-    canonical_statement: >
-      People cannot lie on the affected shoulder without triggering pain,
-      forcing them to change position or avoid their preferred sleeping side.
-    basis: observed
-    aliases:
-      - Cannot sleep on that side
-      - Side sleeping hurts
-    supporting_evidence_count: 94
-    unique_thread_count: 51
-    unique_author_count: 72
-    score: 92
-    confidence: high
-    evidence_ids:
-      - ev_000123
-      - ev_000184
-    boundary_note: >
-      Includes inability to tolerate pressure on the affected shoulder.
-      Excludes general insomnia without a shoulder-related cause.
-```
-
-## Audit Output
-
-Filename:
-
-```text
-{segment_slug}_pain_points_audit.jsonl
-```
-
-The audit must record material processing decisions, including:
-
-- candidate accepted
-- candidate rejected
-- candidates merged
-- concept split
-- stable ID reused
-- new stable ID created
-- old ID retired
-- evidence excluded
-- inference retained
-- ambiguity warning
-- validation failure
-
-Example:
-
-```json
-{"event":"concept_merge","surviving_concept_id":"pp_rotator_cuff_000001","retired_concept_ids":["pp_rotator_cuff_000017"],"reason":"Same underlying problem and practical consequence","evidence_ids":["ev_000123","ev_000184"]}
-```
+Record decisions as tables under that section, not as prose. A merge needs the
+surviving ID, the retired IDs, the reason and the evidence IDs; a rejection
+needs the item and the reason. Anyone auditing the run should be able to
+reconstruct why a pain point exists, why two became one, and why an item was
+dropped, using only this file and the segment evidence file it names.
 
 ## Required Output Fields
 
-### File-level
+### Document-level
 
 - segment ID
 - segment name
@@ -713,22 +715,29 @@ Example:
 - supporting evidence IDs
 - boundary note
 
+### Decision-level
+
+Recorded in the Extraction Decisions section:
+
+- merges: surviving ID, retired IDs, reason, evidence IDs
+- splits: origin ID, resulting IDs, reason
+- stable ID continuity: reused, newly created, retired counts
+- exclusions and rejections: item, decision, reason
+- inferences retained: concept ID, reason, supporting evidence IDs
+- warnings raised
+
 ## Naming Convention
 
-Required outputs:
+Required output:
 
 ```text
 {segment_slug}_pain_points.md
-{segment_slug}_pain_points.yaml
-{segment_slug}_pain_points_audit.jsonl
 ```
 
-Examples:
+Example:
 
 ```text
 rotator_cuff_pain_points.md
-rotator_cuff_pain_points.yaml
-rotator_cuff_pain_points_audit.jsonl
 ```
 
 Generic filenames such as `pain_points.md` are prohibited.
@@ -876,7 +885,8 @@ Fail the run when:
 
 - input is not a canonical segment evidence file
 - segment slug cannot be determined
-- output filenames are incorrect
+- the output filename is incorrect
+- a merge, split or retirement is missing from Extraction Decisions
 - a retained concept has no stable `concept_id`
 - a retained concept has no supporting evidence ID
 - a cited evidence ID is absent from the input
@@ -929,7 +939,7 @@ Warn when:
 ### Naming integrity
 
 - segment slug is unchanged
-- all outputs use the segment-prefixed naming convention
+- the output uses the segment-prefixed naming convention
 
 ## Determinism
 
@@ -950,7 +960,7 @@ the skill must produce identical:
 - counts
 - scores
 - rankings
-- output filenames
+- output filename
 
 ## Completion Criteria
 
@@ -965,5 +975,6 @@ The skill is complete when:
 - every concept cites evidence IDs
 - counts are deduplicated
 - ranking is deterministic
-- all three canonical outputs are produced
+- the canonical Markdown output is produced
+- every merge, split, retirement and exclusion is recorded in Extraction Decisions
 - no other extraction dimension is produced
