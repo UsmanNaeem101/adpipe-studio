@@ -179,6 +179,113 @@ def catalogue():
             for p in load()]
 
 
+# ------------------------------------------------------------------- schema
+
+_SCHEMA_CAT = re.compile(r"^# \d+\.\s+(.+?)\s*$")
+_SCHEMA_LEVER = re.compile(r"^\d+\.\s+(.+?)\s*$")
+
+# Above this many distinct values across the 60 presets, a lever is effectively
+# free text (Avatar has 60 — one per preset) and a dropdown of them would be a
+# list of other people's answers. At or below it, the values are a real
+# vocabulary (Brain Target has 6) and picking from them is the right control.
+CHOICE_MAX = 12
+
+_schema_cache = None
+
+
+def _categories(path=None):
+    """The 7 lever categories and their members, read from the schema chapter.
+
+    Taken from the document rather than hardcoded so the two cannot drift; the
+    chapter is the numbered list before the first preset heading.
+    """
+    path = path or LEVERS_MD
+    cats, cur = [], None
+    for line in open(path, encoding="utf-8"):
+        if line.startswith("# "):
+            m = _SCHEMA_CAT.match(line)
+            if not m:
+                # Before the chapter this is just the document title; after it,
+                # "# Recommended Value Types" means the chapter is over. Ending
+                # there also stops before the Preset Index, whose "01. Awareness
+                # Builder" entries are numbered exactly like levers and would
+                # otherwise all land in the last category.
+                if cats:
+                    break
+                continue
+            cur = (m.group(1), [])
+            cats.append(cur)
+            continue
+        m = _SCHEMA_LEVER.match(line)
+        if m and cur is not None:
+            cur[1].append(m.group(1).strip())
+    return cats
+
+
+def schema():
+    """All 49 levers, grouped, each with the values the 60 presets actually use.
+
+    Every lever is optional. One that is left unset is not sent at all — the
+    model decides it from the brief and whatever else was set, which is the
+    point: a default we invented here would be an opinion nobody asked for.
+    """
+    global _schema_cache
+    if _schema_cache is not None:
+        return _schema_cache
+
+    seen = {}
+    for p in load():
+        for name, value in p["levers"].items():
+            if value:
+                seen.setdefault(name, {}).setdefault(value, 0)
+                seen[name][value] += 1
+
+    groups, placed = [], set()
+    for label, names in _categories():
+        rows = []
+        for name in names:
+            counts = seen.get(name, {})
+            options = sorted(counts, key=lambda v: (-counts[v], v.lower()))
+            rows.append({
+                "name": name,
+                "kind": "choice" if 0 < len(options) <= CHOICE_MAX else "text",
+                "options": options,
+                "visual": name in VISUAL,
+            })
+            placed.add(name)
+        if rows:
+            groups.append({"label": label, "levers": rows})
+
+    # A lever the presets fill but the schema chapter never lists would silently
+    # vanish from the editor, so surface it rather than dropping it.
+    extra = [n for n in seen if n not in placed]
+    if extra:
+        groups.append({"label": "Unlisted",
+                       "levers": [{"name": n, "kind": "text",
+                                   "options": sorted(seen[n]), "visual": False}
+                                  for n in sorted(extra)]})
+    _schema_cache = groups
+    return groups
+
+
+def custom_block(chosen):
+    """Explicitly-set levers as an instruction block, for when there is no preset.
+
+    `chosen` maps lever name → value. Only what the caller set appears; the rest
+    are left for the model to decide, so an untouched editor adds nothing to the
+    prompt at all.
+    """
+    valid = {l["name"] for g in schema() for l in g["levers"]}
+    rows = [(k, str(v).strip()) for k, v in (chosen or {}).items()
+            if k in valid and str(v).strip()]
+    if not rows:
+        return ""
+    rows.sort(key=lambda kv: kv[0])
+    body = "\n".join(f"- {k}: {v}" for k, v in rows)
+    return ("EXECUTION LEVERS (set explicitly — follow these exactly; anything "
+            "not listed is yours to decide):\n" + body)
+
+
 # --------------------------------------------------------------------- prompt
 
 def _line(p, keys):
@@ -346,7 +453,9 @@ _PICK_SYSTEM = (
     "Reply with JSON only: {\"id\": \"NN\", \"why\": \"one short sentence\"}")
 
 
-def _post_json(url, headers, body, timeout=60):
+def _post_json(url, headers, body, timeout=60, label="auto-pick"):
+    """POST JSON and return the parsed reply. `label` names the caller in error
+    text so a failure says which feature broke, not always "auto-pick"."""
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  method="POST", headers=headers)
     try:
@@ -355,12 +464,12 @@ def _post_json(url, headers, body, timeout=60):
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:300]
         if e.code == 401:
-            raise PresetError("the key for the auto-picker was rejected (401).")
+            raise PresetError(f"the key for {label} was rejected (401).")
         if e.code == 402:
             raise PresetError("that account has insufficient credit (402).")
-        raise PresetError(f"auto-pick failed — HTTP {e.code}: {detail}")
+        raise PresetError(f"{label} failed — HTTP {e.code}: {detail}")
     except urllib.error.URLError as e:
-        raise PresetError(f"auto-pick failed — network error: {e.reason}")
+        raise PresetError(f"{label} failed — network error: {e.reason}")
 
 
 def _extract_json(text):

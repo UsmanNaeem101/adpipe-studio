@@ -81,6 +81,27 @@ Include a mention only if it names an actual product/category (not a generic
 activity) and its relationship is preserved without inferring ownership from a
 recommendation.
 
+### Item shape
+
+Write each retained item as its own `###` heading — the item's name and nothing
+else — then the fields above as `- **Label** — value` bullets, and any verbatim
+quotes as `>` blockquotes:
+
+```text
+### Short recognisable name
+
+- **Statement** — one sentence
+- **Frequency** — roughly how many different people
+- **Basis** — observed
+
+> "a verbatim quote"
+```
+
+Keep every retained item at that one heading level, so the set reads back as a
+list. Counts, method notes and anything that is not an item go under their own
+separate heading — never between the items. The studio parses this file to fill
+the lever pickers, and an item it cannot see is an item you cannot select.
+
 ## Quick reference
 
 ```

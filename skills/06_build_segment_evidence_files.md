@@ -18,7 +18,7 @@ An evidence item must never appear in more than one segment evidence file. Secon
 attributes, contexts, consequences, or stray keywords do not create a second
 membership. If someone says *"I'm an accountant and shoulder pain from sitting all day
 means I can't sleep,"* and their validated primary segment is `desk_workers`, the
-comment lives **only** in `desk_workers_evidence.md`. The sleep angle can be extracted
+comment lives **only** in `evidence/desk_workers.txt`. The sleep angle can be extracted
 later as a pain moment *within* that segment — it does not duplicate the comment into a
 side-sleeper file.
 
@@ -45,7 +45,7 @@ conflict-tolerant mode is explicitly enabled).
 5. Sort deterministically: assignment score ↓, then source-quality ↓ (if available),
    then thread ID ↑, then evidence ID ↑. Identical inputs must always produce identical
    order.
-6. Write one file per segment named `{segment_slug}_evidence.md`.
+6. Write one file per segment named `evidence/{segment_slug}.txt`.
 7. Send every unassigned item (`unassigned_ambiguous`,
    `unassigned_insufficient_evidence`, `unassigned_no_matching_segment`) to
    `unassigned_evidence.md` — never into a segment file.
@@ -89,14 +89,14 @@ I injured my shoulder while benching and it still hurts whenever I raise my arm.
 
 ## Naming (so downstream stays sane)
 
-Evidence files: `{segment_slug}_evidence.md`. Every downstream extraction appends the
+Evidence files: `evidence/{segment_slug}.txt`. Every downstream extraction appends the
 segment slug and the dimension, e.g. `desk_workers_pain_points.md`,
 `desk_workers_pain_moments.md`, `desk_workers_mechanisms.md`,
 `desk_workers_representative_voc.md`. A recommended layout:
 
 ```
 research/segments/desk_workers/
-  ├── evidence/desk_workers_evidence.md
+  ├── evidence/desk_workers.txt
   ├── pain_points/desk_workers_pain_points.md
   ├── pain_moments/desk_workers_pain_moments.md
   └── reports/desk_workers_segment_report.md
@@ -110,7 +110,7 @@ and write a segment-prefixed output — and it must **always read the evidence f
 another extraction's output.**
 
 ```
-Correct:   desk_workers_evidence.md → 08_extract_pain_moments → desk_workers_pain_moments.md
+Correct:   evidence/desk_workers.txt → 08_extract_pain_moments → desk_workers_pain_moments.md
 Wrong:     desk_workers_pain_points.md → 08_extract_pain_moments   (never chain extractions)
 ```
 
