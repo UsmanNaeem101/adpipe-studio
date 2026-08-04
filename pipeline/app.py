@@ -36,6 +36,8 @@ sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 import remix  # noqa: E402
 import exifstrip  # noqa: E402
 import presets  # noqa: E402
+import levers  # noqa: E402
+import briefs  # noqa: E402
 
 REFS = os.path.join(ROOT, "references")
 PORT = int(os.environ.get("STUDIO_PORT", "8765"))
@@ -71,11 +73,22 @@ def projects():
 
 
 def segments(project):
-    out = []
-    for d in (os.path.join(ROOT, "projects", project, "evidence"),):
-        if os.path.isdir(d):
-            out += [f[:-4] for f in sorted(os.listdir(d)) if f.endswith(".txt")]
-    return out
+    """Segments this project has, by either of the two things that make one real.
+
+    An evidence file is what the pipeline stages run against; an extractions
+    folder is what the Remix tab's levers come from. Listing only the first
+    hides any segment whose evidence file was moved or cleaned up after
+    extraction, which is exactly when you still want to build ads from it.
+    """
+    base = os.path.join(ROOT, "projects", project)
+    out = set()
+    ev = os.path.join(base, "evidence")
+    if os.path.isdir(ev):
+        out |= {f[:-4] for f in os.listdir(ev) if f.endswith(".txt")}
+    ex = os.path.join(base, "extractions")
+    if os.path.isdir(ex):
+        out |= {d for d in os.listdir(ex) if os.path.isdir(os.path.join(ex, d))}
+    return sorted(out)
 
 
 SAFE_NAME = __import__("re").compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
@@ -449,6 +462,42 @@ def compliance_notes(project="montisella"):
         return ""
 
 
+def build_image_prompt(req):
+    """The exact prompt the image model receives, from one request payload.
+
+    Shared by /prompt and /generate so the text shown for review is assembled by
+    the same code that would send it. Returns (prompt, preset_or_None, mode).
+    """
+    # The preset (if any) decides how strictly the reference layout is held.
+    # Without one, the reference is the only direction there is, so it's fixed.
+    mode = "preset" if req.get("conflict_mode") == "preset" else "reference"
+    chosen = presets.by_id(req["preset"]) if req.get("preset") else None
+
+    if chosen and mode == "preset":
+        head = ("Use this reference ad as the starting point for layout and "
+                "composition, and the item in the second image as the product. "
+                "Replace all copy with the brief below. You may adapt the "
+                "reference's structure where the execution preset requires it. "
+                "Render every word spelled exactly as written; put no text "
+                "anywhere the brief doesn't specify.")
+    else:
+        head = ("Recreate this reference ad's exact layout, composition and text "
+                "placement, but replace the product with the item shown in the "
+                "second image and replace all copy with the brief below. Keep the "
+                "reference's structure and proportions. Render every word spelled "
+                "exactly as written; put no text anywhere the brief doesn't specify.")
+
+    prompt = head + "\n\nBRIEF:\n" + (req.get("brief") or "").strip()
+    if chosen:
+        prompt += "\n\n" + presets.prompt_block(chosen, mode)
+    # Explicitly-set levers go last so they win: a preset fills all 49 by
+    # implication, but only these were actually chosen by a person.
+    block = presets.custom_block(req.get("levers") or {})
+    if block:
+        prompt += "\n\n" + block
+    return prompt, chosen, mode
+
+
 def is_ref_category(name):
     """Real category folders only. `_originals` and `_deleted` live inside
     references/ so backups stay next to what they back up — but they must never
@@ -573,6 +622,39 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
  .stage b{display:block;font-size:14px}.stage small{color:var(--soft);font-size:12.5px}
  .stage .costs{color:var(--signal);font-size:11px;font-weight:700;letter-spacing:.05em}
  .hide{display:none}
+ /* lever pickers */
+ .lev{margin-bottom:11px}
+ .lev label{display:block;font-size:12.5px;font-weight:600;margin-bottom:4px}
+ .lev .req{color:var(--signal)}
+ .lev select,.lev input{width:100%}
+ .lev small{color:var(--soft);font-size:11.5px;display:block;margin-top:3px}
+ .lev.set select,.lev.set input{border-color:var(--accent);background:var(--accent-soft)}
+ details.lvg{border:1.5px solid var(--line);border-radius:11px;margin-bottom:9px;padding:0}
+ details.lvg>summary{cursor:pointer;padding:11px 13px;font-weight:600;font-size:13.5px;
+   list-style:none;display:flex;justify-content:space-between;align-items:center}
+ details.lvg>summary::-webkit-details-marker{display:none}
+ details.lvg[open]>summary{border-bottom:1.5px solid var(--line)}
+ details.lvg .body{padding:12px 13px}
+ .lvn{font-size:11.5px;color:var(--accent);font-weight:700}
+ /* briefs */
+ .bf{border:1.5px solid var(--line);border-radius:11px;padding:12px 14px;margin-bottom:10px}
+ .bf.on{border-color:var(--accent);background:var(--accent-soft)}
+ .bf h4{margin:0 0 6px;font-size:14px;display:flex;gap:8px;align-items:flex-start}
+ .bf h4 input{width:auto;margin-top:2px}
+ .bf p{margin:4px 0;font-size:13px;line-height:1.45}
+ .bf .vis{color:var(--soft);font-size:12.5px;margin-top:7px;font-style:italic}
+ /* prompt confirm */
+ #pmwrap{position:fixed;inset:0;background:rgba(20,20,20,.5);z-index:60;
+   display:flex;align-items:center;justify-content:center;padding:24px}
+ /* Must out-specify #pmwrap's display:flex, or the hidden overlay still covers
+    the page and eats every click. */
+ #pmwrap.hide{display:none}
+ #pmbox{background:var(--paper);border-radius:14px;width:100%;max-width:780px;
+   max-height:88vh;display:flex;flex-direction:column;padding:20px 22px}
+ /* pre-wrap, not pre: a prompt you have to scroll sideways to read is a prompt
+    you will accept without reading. */
+ #pmtext{flex:1;min-height:340px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+   font-size:12.5px;line-height:1.5;white-space:pre-wrap;overflow:auto}
 </style></head><body>
 <header>
   <div class=htop><b>adpipe studio</b><span>voice-of-customer → finished ads</span></div>
@@ -594,7 +676,15 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
   <div class=grid>
     <div>
       <div class=card>
-        <h2>1 · Your product</h2>
+        <h2>1 · Project &amp; segment</h2>
+        <div class=row>
+          <div><label>Project</label><select id=rx_proj></select></div>
+          <div><label>Segment</label><select id=rx_seg></select></div>
+        </div>
+        <p class=hint id=rx_levstate>Pick a project to load its extracted levers.</p>
+      </div>
+      <div class=card>
+        <h2>2 · Your product</h2>
         <div class=drop id=drop>
           <div id=dropmsg>Click or drop a product photo</div>
           <img id=preview hidden>
@@ -603,14 +693,32 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
         <p class=hint>A clean shot of the real product. This gets placed into each layout.</p>
       </div>
       <div class=card>
-        <h2>2 · Creative brief</h2>
+        <h2>3 · Levers</h2>
+        <p class=hint style="margin-top:0">What the ad is about, taken from this
+          segment's extractions. <b>Pain point</b> and <b>desired outcome</b> are
+          required; everything else sharpens the brief.</p>
+        <div id=levbox><p class=hint>No project loaded yet.</p></div>
+      </div>
+      <div class=card>
+        <h2>4 · Creative brief</h2>
         <label>What each ad should say and feel like</label>
         <textarea id=brief placeholder="Headline: You didn't buy bad pillows, you bought the wrong height.
 Subtext: It's set by your shoulder, not by how it feels in the shop.
 CTA: Which height are you?
 Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></textarea>
+        <div style="margin-top:12px">
+          <button class="btn ghost" id=writebriefs style="white-space:nowrap">Write 4 briefs from levers</button>
+          <p class=hint id=bfhint style="margin:7px 0 0">Uses the levers above instead
+            of the box — you pick which results to render. Anything in the box is
+            passed along as extra direction.</p>
+        </div>
         <label style="margin-top:14px">Output shape</label>
         <select id=size>__SIZES__</select>
+      </div>
+      <div class=card id=briefcard hidden>
+        <h2>Briefs</h2>
+        <p class=hint style="margin-top:0" id=bfnote></p>
+        <div id=brieflist></div>
       </div>
       <div class=card>
         <label style="font-weight:500;font-size:14px;display:flex;gap:8px;
@@ -628,7 +736,7 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
     </div>
     <div>
       <div class=card>
-        <h2>3 · Execution preset</h2>
+        <h2>5 · Execution preset</h2>
         <div style="display:flex;gap:9px;align-items:center">
           <select id=preset_sel style=flex:1><option value="">No preset — the image
             model decides</option></select>
@@ -656,7 +764,19 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
         </div>
       </div>
       <div class=card>
-        <h2>4 · Pick reference layouts</h2>
+        <h2>6 · Execution levers</h2>
+        <p class=hint style="margin-top:0">All 49, all optional. Anything you leave
+          alone is left to the model to decide from the brief and whatever else is
+          set. Anything you set is injected into the prompt verbatim.
+          <span id=lvcount style="color:var(--accent);font-weight:700"></span></p>
+        <div style="display:flex;gap:9px;align-items:center;margin-bottom:10px">
+          <a href=# id=lvclear style="color:var(--soft);font-size:13px">clear all</a>
+          <a href=# id=lvfill style="color:var(--soft);font-size:13px">fill from preset</a>
+        </div>
+        <div id=lvbox>loading…</div>
+      </div>
+      <div class=card>
+        <h2>7 · Pick reference layouts</h2>
         <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
           <b id=selcount style="font-size:14px">0 selected</b>
           <a href=# id=clearsel style="color:var(--soft);font-size:13px">clear</a>
@@ -844,6 +964,22 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 </section>
 
 </div>
+
+<!-- Nothing is sent until this is accepted. The text in the box IS what goes to
+     the image model — edit it here and the edit is what gets sent. -->
+<div id=pmwrap class=hide>
+  <div id=pmbox>
+    <h2 style="margin-top:0">Confirm the prompt</h2>
+    <p class=hint id=pmsub style="margin-top:0"></p>
+    <textarea id=pmtext spellcheck=false></textarea>
+    <div style="display:flex;gap:10px;margin-top:14px;align-items:center">
+      <button class=btn id=pmgo>Send it</button>
+      <button class="btn ghost" id=pmcancel>Cancel</button>
+      <span class=hint id=pmcost style="margin:0"></span>
+    </div>
+  </div>
+</div>
+
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 var LIB,LSEL,LDUPE,SKILLS;
@@ -893,7 +1029,10 @@ $('#clearkeys').onclick=async()=>{ $('#k_openai').value=''; $('#k_anthropic').va
 })();
 
 // ---------- remix ----------
+/* Declared up here, not next to their own section, because refreshRemix() reads
+   them and is called from handlers wired further up the file. */
 let product=null, selected=new Map();
+let LEVERS=null, BRIEFS=[], briefPick=new Set();
 const drop=$('#drop'), file=$('#file'), preview=$('#preview');
 drop.onclick=()=>file.click();
 file.onchange=e=>loadFile(e.target.files[0]);
@@ -924,8 +1063,12 @@ $('#clearsel').onclick=e=>{e.preventDefault();selected.clear();
   $$('.thumb.sel').forEach(t=>t.classList.remove('sel'));refreshRemix();};
 function refreshRemix(){ $('#selcount').textContent=selected.size+' selected';
   const ok=product&&selected.size>0; $('#go').disabled=!ok;
-  $('#gohint').textContent=ok?`Will generate ${selected.size} ad(s).`
-    :'Add a product photo and pick at least one template.';
+  const nb=briefPick.size;
+  const jobs=selected.size*(nb||1);
+  $('#gohint').textContent=!ok
+    ? 'Add a product photo and pick at least one template.'
+    : nb ? `Will generate ${jobs} ad(s) — ${nb} brief(s) × ${selected.size} layout(s). You confirm the prompt first.`
+         : `Will generate ${jobs} ad(s) from the brief box. You confirm the prompt first.`;
   refreshConflicts(); }
 
 /* ---------- execution presets ---------- */
@@ -999,21 +1142,259 @@ $('#presetauto').onclick=async()=>{
   b.disabled=false; b.textContent=was;
 };
 
+/* ---------- levers from the pipeline ---------- */
+fetch('/projects').then(r=>r.json()).then(j=>{
+  const s=$('#rx_proj'); s.innerHTML='<option value="">—</option>';
+  (j.projects||[]).forEach(p=>{const o=document.createElement('option');
+    o.value=o.textContent=p; s.appendChild(o);});
+  if((j.projects||[]).length===1){ s.value=j.projects[0]; s.onchange(); }
+});
+$('#rx_proj').onchange=async()=>{
+  const p=$('#rx_proj').value, s=$('#rx_seg'); s.innerHTML='';
+  LEVERS=null; renderLevers();
+  if(!p){ $('#rx_levstate').textContent='Pick a project to load its extracted levers.'; return; }
+  const j=await (await fetch('/segments?project='+encodeURIComponent(p))).json();
+  const segs=j.segments||[];
+  if(!segs.length){ $('#rx_levstate').textContent=
+    'No segments in this project yet — run the segment stage on the Pipeline tab.'; return; }
+  s.innerHTML='<option value="">—</option>';
+  segs.forEach(x=>{const o=document.createElement('option');o.value=o.textContent=x;s.appendChild(o);});
+  if(segs.length===1){ s.value=segs[0]; }
+  s.onchange();
+};
+$('#rx_seg').onchange=async()=>{
+  const p=$('#rx_proj').value, sg=$('#rx_seg').value;
+  if(!p||!sg){ LEVERS=null; renderLevers(); return; }
+  $('#rx_levstate').textContent='loading levers…';
+  const j=await (await fetch(`/levers?project=${encodeURIComponent(p)}&segment=${encodeURIComponent(sg)}`)).json();
+  if(j.error){ LEVERS=null; renderLevers(); $('#rx_levstate').textContent='⚠ '+j.error; return; }
+  LEVERS=j; renderLevers();
+  const parsed=j.dimensions.filter(d=>d.items.length).length;
+  $('#rx_levstate').innerHTML=`${j.extracted}/${j.total} dimensions extracted · `+
+    `<b>${parsed}</b> with selectable items`+
+    (j.extracted?'':' — run <b>extract</b> on the Pipeline tab to fill these');
+};
+
+function renderLevers(){
+  const box=$('#levbox');
+  if(!LEVERS){ box.innerHTML='<p class=hint>No project loaded yet.</p>'; refreshRemix(); return; }
+  box.innerHTML='';
+  LEVERS.dimensions.forEach(d=>{
+    const wrap=document.createElement('div'); wrap.className='lev';
+    const req=d.required?'<span class=req>*</span> ':'';
+    if(!d.present){
+      wrap.innerHTML=`<label>${req}${d.label}</label>
+        <small>not extracted — skill ${String(d.skill).padStart(2,'0')} hasn't run</small>`;
+      box.appendChild(wrap); return;
+    }
+    if(!d.items.length){
+      wrap.innerHTML=`<label>${req}${d.label}</label>
+        <small>⚠ file present but no items could be read —
+        <a href="/file?path=${encodeURIComponent(d.file)}" target=_blank>open it</a></small>`;
+      box.appendChild(wrap); return;
+    }
+    const opts=d.items.map(i=>`<option value="${esc(i.name)}">${esc(i.name)}</option>`).join('');
+    wrap.innerHTML=`<label>${req}${d.label} <span style="color:var(--soft);font-weight:400">
+      (${d.items.length})</span></label>`+
+      (d.multi?`<select multiple size=${Math.min(4,d.items.length)} data-dim="${d.key}">${opts}</select>`
+             :`<select data-dim="${d.key}"><option value="">—</option>${opts}</select>`);
+    const sel=wrap.querySelector('select');
+    sel.onchange=()=>{ wrap.classList.toggle('set',!!picked(sel).length); refreshRemix(); };
+    box.appendChild(wrap);
+  });
+  refreshRemix();
+}
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const picked=sel=>[...sel.selectedOptions].map(o=>o.value).filter(Boolean);
+function chosenLevers(){
+  const out={};
+  $$('#levbox select[data-dim]').forEach(s=>{const v=picked(s); if(v.length) out[s.dataset.dim]=v;});
+  return out;
+}
+function missingRequired(){
+  if(!LEVERS) return [];
+  const c=chosenLevers();
+  return LEVERS.dimensions.filter(d=>d.required&&!(c[d.key]||[]).length).map(d=>d.label);
+}
+
+/* ---------- the 49 execution levers ---------- */
+let LVSCHEMA=[];
+fetch('/leverschema').then(r=>r.json()).then(j=>{
+  LVSCHEMA=j.groups||[];
+  const box=$('#lvbox');
+  if(j.error){ box.innerHTML=`<p class=hint>⚠ ${j.error}</p>`; return; }
+  box.innerHTML='';
+  LVSCHEMA.forEach(g=>{
+    const d=document.createElement('details'); d.className='lvg';
+    d.innerHTML=`<summary>${g.label}<span class=lvn data-g="${esc(g.label)}"></span></summary>`;
+    const body=document.createElement('div'); body.className='body';
+    g.levers.forEach(l=>{
+      const row=document.createElement('div'); row.className='lev';
+      const id='lv_'+l.name.replace(/\W+/g,'_');
+      if(l.kind==='choice'){
+        row.innerHTML=`<label>${esc(l.name)}</label>
+          <select id="${id}" data-lever="${esc(l.name)}"><option value="">— model decides</option>`+
+          l.options.map(o=>`<option value="${esc(o)}">${esc(o)}</option>`).join('')+`</select>`;
+      }else{
+        row.innerHTML=`<label>${esc(l.name)}</label>
+          <input id="${id}" data-lever="${esc(l.name)}" list="${id}_dl"
+            placeholder="model decides"><datalist id="${id}_dl">`+
+          l.options.slice(0,40).map(o=>`<option value="${esc(o)}">`).join('')+`</datalist>`;
+      }
+      const f=row.querySelector('[data-lever]');
+      f.oninput=f.onchange=()=>{ row.classList.toggle('set',!!f.value.trim()); lvCount(); };
+      body.appendChild(row);
+    });
+    d.appendChild(body); box.appendChild(d);
+  });
+  lvCount();
+});
+function customLevers(){
+  const out={};
+  $$('#lvbox [data-lever]').forEach(f=>{ const v=f.value.trim();
+    if(v) out[f.dataset.lever]=v; });
+  return out;
+}
+function lvCount(){
+  const n=Object.keys(customLevers()).length;
+  $('#lvcount').textContent=n?`${n} set`:'';
+  LVSCHEMA.forEach(g=>{
+    const c=g.levers.filter(l=>{const f=document.querySelector(`[data-lever="${CSS.escape(l.name)}"]`);
+      return f&&f.value.trim();}).length;
+    const badge=document.querySelector(`.lvn[data-g="${CSS.escape(g.label)}"]`);
+    if(badge) badge.textContent=c?`${c} set`:'';
+  });
+}
+$('#lvclear').onclick=e=>{e.preventDefault();
+  $$('#lvbox [data-lever]').forEach(f=>{f.value='';f.closest('.lev').classList.remove('set');});
+  lvCount();};
+$('#lvfill').onclick=async e=>{e.preventDefault();
+  const id=$('#preset_sel').value;
+  if(!id){ alert('Pick an execution preset first — this copies its 49 values in so you can edit them.'); return; }
+  const j=await (await fetch('/presets/levers',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({preset:id})})).json();
+  if(j.error){ alert(j.error); return; }
+  Object.entries(j.levers||{}).forEach(([k,v])=>{
+    const f=document.querySelector(`[data-lever="${CSS.escape(k)}"]`);
+    if(!f) return;
+    if(f.tagName==='SELECT'&&![...f.options].some(o=>o.value===v)){
+      const o=document.createElement('option'); o.value=o.textContent=v; f.appendChild(o);
+    }
+    f.value=v; f.closest('.lev').classList.add('set');
+  });
+  lvCount();};
+
+/* ---------- write briefs from the levers ---------- */
+$('#writebriefs').onclick=async()=>{
+  const miss=missingRequired();
+  if(!LEVERS){ $('#bfhint').textContent='Load a project and segment first.'; return; }
+  if(miss.length){ $('#bfhint').textContent='Pick a '+miss.join(' and a ').toLowerCase()+' first.'; return; }
+  const b=$('#writebriefs'); b.disabled=true; const was=b.textContent; b.textContent='writing…';
+  try{
+    const j=await (await fetch('/briefs',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project:$('#rx_proj').value,segment:$('#rx_seg').value,
+        chosen:chosenLevers(), preset:$('#preset_sel').value,
+        levers:customLevers(), extra:$('#brief').value.trim()})})).json();
+    if(j.error){ $('#bfhint').textContent='⚠ '+j.error; }
+    else{ BRIEFS=j.briefs; briefPick=new Set(BRIEFS.map(x=>x.id)); renderBriefs(j);
+      $('#bfhint').textContent=`${j.briefs.length} briefs from ${j.model}.`; }
+  }catch(e){ $('#bfhint').textContent='⚠ '+e; }
+  b.disabled=false; b.textContent=was;
+};
+function renderBriefs(meta){
+  const card=$('#briefcard'), list=$('#brieflist');
+  card.hidden=!BRIEFS.length; list.innerHTML='';
+  $('#bfnote').textContent=BRIEFS.length
+    ? 'Tick the ones to render. Each ticked brief is generated against each layout you picked.'
+    : '';
+  BRIEFS.forEach(b=>{
+    const el=document.createElement('div'); el.className='bf on';
+    el.innerHTML=`<h4><input type=checkbox checked data-bf="${esc(b.id)}">
+      <span>${esc(b.id)} · ${esc(b.angle||'')}</span></h4>
+      <p><b>${esc(b.headline||'')}</b></p>
+      <p>${esc(b.subtext||'')}</p>
+      <p style="color:var(--soft)">CTA: ${esc(b.cta||'')}</p>
+      ${b.why?`<p class=vis>${esc(b.why)}</p>`:''}
+      ${b.visual_brief?`<p class=vis>Plate: ${esc(b.visual_brief)}</p>`:''}`;
+    const cb=el.querySelector('input');
+    cb.onchange=()=>{ cb.checked?briefPick.add(b.id):briefPick.delete(b.id);
+      el.classList.toggle('on',cb.checked); refreshRemix(); };
+    list.appendChild(el);
+  });
+  refreshRemix();
+}
+
+/* ---------- generate, with a confirm step ---------- */
+/* One job per (brief × layout). With no briefs written, the brief box is the
+   single brief, so this is one job per layout exactly as before. */
+function buildJobs(){
+  const layouts=[...selected.entries()];
+  const chosen=BRIEFS.filter(b=>briefPick.has(b.id));
+  if(!chosen.length){
+    const t=$('#brief').value.trim();
+    return layouts.map(([rel,nice])=>({rel,nice,brief:t,label:nice}));
+  }
+  const out=[];
+  chosen.forEach(b=>layouts.forEach(([rel,nice])=>
+    out.push({rel,nice,brief:b.image_brief,label:`${b.id} · ${nice}`})));
+  return out;
+}
+
+const SEP='\n\n════════ JOB %n% · %label% ════════\n\n';
+const sepRe=/\n*════════ JOB \d+ · .*? ════════\n*/;
+
+let pending=null;
 $('#go').onclick=async()=>{
-  const brief=$('#brief').value.trim(), size=$('#size').value;
-  $('#resultscard').hidden=false; const res=$('#results'); res.innerHTML='';
+  const jobs=buildJobs();
+  if(!jobs.length) return;
+  const payload=j=>({product,reference:j.rel,brief:j.brief,size:$('#size').value,
+    preset:$('#preset_sel').value, conflict_mode:cfMode(), levers:customLevers(),
+    strip_exif:$('#stripexif')?$('#stripexif').checked:false});
   $('#go').disabled=true;
-  const jobs=[...selected.entries()];
-  const cards=jobs.map(([rel,nice])=>{ const el=document.createElement('div');
-    el.className='res'; el.innerHTML=`<div class=spin>generating…<br><small>${nice}</small></div>`;
+  try{
+    const texts=[];
+    for(const j of jobs){
+      const r=await (await fetch('/prompt',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify(payload(j))})).json();
+      if(r.error){ $('#gohint').textContent='⚠ '+r.error; $('#go').disabled=false; return; }
+      texts.push(r.prompt);
+    }
+    pending={jobs,payload};
+    $('#pmtext').value=texts.map((t,i)=>
+      jobs.length>1?SEP.replace('%n%',i+1).replace('%label%',jobs[i].label).trimStart()+t:t
+    ).join('\n');
+    const nset=Object.keys(customLevers()).length;
+    $('#pmsub').textContent=`${jobs.length} image${jobs.length>1?'s':''} · `+
+      ($('#preset_sel').value?`preset ${$('#preset_sel').value} · `:'no preset · ')+
+      `${nset} lever${nset===1?'':'s'} set explicitly. This is the exact text that will be sent — edit it here if you want.`;
+    $('#pmcost').textContent='Nothing has been sent yet.';
+    $('#pmwrap').classList.remove('hide');
+  }catch(e){ $('#gohint').textContent='⚠ '+e; $('#go').disabled=false; }
+};
+$('#pmcancel').onclick=()=>{ $('#pmwrap').classList.add('hide'); pending=null; $('#go').disabled=false; };
+$('#pmwrap').onclick=e=>{ if(e.target===$('#pmwrap')) $('#pmcancel').click(); };
+$('#pmgo').onclick=async()=>{
+  if(!pending) return;
+  const {jobs,payload}=pending;
+  /* Split the reviewed text back into per-job prompts, so what was on screen is
+     what each job sends — including any edit just made in the box. */
+  const raw=$('#pmtext').value;
+  const parts=jobs.length>1?raw.split(sepRe).filter(s=>s.trim()):[raw];
+  if(parts.length!==jobs.length){
+    $('#pmcost').textContent=`⚠ the job separators were edited — expected ${jobs.length} sections, found ${parts.length}. Cancel and try again.`;
+    return;
+  }
+  $('#pmwrap').classList.add('hide'); pending=null;
+  $('#resultscard').hidden=false; const res=$('#results'); res.innerHTML='';
+  const cards=jobs.map(j=>{ const el=document.createElement('div');
+    el.className='res'; el.innerHTML=`<div class=spin>generating…<br><small>${esc(j.label)}</small></div>`;
     res.appendChild(el); return el;});
   for(let i=0;i<jobs.length;i++){
-    const [rel,nice]=jobs[i];
+    const job=jobs[i], rel=job.rel, nice=job.label;
     try{
+      const body={...payload(job), prompt:parts[i].trim()};
       const r=await fetch('/generate',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({product,reference:rel,brief,size,
-        preset:$('#preset_sel').value, conflict_mode:cfMode(),
-        strip_exif:$('#stripexif')?$('#stripexif').checked:false})});
+        body:JSON.stringify(body)});
       const j=await r.json();
       if(j.error) cards[i].innerHTML=`<div class=err>✕ ${j.error}</div>`;
       else{ const nm=rel.split('/').pop().replace(/\.[^.]+$/,'');
@@ -1028,7 +1409,7 @@ $('#go').onclick=async()=>{
           ? `<div style="font-size:11px;padding:5px 8px;border-radius:6px;margin-top:6px;
                background:var(--accent-soft);color:var(--accent)">▣ ${j.preset}</div>`
           : '';
-        cards[i].innerHTML=`<img src="${j.image}"><div class=meta><span>${nice}</span>`+
+        cards[i].innerHTML=`<img src="${j.image}"><div class=meta><span>${esc(nice)}</span>`+
           `<a download="remix_${nm}.png" href="${j.image}">download</a></div>${pres}${badge}`;}
     }catch(e){ cards[i].innerHTML=`<div class=err>✕ ${e}</div>`; }
   }
@@ -1520,6 +1901,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(project_summary(n) or {}))
         if u.path == "/library":
             return self._send(200, json.dumps(library()))
+        if u.path == "/levers":
+            q = urllib.parse.parse_qs(u.query)
+            try:
+                return self._send(200, json.dumps(levers.load(
+                    q.get("project", [""])[0], q.get("segment", [""])[0])))
+            except levers.LeverError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+        if u.path == "/leverschema":
+            try:
+                return self._send(200, json.dumps({"groups": presets.schema()}))
+            except presets.PresetError as e:
+                return self._send(200, json.dumps({"error": str(e), "groups": []}))
         if u.path == "/presets":
             try:
                 items = presets.catalogue()
@@ -1657,6 +2050,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 open(dest, "wb").write(raw)
                 saved.append(os.path.relpath(dest, REFS))
             return self._send(200, json.dumps({"saved": saved, "failed": failed}))
+        if path == "/presets/levers":
+            req = self._json()
+            try:
+                p = presets.by_id(req.get("preset", ""))
+            except presets.PresetError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            return self._send(200, json.dumps(
+                {"preset": {"id": p["id"], "name": p["name"]},
+                 "levers": p["levers"]}))
         if path == "/presets/conflicts":
             req = self._json()
             try:
@@ -1679,6 +2081,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     req.get("brief", ""), req.get("reference", ""), keys)))
             except presets.PresetError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
+        if path == "/prompt":
+            return self._prompt(self._json())
+        if path == "/briefs":
+            return self._briefs(self._json())
         if path == "/generate":
             return self._generate(self._json())
         if path == "/run":
@@ -1711,6 +2117,82 @@ class Handler(http.server.BaseHTTPRequestHandler):
             {"ok": True, "path": dest, "bytes": len(raw),
              "rel": os.path.relpath(dest, ROOT)}))
 
+    def _prompt(self, req):
+        """Assemble the prompt without sending it, so it can be reviewed first.
+
+        Generation is the step that costs money and cannot be undone, so the
+        exact text goes back to the browser and nothing is sent until it comes
+        back confirmed.
+        """
+        try:
+            prompt, chosen, mode = build_image_prompt(req)
+        except presets.PresetError as e:
+            return self._send(200, json.dumps({"error": str(e)}))
+        return self._send(200, json.dumps({
+            "prompt": prompt,
+            "preset": (f"{chosen['id']} {chosen['name']} · "
+                       f"{'preset' if mode == 'preset' else 'reference'} wins"
+                       if chosen else None),
+            "levers_set": len({k: v for k, v in (req.get("levers") or {}).items()
+                               if str(v).strip()}),
+        }))
+
+    def _briefs(self, req):
+        with _lock:
+            keys = dict(KEYS)
+        project = req.get("project") or ""
+        segment = req.get("segment") or ""
+        try:
+            data = levers.load(project, segment)
+        except levers.LeverError as e:
+            return self._send(200, json.dumps({"error": str(e)}))
+
+        chosen = req.get("chosen") or {}
+        missing = levers.missing_required(chosen)
+        if missing:
+            return self._send(200, json.dumps(
+                {"error": "Pick a " + " and a ".join(m.lower() for m in missing)
+                          + " first."}))
+        lever_text = levers.selection_text(data, chosen)
+
+        preset = None
+        if req.get("preset"):
+            try:
+                preset = presets.by_id(req["preset"])
+            except presets.PresetError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+
+        cfg = {}
+        try:
+            cfg = json.load(open(os.path.join(ROOT, "projects", project,
+                                              "project.json"), encoding="utf-8"))
+        except Exception:
+            pass
+        facts = ""
+        if cfg.get("facts"):
+            try:
+                facts = open(os.path.join(ROOT, cfg["facts"]), encoding="utf-8").read()
+            except OSError:
+                facts = ""
+
+        try:
+            n = max(1, min(8, int(req.get("n") or
+                                  cfg.get("creative", {}).get("briefs_per_run", 4))))
+        except (TypeError, ValueError):
+            n = 4
+
+        try:
+            out = briefs.write(
+                lever_text, n=n, keys=keys,
+                product=cfg.get("product", ""), market=cfg.get("market", ""),
+                compliance=compliance_notes(project) if project else "",
+                facts=facts, preset=preset,
+                custom_levers=req.get("levers") or {},
+                extra=req.get("extra") or "")
+        except briefs.BriefError as e:
+            return self._send(200, json.dumps({"error": str(e)}))
+        return self._send(200, json.dumps(out))
+
     def _generate(self, req):
         with _lock:
             key = KEYS.get("openai", "")
@@ -1731,33 +2213,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except remix.RemixError as e:
             return self._send(200, json.dumps({"error": str(e)}))
 
-        # The preset (if any) decides how strictly the reference layout is held.
-        # Without one, the reference is the only direction there is, so it's fixed.
-        mode = "preset" if req.get("conflict_mode") == "preset" else "reference"
-        chosen = None
-        if req.get("preset"):
-            try:
-                chosen = presets.by_id(req["preset"])
-            except presets.PresetError as e:
-                return self._send(200, json.dumps({"error": str(e)}))
-
-        if chosen and mode == "preset":
-            head = ("Use this reference ad as the starting point for layout and "
-                    "composition, and the item in the second image as the product. "
-                    "Replace all copy with the brief below. You may adapt the "
-                    "reference's structure where the execution preset requires it. "
-                    "Render every word spelled exactly as written; put no text "
-                    "anywhere the brief doesn't specify.")
-        else:
-            head = ("Recreate this reference ad's exact layout, composition and text "
-                    "placement, but replace the product with the item shown in the "
-                    "second image and replace all copy with the brief below. Keep the "
-                    "reference's structure and proportions. Render every word spelled "
-                    "exactly as written; put no text anywhere the brief doesn't specify.")
-
-        prompt = head + "\n\nBRIEF:\n" + (req.get("brief") or "").strip()
-        if chosen:
-            prompt += "\n\n" + presets.prompt_block(chosen, mode)
+        # Use the prompt the operator confirmed, verbatim. Rebuilding it here
+        # would mean the text they approved and the text that gets sent are
+        # produced twice and could differ; the point of the review step is that
+        # they cannot.
+        try:
+            built, chosen, mode = build_image_prompt(req)
+        except presets.PresetError as e:
+            return self._send(200, json.dumps({"error": str(e)}))
+        prompt = (req.get("prompt") or "").strip() or built
         try:
             out = remix.remix_images(
                 prompt,

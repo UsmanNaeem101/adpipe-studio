@@ -185,6 +185,27 @@ narrows action rather than being proportionate caution, and it's recorded
 truth-neutrally. If it doesn't, leave it out — a belief without a shown constraint
 belongs to the beliefs skill, not here.
 
+### Item shape
+
+Write each retained item as its own `###` heading — the item's name and nothing
+else — then the fields above as `- **Label** — value` bullets, and any verbatim
+quotes as `>` blockquotes:
+
+```text
+### Short recognisable name
+
+- **Statement** — one sentence
+- **Frequency** — roughly how many different people
+- **Basis** — observed
+
+> "a verbatim quote"
+```
+
+Keep every retained item at that one heading level, so the set reads back as a
+list. Counts, method notes and anything that is not an item go under their own
+separate heading — never between the items. The studio parses this file to fill
+the lever pickers, and an item it cannot see is an item you cannot select.
+
 ## Quick reference
 
 ```
