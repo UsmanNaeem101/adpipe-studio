@@ -126,7 +126,8 @@ def skill(n):
     """Read skill NN_*.md — the instruction for one pipeline stage."""
     for f in sorted(os.listdir(SKILLS)):
         if f.startswith(f"{n:02d}_") and f.endswith(".md"):
-            return f[:-3], open(os.path.join(SKILLS, f), encoding="utf-8").read()
+            with open(os.path.join(SKILLS, f), encoding="utf-8") as fh:
+                return f[:-3], fh.read()
     sys.exit(f"Skill {n:02d} not found in {SKILLS}")
 
 
@@ -237,6 +238,214 @@ DEDUP_SCHEMA = {
     "required": ["groups"], "additionalProperties": False,
 }
 
+
+class BatchOutputError(RuntimeError):
+    """A paid model batch completed but did not satisfy its data contract."""
+
+
+def _json_object(text):
+    """Read a JSON object, tolerating a provider wrapping it in a code fence."""
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, count=1, flags=re.I)
+        raw = re.sub(r"\s*```$", "", raw, count=1)
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as first:
+        start = raw.find("{")
+        if start < 0:
+            raise ValueError(str(first)) from first
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(raw[start:])
+        except json.JSONDecodeError as second:
+            raise ValueError(str(second)) from second
+    if not isinstance(obj, dict):
+        raise ValueError("top-level response is not an object")
+    return obj
+
+
+def _schema_issue(value, schema, path="$"):
+    """Return the first useful JSON-schema error for our pipeline schemas.
+
+    Providers should enforce these schemas, but this local check catches a route
+    that ignored response_format and lets the recovery pass repair it safely.
+    """
+    if not schema:
+        return None
+    kind = schema.get("type")
+    valid = {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+    }.get(kind, True)
+    if not valid:
+        return f"{path} must be {kind}"
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{path} is not an allowed value"
+    if kind == "object":
+        for name in schema.get("required", []):
+            if name not in value:
+                return f"{path}.{name} is required"
+        props = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            extra = set(value) - set(props)
+            if extra:
+                return f"{path} has unexpected field {sorted(extra)[0]!r}"
+        for name, child in value.items():
+            if name in props:
+                issue = _schema_issue(child, props[name], f"{path}.{name}")
+                if issue:
+                    return issue
+    elif kind == "array" and "items" in schema:
+        for n, child in enumerate(value):
+            issue = _schema_issue(child, schema["items"], f"{path}[{n}]")
+            if issue:
+                return issue
+    return None
+
+
+def _coverage_issue(rows, expected_ids):
+    """Describe missing, unknown, or repeated evidence IDs, if any."""
+    got = [r.get("evidence_id") for r in rows if isinstance(r, dict)]
+    counts = Counter(got)
+    missing = sorted(set(expected_ids) - set(got))
+    extra = sorted(set(got) - set(expected_ids), key=str)
+    duplicate = sorted((i for i, n in counts.items() if n > 1), key=str)
+    bits = []
+    if missing:
+        bits.append(f"{len(missing)} missing")
+    if extra:
+        bits.append(f"{len(extra)} unknown")
+    if duplicate:
+        bits.append(f"{len(duplicate)} duplicated")
+    if len(got) != len(rows):
+        bits.append("non-object rows")
+    return ", ".join(bits) if bits else None
+
+
+def _decode_job_rows(job, raw, key):
+    payload = _json_object(raw)
+    issue = _schema_issue(payload, job.schema)
+    if issue:
+        raise ValueError(issue)
+    try:
+        rows = payload[key]
+    except KeyError as e:
+        raise ValueError(f"missing top-level {key!r}") from e
+    if not isinstance(rows, list):
+        raise ValueError(f"{key!r} is not a list")
+    if job.expected_ids is not None:
+        issue = _coverage_issue(rows, job.expected_ids)
+        if issue:
+            raise ValueError(f"incomplete record coverage ({issue})")
+    return rows
+
+
+def _raw_text(value):
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _repair_batch(client_, corpus, preamble, failures, key):
+    """Reformat failed model outputs in one structured recovery batch."""
+    from llm import Job
+
+    jobs = []
+    for job, raw, reason in failures:
+        raw = _raw_text(raw)
+        prior = raw if raw.strip() else "[No response was returned. Re-run the request.]"
+        prompt = (
+            "RECOVERY TASK: The previous model response could not be consumed by "
+            f"the pipeline because: {reason}.\n\n"
+            "Return JSON only and obey the supplied JSON schema exactly. Preserve "
+            "every decision, reason, group, score, cue, and assignment that is "
+            "already present in the previous response; this is data-shape repair, "
+            "not a chance to reconsider those judgments. Use the original request "
+            "only to restore an omitted input row or to re-run the job when no "
+            "response was returned. The final top-level array must be named "
+            f"{key!r}. Do not add commentary or Markdown.\n\n"
+            "ORIGINAL REQUEST:\n\n" + job.prompt +
+            "\n\nPREVIOUS RESPONSE:\n\n" + prior)
+        jobs.append(Job(id=job.id, prompt=prompt, max_tokens=job.max_tokens,
+                        schema=job.schema, expected_ids=job.expected_ids))
+    return client_.batch(corpus, preamble, jobs)
+
+
+def _batch_rows(results, jobs, key, diagnostics_dir, repair=None):
+    """Decode all jobs, repairing malformed responses before failing the stage.
+
+    `repair` receives all failed (job, raw, reason) tuples and returns replacement
+    raw responses keyed by job id. Originals and replacements are retained for an
+    audit trail; nothing is silently discarded.
+    """
+    by_id = {j.id: j for j in jobs}
+    failures, decoded = [], {}
+    for jid, job in sorted(by_id.items()):
+        raw = _raw_text(results.get(jid, ""))
+        try:
+            if jid not in results:
+                raise ValueError("no response returned")
+            decoded[jid] = _decode_job_rows(job, raw, key)
+        except (ValueError, TypeError) as e:
+            failures.append((job, raw, str(e)))
+
+    unexpected = sorted(set(results) - set(by_id))
+    if failures:
+        os.makedirs(diagnostics_dir, exist_ok=True)
+        for job, raw, reason in failures:
+            with open(os.path.join(diagnostics_dir, f"{job.id}.original.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(f"ERROR: {reason}\n\n{raw}")
+
+    if failures and repair is not None:
+        print(f"  ! repairing {len(failures)} malformed/missing {key} response(s) "
+              "in one additional structured batch")
+        repaired = repair(failures)
+        still_bad = []
+        for job, original, original_reason in failures:
+            raw = _raw_text(repaired.get(job.id, ""))
+            with open(os.path.join(diagnostics_dir, f"{job.id}.repaired.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(raw)
+            try:
+                if job.id not in repaired:
+                    raise ValueError("repair returned no response")
+                decoded[job.id] = _decode_job_rows(job, raw, key)
+            except (ValueError, TypeError) as e:
+                still_bad.append((job, original, original_reason, str(e)))
+        failures = [(job, raw, f"original: {old}; repair: {new}")
+                    for job, raw, old, new in still_bad]
+
+    if unexpected:
+        os.makedirs(diagnostics_dir, exist_ok=True)
+        for jid in unexpected:
+            with open(os.path.join(diagnostics_dir, f"{jid}.unexpected.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(_raw_text(results[jid]))
+
+    if failures or unexpected:
+        descriptions = [(job.id, reason) for job, _, reason in failures]
+        descriptions.extend((jid, "unexpected response id") for jid in unexpected)
+        sample = "; ".join(f"{jid}: {reason}" for jid, reason in descriptions[:3])
+        raise BatchOutputError(
+            f"{len(descriptions)}/{len(jobs)} batch response(s) still violated the "
+            f"{key!r} JSON contract after recovery ({sample}). Original and repaired "
+            f"responses were saved to {diagnostics_dir}. No stage output was written.")
+    return [row for jid in sorted(decoded) for row in decoded[jid]]
+
+
+def _require_exact_ids(rows, expected_ids, label):
+    """Ensure a per-record model stage judged every input exactly once."""
+    issue = _coverage_issue(rows, expected_ids)
+    if issue:
+        raise BatchOutputError(
+            f"{label} returned incomplete record coverage ({issue}). "
+            "No stage output was written.")
+
 # Interface chrome. Skill 01 explicitly permits stripping junk AROUND a comment,
 # so removing these deterministically costs nothing and never touches customer words.
 BOILER = re.compile(
@@ -260,7 +469,8 @@ def cmd_ingest(cfg, args):
     """
     from llm import Job, confirm
 
-    raw = open(args.source, encoding="utf-8", errors="ignore").read()
+    with open(args.source, encoding="utf-8", errors="ignore") as fh:
+        raw = fh.read()
     blocks = parse_voc(raw)
     voc = pdir(cfg, "voc")
 
@@ -303,10 +513,13 @@ def cmd_ingest(cfg, args):
                 prompt=("Apply skill 01 to each record below. Decide retain or reject "
                         "and give the reason(s). Keep concrete first-person experience "
                         "by default. Never rewrite, tidy or correct customer words — "
-                        "you are only deciding what gets in. Leave the unused reason "
-                        "array empty.\n\nRECORDS:\n\n"
+                        "you are only deciding what gets in. Return JSON only as "
+                        "{\"records\":[...]}, with exactly one object per input record "
+                        "and the numeric [id] copied to evidence_id. Leave the unused "
+                        "reason array empty.\n\nRECORDS:\n\n"
                         + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
-                max_tokens=8000)
+                max_tokens=8000, schema=FILTER_SCHEMA,
+                expected_ids=tuple(r["id"] for r in ch))
             for n, ch in enumerate(chunks)]
 
     prefix = f"{s01}\n\n---\n\n{ctx}"
@@ -314,22 +527,17 @@ def cmd_ingest(cfg, args):
     if not confirm(c.estimate(prefix, PREAMBLE, jobs, batched=True), args.yes):
         return
     c.prewarm(prefix, PREAMBLE)
-    verdicts = {}
-    for out in c.batch(prefix, PREAMBLE, jobs).values():
-        try:
-            for r in json.loads(out)["records"]:
-                verdicts[r["evidence_id"]] = r
-        except (json.JSONDecodeError, KeyError):
-            print("  ! a chunk returned unparseable JSON and was skipped")
+    records = _batch_rows(
+        c.batch(prefix, PREAMBLE, jobs), jobs, "records",
+        os.path.join(voc, "_model_failures", "01_filter"),
+        repair=lambda failed: _repair_batch(c, prefix, PREAMBLE, failed, "records"))
+    _require_exact_ids(records, {r["id"] for r in pre}, "skill 01 filter")
+    verdicts = {r["evidence_id"]: r for r in records}
 
     retained = [{**r, **verdicts[r["id"]]} for r in pre
                 if verdicts.get(r["id"], {}).get("decision") == "retain"]
     rejected = [{**r, **verdicts[r["id"]]} for r in pre
                 if verdicts.get(r["id"], {}).get("decision") == "reject"]
-    unjudged = [r for r in pre if r["id"] not in verdicts]
-    if unjudged:
-        print(f"  ! {len(unjudged)} record(s) got no verdict — retained by default")
-        retained += unjudged
     _write_jsonl(os.path.join(voc, "retained_voc.jsonl"), retained)
     _write_jsonl(os.path.join(voc, "rejected_voc.jsonl"), rejected)
     print(f"  01 filter: {len(retained):,} retained · {len(rejected):,} rejected")
@@ -344,10 +552,11 @@ def cmd_ingest(cfg, args):
                          "different people describing the same pain is ten data "
                          "points, not one; keyword overlap is never enough. When "
                          "unsure, do not merge. Return only groups you are "
-                         "confident in; an empty list is a valid answer.\n\n"
+                         "confident in. Return JSON only as {\"groups\":[...]}; an "
+                         "empty groups list is a valid answer.\n\n"
                          "RECORDS:\n\n"
                          + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
-                 max_tokens=6000)
+                 max_tokens=6000, schema=DEDUP_SCHEMA)
              for n, ch in enumerate(dchunks)]
 
     dprefix = f"{s02}\n\n---\n\n{ctx}"
@@ -355,14 +564,13 @@ def cmd_ingest(cfg, args):
     if not confirm(c.estimate(dprefix, PREAMBLE, djobs, batched=True), args.yes):
         return
     c.prewarm(dprefix, PREAMBLE)
-    drop, groups = set(), []
-    for out in c.batch(dprefix, PREAMBLE, djobs).values():
-        try:
-            for g in json.loads(out)["groups"]:
-                groups.append(g)
-                drop.update(i for i in g["duplicate_ids"] if i != g["canonical_id"])
-        except (json.JSONDecodeError, KeyError):
-            print("  ! a chunk returned unparseable JSON and was skipped")
+    drop = set()
+    groups = _batch_rows(
+        c.batch(dprefix, PREAMBLE, djobs), djobs, "groups",
+        os.path.join(voc, "_model_failures", "02_deduplicate"),
+        repair=lambda failed: _repair_batch(c, dprefix, PREAMBLE, failed, "groups"))
+    for g in groups:
+        drop.update(i for i in g["duplicate_ids"] if i != g["canonical_id"])
 
     deduped = [r for r in retained if r["id"] not in drop]
     _write_jsonl(os.path.join(voc, "deduplicated_voc.jsonl"), deduped)
@@ -583,9 +791,12 @@ def cmd_segment(cfg, args):
                             "unassigned_* status and set primary_segment_id to \"\". "
                             "Unassigned is a valid, correct outcome — never force a fit. "
                             "Record secondary_attributes separately; they must not "
-                            "influence the primary choice.\n\nEVIDENCE:\n\n"
+                            "influence the primary choice. Return JSON only as "
+                            "{\"assignments\":[...]}, with exactly one object per input "
+                            "and the numeric [id] copied to evidence_id.\n\nEVIDENCE:\n\n"
                             + "\n\n".join(f"[{i['id']}] {i['text']}" for i in ch)),
-                    max_tokens=16000)
+                    max_tokens=16000, schema=ASSIGN_SCHEMA,
+                    expected_ids=tuple(i["id"] for i in ch))
                 for n, ch in enumerate(chunks)]
 
         print(f"  05 assign: {len(items):,} items in {len(jobs)} batched chunks")
@@ -594,12 +805,12 @@ def cmd_segment(cfg, args):
         c.prewarm(prefix, PREAMBLE)
         results = c.batch(prefix, PREAMBLE, jobs)
 
-        rows = []
-        for out in results.values():
-            try:
-                rows += json.loads(out)["assignments"]
-            except (json.JSONDecodeError, KeyError):
-                print("  ! a chunk returned unparseable JSON and was skipped")
+        rows = _batch_rows(
+            results, jobs, "assignments",
+            os.path.join(voc, "_model_failures", "05_assign"),
+            repair=lambda failed: _repair_batch(
+                c, prefix, PREAMBLE, failed, "assignments"))
+        _require_exact_ids(rows, {i["id"] for i in items}, "skill 05 assignment")
         with open(asg_p, "w", encoding="utf-8") as fh:
             for r in rows:
                 fh.write(json.dumps(r) + "\n")
@@ -1143,6 +1354,8 @@ def main():
         args.fn(cfg, args)
     except KeyboardInterrupt:
         sys.exit("\nInterrupted. Completed stages are on disk; re-run to continue.")
+    except BatchOutputError as e:
+        sys.exit(f"\n  MODEL OUTPUT ERROR — {e}")
     except Exception as e:
         # Turn SDK errors into one actionable line instead of a traceback.
         name = type(e).__name__

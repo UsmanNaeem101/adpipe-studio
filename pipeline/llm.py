@@ -48,6 +48,10 @@ class Job:
     id: str
     prompt: str
     max_tokens: int = 16000
+    schema: dict | None = None
+    # Per-record stages use this to prove that a response covered the complete
+    # input chunk before any output is accepted or written.
+    expected_ids: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -226,7 +230,7 @@ class Client:
         batch = self.client.messages.batches.create(requests=[
             Request(custom_id=j.id,
                     params=MessageCreateParamsNonStreaming(
-                        **self._params(system, j.prompt, j.max_tokens)))
+                        **self._params(system, j.prompt, j.max_tokens, j.schema)))
             for j in jobs
         ])
         if self.verbose:

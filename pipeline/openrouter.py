@@ -93,12 +93,14 @@ class Client:
     def _post(self, messages, max_tokens, schema=None, retries=3):
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens}
         if schema:
-            # OpenAI-compatible structured output. Not every OpenRouter model
-            # honours it; those that don't just return prose, which the caller's
-            # json.loads will surface as a clear error rather than silent garbage.
+            # Require a route that supports structured output. Without
+            # require_parameters OpenRouter may select a provider that silently
+            # drops response_format, leaving the caller with prose instead of the
+            # JSON contract it asked for.
             body["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {"name": "result", "strict": True, "schema": schema}}
+            body["provider"] = {"require_parameters": True}
         req = urllib.request.Request(
             API, data=json.dumps(body).encode(), method="POST",
             headers={"Authorization": f"Bearer {self.key}",
@@ -115,6 +117,26 @@ class Client:
                 return payload["choices"][0]["message"]["content"] or ""
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "replace")[:400]
+                unsupported_schema = (
+                    schema and e.code in (400, 404, 422)
+                    and any(word in detail.lower() for word in
+                            ("response_format", "json_schema", "structured",
+                             "requested parameters", "unsupported parameter")))
+                if unsupported_schema:
+                    # Some model routes have no endpoint that can enforce
+                    # response_format. Still get the model's answer: put the
+                    # schema in the prompt, then let cli.py validate and, if
+                    # necessary, run its audited repair pass.
+                    fallback = [dict(m) for m in messages]
+                    fallback[-1] = dict(fallback[-1])
+                    fallback[-1]["content"] = (
+                        fallback[-1].get("content", "")
+                        + "\n\nReturn JSON only, matching this schema exactly:\n"
+                        + json.dumps(schema, separators=(",", ":")))
+                    if self.verbose:
+                        print("  ! this OpenRouter route cannot enforce JSON schema; "
+                              "retrying with prompt-level schema and local validation")
+                    return self._post(fallback, max_tokens, schema=None, retries=retries)
                 if e.code in (429, 500, 502, 503) and attempt < retries - 1:
                     time.sleep(2 ** attempt * 5); continue
                 if e.code == 401:
@@ -170,7 +192,7 @@ class Client:
         def run(j):
             return j.id, self._post(
                 [{"role": "system", "content": system},
-                 {"role": "user", "content": j.prompt}], j.max_tokens)
+                 {"role": "user", "content": j.prompt}], j.max_tokens, j.schema)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = [pool.submit(run, j) for j in jobs]
