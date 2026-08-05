@@ -813,6 +813,13 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
       </label>
       <p class=hint>Full path to the exported Reddit dump.</p>
     </div>
+    <div id=segvocbox class="hide" style="margin-top:16px">
+      <label>VOC source for segmentation</label>
+      <select id=segvoc style="width:100%">
+        <option value="">Default (filtered_voc.jsonl — the deduplicated set)</option>
+      </select>
+      <p class=hint>Pick which ingest output to run segment on. Shows files from voc/*. jsonl.</p>
+    </div>
     <div id=opt_model style="margin-top:16px">
       <div class=row>
         <div><label>Provider</label><select id=provider>
@@ -1425,6 +1432,9 @@ const STAGES=__STAGES__;
       (s.costs?'<div class=costs>COSTS API CREDIT</div>':'');
     d.onclick=()=>{ stage=s; $$('.stage').forEach(x=>x.classList.remove('on'));
       d.classList.add('on'); $('#ingestbox').classList.toggle('hide',!s.source);
+      const showSeg = s.name==='segment';
+      $('#segvocbox').classList.toggle('hide',!showSeg);
+      if(showSeg) loadVocFiles();
       $('#runbtn').disabled=false;
       $('#runhint').textContent=s.costs?'This stage calls the Claude API — tick the approval box.':'Free — pure code.';
     };
@@ -1440,6 +1450,17 @@ async function loadSegs(){
   $('#seg').innerHTML=j.segments.length?j.segments.map(x=>`<option>${x}</option>`).join('')
     :'<option value="">— none yet —</option>';
 }
+async function loadVocFiles(){
+  const pr=$('#proj').value; if(!pr)return;
+  const s=$('#segvoc'); const was=s.value;
+  s.innerHTML='<option value="">Default (filtered_voc.jsonl)</option>';
+  try{
+    const j=await (await fetch('/voc-files?project='+encodeURIComponent(pr))).json();
+    (j.files||[]).forEach(f=>{const o=document.createElement('option');
+      o.value=f.path; o.textContent=f.name; s.appendChild(o);});
+    if(was&&[...s.options].some(o=>o.value===was))s.value=was;
+  }catch(e){}
+}
 $('#runbtn').onclick=async()=>{
   if(!stage) return;
   const free = stage.name==='ingest' && $('#rulesonly').checked;
@@ -1447,7 +1468,8 @@ $('#runbtn').onclick=async()=>{
     $('#runhint').textContent='Tick the approval box first — this stage spends credit.'; return; }
   const log=$('#log'); log.textContent=''; $('#runbtn').disabled=true;
   const body={stage:stage.name,project:$('#proj').value,segment:$('#seg').value,
-              source:$('#ingestpath').value.trim(),approve:$('#approve').checked,
+              source:$('#ingestpath').value.trim(),voc_source:$('#segvoc')?$('#segvoc').value:'',
+              approve:$('#approve').checked,
               rules_only:$('#rulesonly').checked,
               n_concepts:+$('#nconcepts').value||0, n_hooks:+$('#nhooks').value||0,
               n_briefs:+$('#nbriefs').value||0,
@@ -1477,7 +1499,9 @@ $('#npbtn').onclick=async()=>{
   m.textContent='Created '+r.project+' — now edit its project.json filter regexes for this niche.';
   m.style.color='var(--accent)';
   $('#npname').value=$('#npproduct').value=$('#npmarket').value='';
-  loadProjects();
+  // Reload project lists in other tabs — safe if the DOM is not ready yet.
+  if(typeof refreshRemix==='function'&&$('#rx_proj'))$('#rx_proj').onchange();
+  if($('#oproj')&&$('#oproj').onchange)$('#oproj').onchange();
 };
 
 /* ---------- VOC upload ---------- */
@@ -1665,6 +1689,18 @@ async function viewFile(path,kind){
 }
 $('#orefresh')&&($('#orefresh').onclick=loadOutputs);
 $('#oproj')&&($('#oproj').onchange=loadOutputs);
+/* Populate the output tab's project picker if empty. This runs once but is
+   safe to re-fire: setting .innerHTML on an already-populated select is a no-op
+   because the option values are the same. */
+if($('#oproj')&&!$('#oproj').options.length){
+  fetch('/projects').then(r=>r.json()).then(j=>{
+    const s=$('#oproj'); s.innerHTML='<option value="">—</option>';
+    (j.projects||[]).forEach(p=>{const o=document.createElement('option');
+      o.value=o.textContent=p; s.appendChild(o);});
+    if((j.projects||[]).length===1){s.value=j.projects[0];s.onchange();}
+    else if($('#oproj').options.length===1){s.value=j.projects[0];s.onchange();}
+  });
+}
 
 /* ================= reference library ================= */
 LIB=null; LSEL=new Set(); LDUPE=false; var LSHOWN=0, LCUR=null, LZOOM=1;
@@ -1927,6 +1963,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/outputs":
             pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             return self._send(200, json.dumps(project_outputs(pr) if pr else {}))
+        if u.path == "/voc-files":
+            pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
+            if pr not in projects():
+                return self._send(200, json.dumps({"error": "unknown project"}))
+            voc_dir = os.path.join(ROOT, "projects", pr, "voc")
+            files = []
+            if os.path.isdir(voc_dir):
+                for f in sorted(os.listdir(voc_dir)):
+                    if f.endswith(".jsonl"):
+                        files.append({"name": f, "path": os.path.join(voc_dir, f)})
+            return self._send(200, json.dumps({"files": files}))
         if u.path == "/file":
             q = urllib.parse.parse_qs(u.query)
             rel = q.get("path", [""])[0]
@@ -2286,6 +2333,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, "No segment selected.\n",
                                   "text/plain; charset=utf-8")
             cmd.append(seg)
+        elif stage == "segment":
+            vsrc = req.get("voc_source") or ""
+            if vsrc:
+                if not os.path.exists(vsrc):
+                    return self._send(200, f"VOC source not found:\n  {vsrc}\n",
+                                      "text/plain; charset=utf-8")
+                cmd += ["--source", vsrc]
 
         env = dict(os.environ)
         with _lock:

@@ -484,9 +484,10 @@ def cmd_segment(cfg, args):
     """
     from llm import Job, confirm
 
-    src = os.path.join(cfg["_dir"], "voc", "filtered_voc.jsonl")
+    src = (getattr(args, "source", None)
+           or os.path.join(cfg["_dir"], "voc", "filtered_voc.jsonl"))
     if not os.path.exists(src):
-        sys.exit(f"No filtered VOC. Run: adpipe -p {cfg['name']} ingest <raw.txt>")
+        sys.exit(f"No VOC source at {src}. Run: adpipe -p {cfg['name']} ingest <raw.txt>")
     items = [json.loads(l) for l in open(src, encoding="utf-8")]
     by_id = {i["id"]: i for i in items}
     voc = pdir(cfg, "voc")
@@ -1115,6 +1116,7 @@ def main():
     s.set_defaults(fn=cmd_ingest)
     s = common(sub.add_parser("segment")); s.add_argument("--rediscover", action="store_true")
     s.add_argument("--reassign", action="store_true")
+    s.add_argument("--source", help="VOC file to segment (default: voc/filtered_voc.jsonl)")
     s.set_defaults(fn=cmd_segment)
     s = sub.add_parser("studio", help="open the browser UI"); s.set_defaults(fn=cmd_studio)
     for name, fn in (("extract", cmd_extract), ("picc", cmd_picc), ("concepts", cmd_concepts),
