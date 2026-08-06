@@ -27,6 +27,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+import auditlog
+
 MODEL = "claude-opus-5"
 
 # USD per million tokens. Multipliers per shared/prompt-caching.md.
@@ -195,22 +197,38 @@ class Client:
         """Write the cache entry before a fan-out. Parallel requests can't read a
         cache entry that is still being written, so without this every job in a
         batch pays the full corpus price."""
-        r = self.client.messages.create(
-            model=self.model, max_tokens=0,
-            system=self._system(corpus, preamble),
-            messages=[{"role": "user", "content": "warmup"}],
-        )
+        params = {"model": self.model, "max_tokens": 0,
+                  "system": self._system(corpus, preamble),
+                  "messages": [{"role": "user", "content": "warmup"}]}
+        audit = auditlog.start("anthropic", self.model, "cache_prewarm", params,
+                               job_id="warmup")
+        try:
+            r = self.client.messages.create(**params)
+            audit.response(r, text="", usage=getattr(r, "usage", None))
+        except Exception as e:
+            audit.error(e)
+            raise
         self._track(r.usage)
         if self.verbose:
             print(f"  cache warmed: {r.usage.cache_creation_input_tokens:,} tokens written")
 
-    def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None) -> str:
+    def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
+            job_id="single", operation="pipeline_single") -> str:
         """Single request. Always streamed — above ~16k max_tokens a non-streaming
         call risks an HTTP timeout, and these stages run long."""
         params = self._params(self._system(corpus, preamble), prompt, max_tokens, schema)
-        with self.client.messages.stream(**params) as stream:
-            msg = stream.get_final_message()
+        audit = auditlog.start("anthropic", self.model, operation, params,
+                               job_id=job_id)
+        try:
+            with self.client.messages.stream(**params) as stream:
+                msg = stream.get_final_message()
+        except Exception as e:
+            audit.error(e)
+            raise
         self._track(msg.usage)
+
+        text = "".join(b.text for b in msg.content if b.type == "text")
+        audit.response(msg, text=text, usage=msg.usage, stop_reason=msg.stop_reason)
 
         if msg.stop_reason == "refusal":
             cat = getattr(msg.stop_details, "category", None)
@@ -218,7 +236,7 @@ class Client:
         if msg.stop_reason == "max_tokens":
             print(f"  ! output hit max_tokens ({max_tokens}) and is truncated — raise it")
 
-        return "".join(b.text for b in msg.content if b.type == "text")
+        return text
 
     def batch(self, corpus, preamble, jobs, poll_seconds=30) -> dict:
         """Fan out independent jobs at 50%. Results come back keyed by custom_id in
@@ -227,37 +245,63 @@ class Client:
         from anthropic.types.messages.batch_create_params import Request
 
         system = self._system(corpus, preamble)
-        batch = self.client.messages.batches.create(requests=[
-            Request(custom_id=j.id,
-                    params=MessageCreateParamsNonStreaming(
-                        **self._params(system, j.prompt, j.max_tokens, j.schema)))
-            for j in jobs
-        ])
+        params_by_id = {j.id: self._params(
+            system, j.prompt, j.max_tokens, j.schema) for j in jobs}
+        audits = {j.id: auditlog.start(
+            "anthropic", self.model, "pipeline_batch_job", params_by_id[j.id],
+            job_id=j.id) for j in jobs}
+        try:
+            batch = self.client.messages.batches.create(requests=[
+                Request(custom_id=j.id,
+                        params=MessageCreateParamsNonStreaming(**params_by_id[j.id]))
+                for j in jobs
+            ])
+        except Exception as e:
+            for audit in audits.values():
+                audit.error(e, phase="batch_submit")
+            raise
         if self.verbose:
             print(f"  batch {batch.id} submitted ({len(jobs)} requests)")
 
-        while True:
-            b = self.client.messages.batches.retrieve(batch.id)
-            if b.processing_status == "ended":
-                break
-            if self.verbose:
-                c = b.request_counts
-                print(f"    {b.processing_status}: {c.succeeded} done, "
-                      f"{c.processing} running, {c.errored} errored", flush=True)
-            time.sleep(poll_seconds)
+        try:
+            while True:
+                b = self.client.messages.batches.retrieve(batch.id)
+                if b.processing_status == "ended":
+                    break
+                if self.verbose:
+                    c = b.request_counts
+                    print(f"    {b.processing_status}: {c.succeeded} done, "
+                          f"{c.processing} running, {c.errored} errored", flush=True)
+                time.sleep(poll_seconds)
+        except Exception as e:
+            for audit in audits.values():
+                audit.error(e, phase="batch_poll", batch_id=batch.id)
+            raise
 
         out, failed = {}, []
-        for res in self.client.messages.batches.results(batch.id):
-            if res.result.type == "succeeded":
-                m = res.result.message
-                self._track(m.usage)
-                if m.stop_reason == "refusal":
-                    failed.append(f"{res.custom_id}: refused by safety classifiers")
-                    continue
-                out[res.custom_id] = "".join(b.text for b in m.content if b.type == "text")
-            else:
-                detail = getattr(getattr(res.result, "error", None), "type", res.result.type)
-                failed.append(f"{res.custom_id}: {detail}")
+        try:
+            for res in self.client.messages.batches.results(batch.id):
+                if res.result.type == "succeeded":
+                    m = res.result.message
+                    self._track(m.usage)
+                    text = "".join(b.text for b in m.content if b.type == "text")
+                    audits[res.custom_id].response(
+                        m, text=text, usage=m.usage, stop_reason=m.stop_reason,
+                        batch_id=batch.id)
+                    if m.stop_reason == "refusal":
+                        failed.append(f"{res.custom_id}: refused by safety classifiers")
+                        continue
+                    out[res.custom_id] = text
+                else:
+                    detail = getattr(
+                        getattr(res.result, "error", None), "type", res.result.type)
+                    audits[res.custom_id].event(
+                        "batch_failure", res.result, batch_id=batch.id)
+                    failed.append(f"{res.custom_id}: {detail}")
+        except Exception as e:
+            for audit in audits.values():
+                audit.error(e, phase="batch_results", batch_id=batch.id)
+            raise
 
         for f in failed:
             print(f"  ! {f}")

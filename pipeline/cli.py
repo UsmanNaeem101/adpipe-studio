@@ -35,16 +35,15 @@ SKILLS = os.path.join(ROOT, "skills")
 
 # Skills 07-26 all read the evidence file and write one dimension each.
 EXTRACTORS = list(range(7, 27))
+EMPTY_EXTRACTION_RETRIES = 3
 
-# Not every run needs all 20. These presets pick the dimensions that actually
-# drive a cold problem-aware static ad; the rest are for deeper strategy work.
+# Extraction depth presets. Keep these definitions as the single source of truth
+# for both the CLI and Studio so the selected label always matches the jobs run.
 PRESETS = {
-    # angle + hook + proof, in their own language. The minimum that still
-    # produces a defensible PICC card.
-    "quick":    [7, 8, 14, 18, 24, 25],
-    # adds the promise, the tone, the reframe and the mechanism.
-    "standard": [7, 8, 9, 10, 13, 14, 18, 19, 24, 25],
-    "full":     EXTRACTORS,
+    "fast": [7, 8, 9, 12, 14, 16, 18, 19, 20, 24],
+    "standard": [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                 21, 22, 24, 25],
+    "deep": EXTRACTORS,
 }
 SKILL_TITLES = {
     7: "pain points", 8: "pain moments", 9: "desired outcomes",
@@ -58,7 +57,7 @@ SKILL_TITLES = {
 
 
 def chosen_extractors(args):
-    """--skills 7,8,14 wins; else --preset; else full."""
+    """--skills wins; else the requested preset; else all 20 extractors."""
     if getattr(args, "skills", None):
         want = []
         for tok in args.skills.split(","):
@@ -69,7 +68,7 @@ def chosen_extractors(args):
                 sys.exit(f"--skills: {tok!r} is not an extractor (07-26)")
             want.append(int(tok))
         return sorted(set(want))
-    return PRESETS[getattr(args, "preset", None) or "full"]
+    return PRESETS[getattr(args, "preset", None) or "deep"]
 
 
 # ------------------------------------------------------------------ project
@@ -953,7 +952,8 @@ def cmd_extract(cfg, args):
     from llm import Job, confirm
     warn_if_imported(cfg, args.segment)
     c = client(cfg, args)
-    corpus = open(evidence_path(cfg, args.segment), encoding="utf-8").read()
+    with open(evidence_path(cfg, args.segment), encoding="utf-8") as fh:
+        corpus = fh.read()
     out = pdir(cfg, "extractions", args.segment)
 
     picked = chosen_extractors(args)
@@ -963,7 +963,16 @@ def cmd_extract(cfg, args):
     for n in picked:
         name, body = skill(n)
         dest = os.path.join(out, f"{name}.md")
-        if os.path.exists(dest) and not args.force:
+        # A zero-byte/whitespace artefact is a failed extraction, not completed
+        # work. Pick it up automatically even without --force.
+        present = False
+        if os.path.exists(dest):
+            try:
+                with open(dest, encoding="utf-8") as fh:
+                    present = bool(fh.read().strip())
+            except OSError:
+                present = False
+        if present and not args.force:
             continue
         names[name] = dest
         jobs.append(Job(id=name, prompt=(
@@ -982,9 +991,47 @@ def cmd_extract(cfg, args):
 
     c.prewarm(corpus, PREAMBLE)   # so batch members read rather than each re-write
     results = c.batch(corpus, PREAMBLE, jobs)
-    for cid, text in results.items():
-        open(names[cid], "w", encoding="utf-8").write(text)
-    print(f"\n  {len(results)}/{len(jobs)} written -> {out}   (${c.actual_usd():.2f})")
+
+    # A provider can report a successful request while returning no text. Never
+    # turn that into a misleading 0-byte extraction. Retry only the affected
+    # skill immediately, keeping successful batch results intact.
+    failed = []
+    for job in jobs:
+        text = results.get(job.id, "")
+        if text and text.strip():
+            continue
+        print(f"  ! {job.id} returned no content; retrying immediately "
+              f"up to {EMPTY_EXTRACTION_RETRIES} times")
+        for attempt in range(1, EMPTY_EXTRACTION_RETRIES + 1):
+            print(f"    {job.id}: retry {attempt}/{EMPTY_EXTRACTION_RETRIES}",
+                  flush=True)
+            text = c.one(
+                corpus, PREAMBLE, job.prompt, job.max_tokens, job.schema,
+                job_id=job.id,
+                operation=f"extraction_empty_retry_{attempt}")
+            if text and text.strip():
+                results[job.id] = text
+                print(f"    {job.id}: recovered on retry {attempt}")
+                break
+        else:
+            results.pop(job.id, None)
+            failed.append(job.id)
+
+    written = 0
+    for job in jobs:
+        text = results.get(job.id, "")
+        if not text or not text.strip():
+            continue
+        with open(names[job.id], "w", encoding="utf-8") as fh:
+            fh.write(text)
+        written += 1
+    print(f"\n  {written}/{len(jobs)} written -> {out}   (${c.actual_usd():.2f})")
+    if failed:
+        labels = ", ".join(failed)
+        raise SystemExit(
+            f"  Extraction failed after {EMPTY_EXTRACTION_RETRIES} retries: {labels}.\n"
+            "  Run the failed skill again from Pipeline > Extract > "
+            "Individual skill rerun, or use --skills NUMBER --force.")
 
 
 def read_extractions(cfg, segment, *want):
@@ -1336,7 +1383,7 @@ def main():
         s = common(sub.add_parser(name)); s.add_argument("segment"); s.set_defaults(fn=fn)
         if name in ("extract", "run"):
             s.add_argument("--preset", choices=sorted(PRESETS),
-                           help="which extractors to run (default: full)")
+                           help="extraction depth: fast, standard, or deep (default: deep)")
             s.add_argument("--skills", help="explicit list, e.g. 7,8,14,18,24,25")
         if name in ("concepts", "run"):
             s.add_argument("--concepts", type=int, help="how many concepts")
@@ -1348,6 +1395,10 @@ def main():
     if extra:
         ap.error(f"unrecognized arguments: {' '.join(extra)}")
     cfg = load_project(args.project)
+    os.environ["ADPIPE_PROJECT"] = cfg["name"]
+    os.environ["ADPIPE_STAGE"] = args.cmd
+    import auditlog
+    auditlog.set_context(project=cfg["name"], stage=args.cmd, source="pipeline_cli")
     print(f"[{cfg['name']}] {args.cmd}")
 
     try:

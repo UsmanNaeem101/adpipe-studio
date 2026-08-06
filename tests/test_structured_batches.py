@@ -40,6 +40,16 @@ class FakeResponse:
 
 
 class StructuredBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.audit_tmp = tempfile.TemporaryDirectory()
+        self.audit_env = mock.patch.dict(
+            os.environ, {"ADPIPE_LOG_DIR": self.audit_tmp.name})
+        self.audit_env.start()
+
+    def tearDown(self):
+        self.audit_env.stop()
+        self.audit_tmp.cleanup()
+
     def test_anthropic_params_include_job_schema(self):
         client = object.__new__(llm.Client)
         client.model = "test-model"
@@ -61,13 +71,25 @@ class StructuredBatchTests(unittest.TestCase):
         body = json.loads(request.data)
         self.assertEqual(body["response_format"]["type"], "json_schema")
         self.assertTrue(body["provider"]["require_parameters"])
+        logged = {}
+        for base, _dirs, files in os.walk(self.audit_tmp.name):
+            for name in files:
+                if name in ("request.json", "response.json"):
+                    with open(os.path.join(base, name), encoding="utf-8") as fh:
+                        logged[name] = json.load(fh)
+        self.assertEqual(logged["request.json"]["request"]["messages"][0]["content"],
+                         "x")
+        self.assertEqual(logged["response.json"]["text"], '{"records":[]}')
+        self.assertEqual(
+            logged["response.json"]["provider_response"]["usage"]["prompt_tokens"], 1)
 
     def test_openrouter_batch_passes_each_job_schema(self):
         client = object.__new__(openrouter.Client)
         client.verbose = False
         seen = []
 
-        def fake_post(_messages, _max_tokens, schema=None, retries=3):
+        def fake_post(_messages, _max_tokens, schema=None, retries=3,
+                      job_id=None, operation="completion"):
             seen.append(schema)
             return '{"records":[]}'
 

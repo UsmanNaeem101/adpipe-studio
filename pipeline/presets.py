@@ -36,6 +36,8 @@ import re
 import urllib.error
 import urllib.request
 
+import auditlog
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEVERS_MD = os.environ.get(
     "LEVERS_MD", os.path.join(ROOT, "reference_docs", "execution_levers.md"))
@@ -456,20 +458,36 @@ _PICK_SYSTEM = (
 def _post_json(url, headers, body, timeout=60, label="auto-pick"):
     """POST JSON and return the parsed reply. `label` names the caller in error
     text so a failure says which feature broke, not always "auto-pick"."""
+    provider = "anthropic" if "anthropic.com" in url else "openrouter"
+    audit = auditlog.start(provider, body.get("model", ""), label, body,
+                           metadata={"endpoint": url})
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.load(r)
+            payload = json.load(r)
+        if provider == "anthropic":
+            text = "".join(b.get("text", "") for b in payload.get("content", []))
+        else:
+            text = ((payload.get("choices") or [{}])[0].get("message") or {}).get(
+                "content", "") or ""
+        audit.response(payload, text=text, usage=payload.get("usage"))
+        return payload
     except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:300]
+        detail_full = e.read().decode("utf-8", "replace")
+        detail = detail_full[:300]
+        audit.event("http_error", detail_full, status=e.code)
         if e.code == 401:
             raise PresetError(f"the key for {label} was rejected (401).")
         if e.code == 402:
             raise PresetError("that account has insufficient credit (402).")
         raise PresetError(f"{label} failed — HTTP {e.code}: {detail}")
     except urllib.error.URLError as e:
+        audit.event("network_error", str(e.reason))
         raise PresetError(f"{label} failed — network error: {e.reason}")
+    except Exception as e:
+        audit.error(e)
+        raise
 
 
 def _extract_json(text):

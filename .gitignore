@@ -27,6 +27,8 @@ projects/_deleted/
 # Uploaded raw VOC dumps — tens of MB per file, and an input rather than code.
 projects/*/voc/raw/
 projects/*/voc/_model_failures/
+projects/*/logs/
+/logs/
 
 # Segment evidence: real scraped customer comments with source URLs. Same
 # category as voc/raw — an input/output of a run, not something to version.

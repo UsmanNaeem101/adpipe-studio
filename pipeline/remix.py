@@ -34,6 +34,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+import auditlog
+
 EDIT_URL = os.environ.get("IMAGE_EDIT_URL", "https://api.openai.com/v1/images/edits")
 MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-1")
 SIZE = os.environ.get("IMAGE_SIZE", "1024x1536")   # portrait, ~4:5
@@ -75,6 +77,14 @@ def remix_images(prompt, images, key, size=None, retries=3):
     """Core: send in-memory images to the edit endpoint, return the result bytes.
     `images` is a list of (filename, bytes). Shared by the CLI and the web app."""
     files = [("image[]", fn, data) for fn, data in images]
+    request_log = {
+        "model": MODEL, "prompt": prompt, "size": size or SIZE, "n": 1,
+        "images": [{"filename": fn, "bytes": len(data),
+                    "sha256": __import__("hashlib").sha256(data).hexdigest()}
+                   for fn, data in images],
+    }
+    audit = auditlog.start("openai", MODEL, "image_edit", request_log,
+                           metadata={"endpoint": EDIT_URL, "retries": retries})
     boundary, body = _multipart(
         {"model": MODEL, "prompt": prompt, "size": size or SIZE, "n": "1"}, files)
     req = urllib.request.Request(
@@ -84,22 +94,36 @@ def remix_images(prompt, images, key, size=None, retries=3):
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
-                item = json.load(r)["data"][0]
+                payload = json.load(r)
+                item = payload["data"][0]
             if "b64_json" in item:
-                return base64.b64decode(item["b64_json"])
-            with urllib.request.urlopen(item["url"], timeout=300) as img:
-                return img.read()
+                data = base64.b64decode(item["b64_json"])
+                logged = {**payload, "data": [{**item, "b64_json":
+                          f"[saved as response.png · {len(data)} bytes]"}]}
+            else:
+                with urllib.request.urlopen(item["url"], timeout=300) as img:
+                    data = img.read()
+                logged = payload
+            audit.binary_response(data, logged)
+            return data
         except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:400]
+            detail_full = e.read().decode("utf-8", "replace")
+            detail = detail_full[:400]
+            audit.event("http_error", detail_full, status=e.code,
+                        attempt=attempt + 1)
             if e.code in (429, 500, 502, 503) and attempt < retries - 1:
                 time.sleep(2 ** attempt * 5); continue
             if e.code == 401:
                 raise RemixError("401 — the image API key was rejected.")
             raise RemixError(f"HTTP {e.code}: {detail}")
         except urllib.error.URLError as e:
+            audit.event("network_error", str(e.reason), attempt=attempt + 1)
             if attempt < retries - 1:
                 time.sleep(5); continue
             raise RemixError(f"Network error: {e.reason}")
+        except Exception as e:
+            audit.error(e, attempt=attempt + 1)
+            raise
     raise RemixError("Gave up after retries.")
 
 
@@ -120,6 +144,13 @@ def main():
     ap.add_argument("--no-strip-exif", action="store_true",
                     help="keep EXIF; default is to strip it")
     args = ap.parse_args()
+
+    manifest = os.path.abspath(args.manifest)
+    parts = manifest.split(os.sep)
+    if "projects" in parts:
+        n = parts.index("projects")
+        if n + 1 < len(parts):
+            auditlog.set_context(project=parts[n + 1], stage="remix", source="remix_cli")
 
     doc = json.load(open(args.manifest, encoding="utf-8"))
     base = os.path.dirname(os.path.abspath(args.manifest))

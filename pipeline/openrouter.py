@@ -33,6 +33,8 @@ import time
 import urllib.error
 import urllib.request
 
+import auditlog
+
 API = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 
@@ -90,7 +92,8 @@ class Client:
 
     # ------------------------------------------------------------- internals
 
-    def _post(self, messages, max_tokens, schema=None, retries=3):
+    def _post(self, messages, max_tokens, schema=None, retries=3,
+              job_id=None, operation="completion"):
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens}
         if schema:
             # Require a route that supports structured output. Without
@@ -101,6 +104,8 @@ class Client:
                 "type": "json_schema",
                 "json_schema": {"name": "result", "strict": True, "schema": schema}}
             body["provider"] = {"require_parameters": True}
+        audit = auditlog.start("openrouter", self.model, operation, body, job_id,
+                               {"endpoint": API, "retries": retries})
         req = urllib.request.Request(
             API, data=json.dumps(body).encode(), method="POST",
             headers={"Authorization": f"Bearer {self.key}",
@@ -114,9 +119,17 @@ class Client:
                 u = payload.get("usage") or {}
                 self.spent["in"] += u.get("prompt_tokens", 0)
                 self.spent["out"] += u.get("completion_tokens", 0)
-                return payload["choices"][0]["message"]["content"] or ""
+                message = payload["choices"][0]["message"]
+                content = message.get("content") or ""
+                audit.response(payload, text=content, usage=u,
+                               finish_reason=payload["choices"][0].get("finish_reason"))
+                return content
             except urllib.error.HTTPError as e:
-                detail = e.read().decode("utf-8", "replace")[:400]
+                detail_full = e.read().decode("utf-8", "replace")
+                detail = detail_full[:400]
+                audit.event("http_error", detail_full, status=e.code,
+                            attempt=attempt + 1, will_retry=(
+                                e.code in (429, 500, 502, 503) and attempt < retries - 1))
                 unsupported_schema = (
                     schema and e.code in (400, 404, 422)
                     and any(word in detail.lower() for word in
@@ -136,7 +149,8 @@ class Client:
                     if self.verbose:
                         print("  ! this OpenRouter route cannot enforce JSON schema; "
                               "retrying with prompt-level schema and local validation")
-                    return self._post(fallback, max_tokens, schema=None, retries=retries)
+                    return self._post(fallback, max_tokens, schema=None, retries=retries,
+                                      job_id=job_id, operation=operation + "_schema_fallback")
                 if e.code in (429, 500, 502, 503) and attempt < retries - 1:
                     time.sleep(2 ** attempt * 5); continue
                 if e.code == 401:
@@ -148,9 +162,14 @@ class Client:
                              f"Check the exact id at https://openrouter.ai/models")
                 sys.exit(f"  HTTP {e.code}: {detail}")
             except urllib.error.URLError as e:
+                audit.event("network_error", str(e.reason), attempt=attempt + 1,
+                            will_retry=attempt < retries - 1)
                 if attempt < retries - 1:
                     time.sleep(5); continue
                 sys.exit(f"  Network error: {e.reason}")
+            except Exception as e:
+                audit.error(e, attempt=attempt + 1)
+                raise
         sys.exit("  Gave up after retries.")
 
     @staticmethod
@@ -178,10 +197,12 @@ class Client:
         if self.verbose:
             print("  (no prompt cache on OpenRouter — nothing to warm)")
 
-    def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None):
+    def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
+            job_id="single", operation="pipeline_single"):
         msgs = [{"role": "system", "content": f"{preamble}\n\n{corpus}"},
                 {"role": "user", "content": prompt}]
-        return self._post(msgs, max_tokens, schema)
+        return self._post(msgs, max_tokens, schema, job_id=job_id,
+                          operation=operation)
 
     def batch(self, corpus, preamble, jobs, poll_seconds=0):
         """No batch endpoint — run concurrently to recover wall-clock time.
@@ -192,7 +213,8 @@ class Client:
         def run(j):
             return j.id, self._post(
                 [{"role": "system", "content": system},
-                 {"role": "user", "content": j.prompt}], j.max_tokens, j.schema)
+                 {"role": "user", "content": j.prompt}], j.max_tokens, j.schema,
+                job_id=j.id, operation="pipeline_batch_job")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = [pool.submit(run, j) for j in jobs]

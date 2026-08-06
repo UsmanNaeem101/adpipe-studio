@@ -101,8 +101,30 @@ first (parallel requests can't read an entry another is still writing), then all
 extractions go out as **one batch at 50% off**. Cache reads cost ~10%, so 20
 extractions over one corpus cost roughly one full read plus change.
 
+An empty extraction response is never written as a 0-byte Markdown file. Only the
+affected skill is retried immediately up to three times; if all retries are empty,
+the stage exits with a clear failure and keeps the other successful outputs. In the
+Studio choose **Pipeline → Extract → Individual skill rerun** to rerun any one skill,
+or use `./adpipe extract <segment> --skills 7 --force` from the CLI.
+
 **Every model stage prints a cost estimate and waits for a yes.** `--yes` skips the
 prompt; `--effort` overrides the model's effort level for one run.
+
+### Model audit logs
+
+Every generation request is logged before it is sent. Each request gets a
+timestamped directory under `projects/<project>/logs/model/<date>/` containing:
+
+- `request.json` — provider, model, stage/job ID, schema and the complete system,
+  corpus and user prompt;
+- `response.json` — the complete provider payload, extracted text, usage, stop
+  reason, elapsed time and an explicit `empty_text` flag;
+- `events.jsonl` — retries, HTTP/provider errors and fallback routing;
+- `response.png` — the raw returned image for image-generation/edit requests.
+
+These logs can contain customer evidence and are intentionally gitignored. They
+also appear in the Studio **Outputs → Logs** accordion. Set `ADPIPE_LOG_DIR` to an
+absolute directory to override the default location.
 
 ---
 

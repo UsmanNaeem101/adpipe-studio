@@ -20,6 +20,7 @@ Standard library only.
 from __future__ import annotations
 
 import base64
+import datetime
 import http.server
 import json
 import mimetypes
@@ -38,12 +39,24 @@ import exifstrip  # noqa: E402
 import presets  # noqa: E402
 import levers  # noqa: E402
 import briefs  # noqa: E402
+import auditlog  # noqa: E402
 
 REFS = os.path.join(ROOT, "references")
 PORT = int(os.environ.get("STUDIO_PORT", "8765"))
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 SIZES = {"4:5 portrait": "1024x1536", "1:1 square": "1024x1024",
          "1.91:1 landscape": "1536x1024"}
+
+# `filtered_voc.jsonl` is the ingest contract consumed by skills 03-06. The
+# other ingest artefacts explain how it was produced, but are not alternative
+# segmentation corpora and should not appear in the Segment source picker.
+SEGMENT_VOC_FILES = ("filtered_voc.jsonl",)
+INGEST_ADDITIONAL_FILES = (
+    ("retained_voc.jsonl", "retained_voc.jsonl · 01 retained records"),
+    ("rejected_voc.jsonl", "rejected_voc.jsonl · 01 rejected records"),
+    ("deduplicated_voc.jsonl", "deduplicated_voc.jsonl · 02 deduplicated copy"),
+    ("duplicate_groups.jsonl", "duplicate_groups.jsonl · 02 duplicate audit"),
+)
 
 # In-memory only. Never persisted server-side, never logged.
 KEYS = {"openai": os.environ.get("OPENAI_API_KEY", ""),
@@ -173,29 +186,33 @@ def project_outputs(project):
             prov = {}
     out = {"stages": [], "provenance": prov}
 
-    def entry(stage, label, path, kind="text"):
+    def entry(stage, label, path, kind="text", role=None):
         if os.path.exists(path):
+            stat = os.stat(path)
             rel = os.path.relpath(path, ROOT)
             out["stages"].append({"stage": stage, "label": label, "path": rel,
                                   "kind": kind,
-                                  "size": os.path.getsize(path),
-                                  "mtime": os.path.getmtime(path)})
+                                  "role": role,
+                                  "size": stat.st_size,
+                                  "mtime": stat.st_mtime,
+                                  "modified_at": datetime.datetime.fromtimestamp(
+                                      stat.st_mtime).astimezone().isoformat(
+                                          timespec="seconds")})
 
     voc = os.path.join(root, "voc")
-    for f, lbl in (("retained_voc.jsonl", "01 retained"),
-                   ("rejected_voc.jsonl", "01 rejected"),
-                   ("deduplicated_voc.jsonl", "02 deduplicated"),
-                   ("duplicate_groups.jsonl", "02 duplicate groups"),
-                   ("filtered_voc.jsonl", "corpus the segment stage reads"),
-                   ("candidate_segments.json", "03 candidates"),
+    entry("ingest", "filtered_voc.jsonl · segment-ready corpus",
+          os.path.join(voc, "filtered_voc.jsonl"), role="final")
+    for f, lbl in INGEST_ADDITIONAL_FILES:
+        entry("ingest", lbl, os.path.join(voc, f), role="additional")
+
+    for f, lbl in (("candidate_segments.json", "03 candidates"),
                    ("validated_segments.json", "04 decisions"),
                    ("segment_assignments.jsonl", "05 assignments"),
                    ("unassigned_evidence.md", "06 unassigned"),
                    ("segment_evidence_manifest.yaml", "06 manifest"),
                    ("assignment_conflicts.jsonl", "06 conflicts"),
                    ("missing_evidence.jsonl", "06 missing")):
-        entry("ingest" if f.startswith(("retained", "rejected", "dedup", "duplicate"))
-              else "segment", lbl, os.path.join(voc, f))
+        entry("segment", lbl, os.path.join(voc, f))
 
     ed = os.path.join(root, "evidence")
     if os.path.isdir(ed):
@@ -227,7 +244,38 @@ def project_outputs(project):
                 for f in sorted(os.listdir(rd)):
                     if f.lower().endswith(IMG_EXT):
                         entry("render", f"{seg} · {f}", os.path.join(rd, f), "image")
+
+    ld = os.path.join(root, "logs", "model")
+    if os.path.isdir(ld):
+        for base, _dirs, files in os.walk(ld):
+            for f in sorted(files):
+                if f.endswith((".json", ".jsonl", ".png")):
+                    path = os.path.join(base, f)
+                    label = os.path.relpath(path, ld)
+                    entry("logs", label, path,
+                          "image" if f.endswith(".png") else "text")
     return out
+
+
+def segment_voc_files(project):
+    """Only completed ingest contracts that skills 03-06 may consume."""
+    if project not in projects():
+        return []
+    voc_dir = os.path.join(ROOT, "projects", project, "voc")
+    files = []
+    for name in SEGMENT_VOC_FILES:
+        path = os.path.join(voc_dir, name)
+        if os.path.isfile(path):
+            stat = os.stat(path)
+            files.append({
+                "name": name,
+                "label": f"Final · {name}",
+                "path": path,
+                "mtime": stat.st_mtime,
+                "modified_at": datetime.datetime.fromtimestamp(
+                    stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+            })
+    return files
 
 
 DIMCACHE = os.path.join(ROOT, ".cache", "dims.json")
@@ -588,6 +636,25 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
    padding:6px;background:var(--surface)}
  .cat h3{font-size:13px;margin:12px 8px 6px;color:var(--soft);position:sticky;top:0;
    background:var(--surface);padding:4px 0}
+ .outstage{background:var(--paper);border:1px solid var(--line);border-radius:10px;
+   margin-bottom:7px;overflow:hidden}
+ .outstage>summary{cursor:pointer;list-style:none;padding:10px 11px;display:grid;
+   grid-template-columns:14px minmax(0,1fr);gap:8px;align-items:start}
+ .outstage>summary::-webkit-details-marker{display:none}
+ .outstage>summary::before{content:"›";font-size:20px;line-height:18px;color:var(--accent);
+   transform-origin:center;transition:transform .12s ease}
+ .outstage[open]>summary::before{transform:rotate(90deg)}
+ .outstage[open]>summary{border-bottom:1px solid var(--line);background:var(--accent-soft)}
+ .osline{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+ .osname{font-size:13px;text-transform:capitalize;font-weight:700}
+ .oscount{font-size:11px;color:var(--soft);font-weight:500}
+ .osdate{font-size:11px;color:var(--soft);margin-top:2px}
+ .outbody{padding:7px}
+ .outgroup-title{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;
+   color:var(--soft);font-weight:800;padding:7px 7px 3px}
+ .orow{padding:7px 8px;border-radius:7px;cursor:pointer;font-size:12.5px;line-height:1.35}
+ .orow:hover,.orow.on{background:var(--accent-soft)}
+ .ormeta{color:var(--soft);font-size:10.5px;margin-top:2px}
  .thumbs{display:grid;grid-template-columns:repeat(auto-fill,minmax(88px,1fr));gap:8px}
  .thumb{position:relative;border:3px solid transparent;border-radius:8px;overflow:hidden;
    cursor:pointer;aspect-ratio:4/5;background:#eee}
@@ -816,9 +883,10 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
     <div id=segvocbox class="hide" style="margin-top:16px">
       <label>VOC source for segmentation</label>
       <select id=segvoc style="width:100%">
-        <option value="">Default (filtered_voc.jsonl — the deduplicated set)</option>
+        <option value="">Loading final ingest file…</option>
       </select>
-      <p class=hint>Pick which ingest output to run segment on. Shows files from voc/*. jsonl.</p>
+      <p class=hint>Only completed, segment-ready ingest files are shown. Audit and
+        intermediate files remain available on the Outputs tab.</p>
     </div>
     <div id=opt_model style="margin-top:16px">
       <div class=row>
@@ -830,15 +898,22 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
       <p class=hint id=modelhint></p>
     </div>
     <div id=opt_extract class=opts style="margin-top:14px" hidden>
-      <label>Which dimensions?</label>
+      <label>Research depth</label>
       <select id=preset>
-        <option value=quick>Quick — 6 · pain points, moments, failed solutions, objections, VOC, terminology</option>
-        <option value=standard>Standard — 10 · adds outcomes, emotion, limiting beliefs, mechanism</option>
-        <option value=full selected>Full — all 20</option>
-        <option value=custom>Custom…</option>
+        <option value=fast selected>Fast Test — 10 core dimensions</option>
+        <option value=standard>Standard — 18 dimensions</option>
+        <option value=deep>Deep Research — all 20 extraction skills (07–26)</option>
       </select>
-      <div id=skillpick hidden style="margin-top:10px;max-height:200px;overflow:auto;
-           border:1px solid var(--line);border-radius:9px;padding:10px"></div>
+      <p class=hint id=extracthint></p>
+    </div>
+    <div id=opt_extract_single class=opts style="margin-top:14px" hidden>
+      <label>Individual skill rerun</label>
+      <select id=extractskill>
+        <option value="">Use the research depth preset above</option>
+      </select>
+      <p class=hint>Selecting one skill runs only that extractor and overwrites its
+        existing output. Empty responses retry immediately three times and are never
+        written as 0-byte files.</p>
     </div>
     <div id=opt_concepts class=opts style="margin-top:14px" hidden>
       <div class=row>
@@ -1139,7 +1214,8 @@ $('#presetauto').onclick=async()=>{
   try{
     const j=await (await fetch('/presets/pick',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({brief:$('#brief').value.trim(),
+      body:JSON.stringify({project:$('#rx_proj').value,segment:$('#rx_seg').value,
+        brief:$('#brief').value.trim(),
         reference:selected.size?[...selected.keys()][0]:''})})).json();
     if(j.error){ $('#presetwhy').innerHTML=`<b style=color:var(--signal)>⚠ ${j.error}</b>`; }
     else{ $('#preset_sel').value=j.id;
@@ -1354,7 +1430,8 @@ let pending=null;
 $('#go').onclick=async()=>{
   const jobs=buildJobs();
   if(!jobs.length) return;
-  const payload=j=>({product,reference:j.rel,brief:j.brief,size:$('#size').value,
+  const payload=j=>({project:$('#rx_proj').value,segment:$('#rx_seg').value,
+    product,reference:j.rel,brief:j.brief,size:$('#size').value,
     preset:$('#preset_sel').value, conflict_mode:cfMode(), levers:customLevers(),
     strip_exif:$('#stripexif')?$('#stripexif').checked:false});
   $('#go').disabled=true;
@@ -1435,8 +1512,9 @@ const STAGES=__STAGES__;
       const showSeg = s.name==='segment';
       $('#segvocbox').classList.toggle('hide',!showSeg);
       if(showSeg) loadVocFiles();
+      showOpts(s.name);
       $('#runbtn').disabled=false;
-      $('#runhint').textContent=s.costs?'This stage calls the Claude API — tick the approval box.':'Free — pure code.';
+      $('#runhint').textContent=s.costs?'This stage calls the selected model API — tick the approval box.':'Free — pure code.';
     };
     el.appendChild(d);});
 })();
@@ -1449,17 +1527,23 @@ async function loadSegs(){
   const j=await r.json();
   $('#seg').innerHTML=j.segments.length?j.segments.map(x=>`<option>${x}</option>`).join('')
     :'<option value="">— none yet —</option>';
+  if(stage&&stage.name==='segment')loadVocFiles();
 }
 async function loadVocFiles(){
   const pr=$('#proj').value; if(!pr)return;
   const s=$('#segvoc'); const was=s.value;
-  s.innerHTML='<option value="">Default (filtered_voc.jsonl)</option>';
+  s.innerHTML='<option value="">Loading final ingest file…</option>'; s.disabled=true;
   try{
     const j=await (await fetch('/voc-files?project='+encodeURIComponent(pr))).json();
-    (j.files||[]).forEach(f=>{const o=document.createElement('option');
-      o.value=f.path; o.textContent=f.name; s.appendChild(o);});
+    const files=j.files||[]; s.innerHTML='';
+    if(!files.length){s.innerHTML='<option value="">No final ingest file — run ingest first</option>';return;}
+    files.forEach(f=>{const o=document.createElement('option');
+      const when=new Date(f.mtime*1000).toLocaleString([],{
+        dateStyle:'medium',timeStyle:'short'});
+      o.value=f.path; o.textContent=`${f.label} — ${when}`; s.appendChild(o);});
+    s.disabled=false;
     if(was&&[...s.options].some(o=>o.value===was))s.value=was;
-  }catch(e){}
+  }catch(e){s.innerHTML='<option value="">Could not load final ingest file</option>';}
 }
 $('#runbtn').onclick=async()=>{
   if(!stage) return;
@@ -1475,11 +1559,11 @@ $('#runbtn').onclick=async()=>{
               n_briefs:+$('#nbriefs').value||0,
               provider:$('#provider')?$('#provider').value:'',
               model:$('#modelid')?$('#modelid').value.trim():''};
-  if(stage.name==='extract'||stage.name==='run'){
-    if($('#preset').value==='custom'){
-      body.skills=[...document.querySelectorAll('.sk:checked')].map(c=>c.value).join(',');
-      if(!body.skills){alert('Pick at least one dimension.');return;}
-    } else body.preset=$('#preset').value;
+  if(stage.name==='extract'&&$('#extractskill').value){
+    body.skills=$('#extractskill').value;
+    body.force=true;
+  }else if(stage.name==='extract'||stage.name==='run'){
+    body.preset=$('#preset').value;
   }
   const r=await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)});
@@ -1526,69 +1610,6 @@ bindDrop($('#vocdrop'),$('#vocfile'),async f=>{
   $('#vocmsg').textContent=f.name;
 });
 
-/* ---------- stage option panels ---------- */
-SKILLS=null;
-async function loadSkills(){
-  if(SKILLS)return SKILLS;
-  SKILLS=await (await fetch('/skills')).json();
-  $('#skillpick').innerHTML=SKILLS.extractors.map(x=>
-    `<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin:3px 0">
-      <input type=checkbox class=sk value=${x.n} style=width:auto> ${String(x.n).padStart(2,'0')} ${x.title}</label>`).join('');
-  return SKILLS;
-}
-$('#preset').onchange=async()=>{
-  const custom=$('#preset').value==='custom';
-  $('#skillpick').hidden=!custom;
-  if(custom){const S=await loadSkills();
-    const pre=S.presets.standard;
-    document.querySelectorAll('.sk').forEach(c=>c.checked=pre.includes(+c.value));}
-};
-function showOpts(name){
-  document.querySelectorAll('.opts').forEach(o=>o.hidden=true);
-  if(name==='extract'||name==='run'){$('#opt_extract').hidden=false;loadSkills();}
-  if(name==='concepts'||name==='run')$('#opt_concepts').hidden=false;
-  if(name==='brief'||name==='run')$('#opt_brief').hidden=false;
-}
-
-/* ---------- outputs browser ---------- */
-async function loadOutputs(){
-  const pr=$('#oproj').value; if(!pr)return;
-  const d=await (await fetch('/outputs?project='+encodeURIComponent(pr))).json();
-  const byStage={};
-  (d.stages||[]).forEach(x=>{(byStage[x.stage]=byStage[x.stage]||[]).push(x);});
-  const order=['ingest','segment','extract','picc','concepts','brief','render'];
-  $('#olist').innerHTML = order.filter(st=>byStage[st]).map(st=>
-    `<div class=cat><h3>${st} — ${byStage[st].length}</h3>`+
-    byStage[st].map(x=>`<div class=orow data-p="${x.path}" data-k="${x.kind}"
-       style="padding:6px 9px;border-radius:7px;cursor:pointer;font-size:13px">
-       ${x.label} <span style="color:var(--soft)">${(x.size/1024).toFixed(0)}KB</span></div>`).join('')+
-    `</div>`).join('') || '<p class=hint style=padding:10px>Nothing produced yet.</p>';
-  document.querySelectorAll('.orow').forEach(r=>r.onclick=()=>viewFile(r.dataset.p,r.dataset.k));
-  const imported=Object.entries(d.provenance||{}).filter(([k,v])=>v.origin==='imported');
-  $('#provwarn').innerHTML = imported.length ? `<div class=card
-    style="background:#FDF3F0;border-color:var(--signal);margin-bottom:14px">
-    <b style=color:var(--signal)>⚠ Imported evidence</b>
-    <p class=hint style=margin-top:6px>${imported.map(([k,v])=>
-      `<b>${k}</b> — ${v.detail}`).join('<br>')}<br><br>
-      These were copied in, not produced by this project's pipeline. There are no
-      candidate/validated/assignment records behind them, so anything built on them
-      inherits an unverifiable lineage.</p></div>` : '';
-}
-async function viewFile(path,kind){
-  const v=$('#oview');
-  if(kind==='image'){v.innerHTML=`<img src="/file?path=${encodeURIComponent(path)}"
-      style="max-width:100%;border-radius:10px"><p class=hint>${path}</p>`;return;}
-  v.innerHTML='<p class=hint>Loading…</p>';
-  const d=await (await fetch('/file?path='+encodeURIComponent(path))).json();
-  v.innerHTML=`<p class=hint style=margin:0>${path}${d.clipped?' — showing first 200KB of '+(d.bytes/1024).toFixed(0)+'KB':''}</p>
-    <pre style="white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;
-      background:var(--surface);padding:14px;border-radius:9px;max-height:520px;
-      overflow:auto;margin-top:10px">${d.text.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}</pre>`;
-}
-$('#orefresh').onclick=loadOutputs;
-$('#oproj').onchange=loadOutputs;
-
-
 /* ================= project creation ================= */
 $('#npbtn')&&($('#npbtn').onclick=async()=>{
   const m=$('#npmsg');
@@ -1624,25 +1645,35 @@ bindDrop($('#vocdrop'),$('#vocfile'),async fs=>{
 });
 
 /* ================= stage options ================= */
-SKILLS=null;
-async function loadSkills(){
-  if(SKILLS)return SKILLS;
-  SKILLS=await (await fetch('/skills')).json();
-  $('#skillpick').innerHTML=SKILLS.extractors.map(x=>
-    `<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin:3px 0;font-size:13px">
-      <input type=checkbox class=sk value=${x.n} style=width:auto> ${String(x.n).padStart(2,'0')} ${x.title}</label>`).join('');
-  return SKILLS;
+const EXTRACT_PRESET_INFO={
+  fast:'07 Pain Points · 08 Pain Moments · 09 Desired Outcomes · 12 Beliefs · '+
+       '14 Failed Solutions · 16 Buying Triggers · 18 Objections · 19 Mechanisms · '+
+       '20 Desired Proof · 24 Representative VOC',
+  standard:'Everything in Fast Test, plus: 10 Emotional States · 11 Psychological Drivers · '+
+       '13 Limiting Beliefs · 15 Assumed Solutions · 17 Buying Criteria · '+
+       '21 Product Mentions · 22 Competitors · 25 Terminology',
+  deep:'Everything in Standard, plus: 23 Offers · 26 Slang. Runs every extraction '+
+       'skill from 07 through 26.'
+};
+function describeExtractPreset(){
+  if($('#extracthint'))$('#extracthint').textContent=EXTRACT_PRESET_INFO[$('#preset').value]||'';
 }
-$('#preset')&&($('#preset').onchange=async()=>{
-  const c=$('#preset').value==='custom'; $('#skillpick').hidden=!c;
-  if(c){const S=await loadSkills();
-    document.querySelectorAll('.sk').forEach(x=>x.checked=S.presets.standard.includes(+x.value));}
+$('#preset')&&($('#preset').onchange=describeExtractPreset);
+describeExtractPreset();
+fetch('/skills').then(r=>r.json()).then(j=>{
+  const s=$('#extractskill');
+  (j.extractors||[]).forEach(x=>{
+    const o=document.createElement('option');
+    o.value=x.n; o.textContent=`${String(x.n).padStart(2,'0')} · ${x.title}`;
+    s.appendChild(o);
+  });
 });
 function showOpts(name){
   document.querySelectorAll('.opts').forEach(o=>o.hidden=true);
   const model=['ingest','segment','extract','picc','concepts','brief','run'].includes(name);
   if($('#opt_model'))$('#opt_model').hidden=!model;
-  if(name==='extract'||name==='run'){$('#opt_extract').hidden=false;loadSkills();}
+  if(name==='extract'||name==='run')$('#opt_extract').hidden=false;
+  if(name==='extract')$('#opt_extract_single').hidden=false;
   if(name==='concepts'||name==='run')$('#opt_concepts').hidden=false;
   if(name==='brief'||name==='run')$('#opt_brief').hidden=false;
 }
@@ -1656,22 +1687,56 @@ $('#provider')&&($('#provider').onchange=()=>{
 $('#provider')&&$('#provider').dispatchEvent(new Event('change'));
 
 /* ================= outputs browser ================= */
+const outEsc=t=>String(t??'').replace(/[&<>"']/g,c=>({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const outWhen=seconds=>new Date(seconds*1000).toLocaleString([],{
+  dateStyle:'medium',timeStyle:'short'});
 async function loadOutputs(){
   const pr=$('#oproj')&&$('#oproj').value; if(!pr)return;
   const d=await (await fetch('/outputs?project='+encodeURIComponent(pr))).json();
   const by={}; (d.stages||[]).forEach(x=>{(by[x.stage]=by[x.stage]||[]).push(x)});
-  const order=['ingest','segment','extract','picc','concepts','brief','render'];
-  $('#olist').innerHTML=order.filter(k=>by[k]).map(k=>
-    `<div class=cat><h3>${k} — ${by[k].length}</h3>`+by[k].map(x=>
-      `<div class=orow data-p="${x.path}" data-k="${x.kind}" style="padding:6px 9px;
-        border-radius:7px;cursor:pointer;font-size:13px">${x.label}
-        <span style=color:var(--soft)>${(x.size/1024).toFixed(0)}KB</span></div>`).join('')+
-    `</div>`).join('')||'<p class=hint style=padding:10px>Nothing produced yet.</p>';
-  document.querySelectorAll('.orow').forEach(r=>r.onclick=()=>viewFile(r.dataset.p,r.dataset.k));
+  const order=['ingest','segment','extract','picc','concepts','brief','render','logs'];
+  const old=[...document.querySelectorAll('#olist details.outstage')];
+  const hadAccordion=old.length>0;
+  const openStages=new Set(old.filter(x=>x.open).map(x=>x.dataset.stage));
+  const lookup=[];
+  const rowsHtml=rows=>rows.map(x=>{const i=lookup.push(x)-1;return `
+    <div class=orow data-oi="${i}">
+      <div>${outEsc(x.label)}</div>
+      <div class=ormeta>${outWhen(x.mtime)} · ${(x.size/1024).toFixed(0)} KB</div>
+    </div>`}).join('');
+  const groupHtml=(title,rows,empty)=>`<div class=outgroup-title>${title}</div>`+
+    (rows.length?rowsHtml(rows):`<div class=hint style="padding:3px 7px 8px">${empty}</div>`);
+  const stages=order.filter(k=>by[k]);
+  $('#olist').innerHTML=stages.map((k,n)=>{
+    const items=by[k].slice().sort((a,b)=>b.mtime-a.mtime);
+    const latest=Math.max(...items.map(x=>x.mtime));
+    const open=openStages.has(k)||(!hadAccordion&&n===0)?' open':'';
+    let body=rowsHtml(items);
+    if(k==='ingest'){
+      const final=items.filter(x=>x.role==='final');
+      const additional=items.filter(x=>x.role!=='final');
+      body=groupHtml('Final file',final,'Run ingest to create the segment-ready file.')+
+           groupHtml('Additional files',additional,'No audit or intermediate files yet.');
+    }
+    return `<details class=outstage data-stage="${k}"${open}>
+      <summary><div><div class=osline><span class=osname>${k}</span>
+        <span class=oscount>${items.length} file${items.length===1?'':'s'}</span></div>
+        <div class=osdate>Latest · ${outWhen(latest)}</div></div></summary>
+      <div class=outbody>${body}</div></details>`;
+  }).join('')||'<p class=hint style=padding:10px>Nothing produced yet.</p>';
+  const accordions=[...document.querySelectorAll('#olist details.outstage')];
+  accordions.forEach(panel=>panel.ontoggle=()=>{
+    if(panel.open)accordions.forEach(other=>{if(other!==panel)other.open=false;});
+  });
+  document.querySelectorAll('#olist .orow').forEach(r=>r.onclick=()=>{
+    document.querySelectorAll('#olist .orow').forEach(x=>x.classList.remove('on'));
+    r.classList.add('on'); const x=lookup[+r.dataset.oi]; viewFile(x.path,x.kind);
+  });
   const imp=Object.entries(d.provenance||{}).filter(([k,v])=>v.origin==='imported');
   $('#provwarn').innerHTML=imp.length?`<div class=card style="background:#FDF3F0;
     border-color:var(--signal);margin-bottom:14px"><b style=color:var(--signal)>⚠ Imported evidence</b>
-    <p class=hint style=margin-top:6px>${imp.map(([k,v])=>`<b>${k}</b> — ${v.detail}`).join('<br>')}
+    <p class=hint style=margin-top:6px>${imp.map(([k,v])=>`<b>${outEsc(k)}</b> — ${outEsc(v.detail)}`).join('<br>')}
     <br><br>Copied in, not produced by this project's pipeline. No candidate / validated /
     assignment records exist behind them, so anything built on them inherits an
     unverifiable lineage.</p></div>`:'';
@@ -1679,13 +1744,12 @@ async function loadOutputs(){
 async function viewFile(path,kind){
   const v=$('#oview');
   if(kind==='image'){v.innerHTML=`<img src="/file?path=${encodeURIComponent(path)}"
-    style="max-width:100%;border-radius:10px"><p class=hint>${path}</p>`;return}
+    style="max-width:100%;border-radius:10px"><p class=hint>${outEsc(path)}</p>`;return}
   v.innerHTML='<p class=hint>Loading…</p>';
   const d=await (await fetch('/file?path='+encodeURIComponent(path))).json();
-  const esc=t=>t.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-  v.innerHTML=`<p class=hint style=margin:0>${path}${d.clipped?' — first 200KB of '+(d.bytes/1024).toFixed(0)+'KB':''}</p>
+  v.innerHTML=`<p class=hint style=margin:0>${outEsc(path)}${d.clipped?' — first 200KB of '+(d.bytes/1024).toFixed(0)+'KB':''}</p>
     <pre style="white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;background:var(--surface);
-      padding:14px;border-radius:9px;max-height:520px;overflow:auto;margin-top:10px">${esc(d.text)}</pre>`;
+      padding:14px;border-radius:9px;max-height:520px;overflow:auto;margin-top:10px">${outEsc(d.text)}</pre>`;
 }
 $('#orefresh')&&($('#orefresh').onclick=loadOutputs);
 $('#oproj')&&($('#oproj').onchange=loadOutputs);
@@ -1967,13 +2031,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             if pr not in projects():
                 return self._send(200, json.dumps({"error": "unknown project"}))
-            voc_dir = os.path.join(ROOT, "projects", pr, "voc")
-            files = []
-            if os.path.isdir(voc_dir):
-                for f in sorted(os.listdir(voc_dir)):
-                    if f.endswith(".jsonl"):
-                        files.append({"name": f, "path": os.path.join(voc_dir, f)})
-            return self._send(200, json.dumps({"files": files}))
+            return self._send(200, json.dumps({"files": segment_voc_files(pr)}))
         if u.path == "/file":
             q = urllib.parse.parse_qs(u.query)
             rel = q.get("path", [""])[0]
@@ -2124,8 +2182,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _lock:
                 keys = dict(KEYS)
             try:
-                return self._send(200, json.dumps(presets.pick(
-                    req.get("brief", ""), req.get("reference", ""), keys)))
+                with auditlog.scope(project=req.get("project"),
+                                    segment=req.get("segment"),
+                                    stage="preset_pick", source="studio"):
+                    picked = presets.pick(
+                        req.get("brief", ""), req.get("reference", ""), keys)
+                return self._send(200, json.dumps(picked))
             except presets.PresetError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
         if path == "/prompt":
@@ -2229,13 +2291,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             n = 4
 
         try:
-            out = briefs.write(
-                lever_text, n=n, keys=keys,
-                product=cfg.get("product", ""), market=cfg.get("market", ""),
-                compliance=compliance_notes(project) if project else "",
-                facts=facts, preset=preset,
-                custom_levers=req.get("levers") or {},
-                extra=req.get("extra") or "")
+            with auditlog.scope(project=project, segment=segment,
+                                stage="remix_briefs", source="studio"):
+                out = briefs.write(
+                    lever_text, n=n, keys=keys,
+                    product=cfg.get("product", ""), market=cfg.get("market", ""),
+                    compliance=compliance_notes(project) if project else "",
+                    facts=facts, preset=preset,
+                    custom_levers=req.get("levers") or {},
+                    extra=req.get("extra") or "")
         except briefs.BriefError as e:
             return self._send(200, json.dumps({"error": str(e)}))
         return self._send(200, json.dumps(out))
@@ -2270,10 +2334,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"error": str(e)}))
         prompt = (req.get("prompt") or "").strip() or built
         try:
-            out = remix.remix_images(
-                prompt,
-                [(os.path.basename(ref), open(ref, "rb").read()), ("product.png", prod)],
-                key, size=req.get("size"))
+            with auditlog.scope(project=req.get("project"), segment=req.get("segment"),
+                                stage="remix_image", source="studio"):
+                out = remix.remix_images(
+                    prompt,
+                    [(os.path.basename(ref), open(ref, "rb").read()), ("product.png", prod)],
+                    key, size=req.get("size"))
         except remix.RemixError as e:
             return self._send(200, json.dumps({"error": str(e)}))
 
@@ -2302,6 +2368,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if req.get("approve"):
             cmd.append("--yes")
         cmd.append(stage)
+        if req.get("force"):
+            cmd.append("--force")
         if req.get("provider"):
             cmd += ["--provider", str(req["provider"])]
         if req.get("model"):

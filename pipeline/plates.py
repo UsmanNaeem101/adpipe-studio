@@ -28,6 +28,8 @@ import time
 import urllib.error
 import urllib.request
 
+import auditlog
+
 API_URL = os.environ.get("IMAGE_API_URL", "https://api.openai.com/v1/images/generations")
 MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-1")
 # Portrait. render.py crops with object-fit: cover, so this only needs the right
@@ -41,12 +43,15 @@ BANNED_IN_PROMPT = ("text", "word", "caption", "label", "logo", "typography")
 
 
 def generate(prompt: str, key: str, retries: int = 3) -> bytes:
-    body = json.dumps({
+    request_body = {
         "model": MODEL,
         "prompt": prompt,
         "size": SIZE,
         "n": 1,
-    }).encode()
+    }
+    audit = auditlog.start("openai", MODEL, "image_generation", request_body,
+                           metadata={"endpoint": API_URL, "retries": retries})
+    body = json.dumps(request_body).encode()
     req = urllib.request.Request(
         API_URL, data=body, method="POST",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -57,11 +62,20 @@ def generate(prompt: str, key: str, retries: int = 3) -> bytes:
                 payload = json.load(r)
             item = payload["data"][0]
             if "b64_json" in item:
-                return base64.b64decode(item["b64_json"])
-            with urllib.request.urlopen(item["url"], timeout=300) as img:
-                return img.read()
+                data = base64.b64decode(item["b64_json"])
+                logged = {**payload, "data": [{**item, "b64_json":
+                          f"[saved as response.png · {len(data)} bytes]"}]}
+            else:
+                with urllib.request.urlopen(item["url"], timeout=300) as img:
+                    data = img.read()
+                logged = payload
+            audit.binary_response(data, logged)
+            return data
         except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:400]
+            detail_full = e.read().decode("utf-8", "replace")
+            detail = detail_full[:400]
+            audit.event("http_error", detail_full, status=e.code,
+                        attempt=attempt + 1)
             if e.code in (429, 500, 502, 503) and attempt < retries - 1:
                 wait = 2 ** attempt * 5
                 print(f"      {e.code}, retrying in {wait}s")
@@ -73,10 +87,14 @@ def generate(prompt: str, key: str, retries: int = 3) -> bytes:
                 sys.exit(f"  400 — the API rejected the prompt:\n  {detail}")
             sys.exit(f"  HTTP {e.code}: {detail}")
         except urllib.error.URLError as e:
+            audit.event("network_error", str(e.reason), attempt=attempt + 1)
             if attempt < retries - 1:
                 time.sleep(5)
                 continue
             sys.exit(f"  Network error: {e.reason}")
+        except Exception as e:
+            audit.error(e, attempt=attempt + 1)
+            raise
     sys.exit("  Gave up after retries.")
 
 
@@ -91,6 +109,13 @@ def main():
     ap.add_argument("--no-strip-exif", action="store_true",
                     help="keep EXIF; default is to strip it")
     args = ap.parse_args()
+
+    manifest = os.path.abspath(args.plates)
+    parts = manifest.split(os.sep)
+    if "projects" in parts:
+        n = parts.index("projects")
+        if n + 1 < len(parts):
+            auditlog.set_context(project=parts[n + 1], stage="plates", source="plates_cli")
 
     doc = json.load(open(args.plates, encoding="utf-8"))
     base = os.path.dirname(os.path.abspath(args.plates))
