@@ -105,6 +105,11 @@ class AppOutputTests(unittest.TestCase):
         self.assertIn("body.force=true", app.PAGE)
         self.assertIn("--force", app.Handler._run.__code__.co_consts)
 
+    def test_pipeline_exposes_force_redo_for_any_stage(self):
+        self.assertIn('id=force', app.PAGE)
+        self.assertIn('Force redo existing outputs', app.PAGE)
+        self.assertIn("force:$('#force').checked", app.PAGE)
+
 
 if __name__ == "__main__":
     unittest.main()

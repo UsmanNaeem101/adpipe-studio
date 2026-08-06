@@ -929,7 +929,12 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
       <label style="font-weight:500;font-size:14px;display:flex;gap:8px;align-items:center;margin:0">
         <input type=checkbox id=approve style="width:auto"> I approve any API spend for this run
       </label>
+      <label style="font-weight:500;font-size:14px;display:flex;gap:8px;align-items:center;margin:0">
+        <input type=checkbox id=force style="width:auto"> Force redo existing outputs
+      </label>
     </div>
+    <p class=hint style="margin-top:8px">Force redo replaces outputs that would otherwise
+      be skipped because their files already exist.</p>
     <p class=hint id=runhint>Pick a stage. Stages marked COSTS call the Claude API.</p>
   </div>
   <div class=card>
@@ -1554,6 +1559,7 @@ $('#runbtn').onclick=async()=>{
   const body={stage:stage.name,project:$('#proj').value,segment:$('#seg').value,
               source:$('#ingestpath').value.trim(),voc_source:$('#segvoc')?$('#segvoc').value:'',
               approve:$('#approve').checked,
+              force:$('#force').checked,
               rules_only:$('#rulesonly').checked,
               n_concepts:+$('#nconcepts').value||0, n_hooks:+$('#nhooks').value||0,
               n_briefs:+$('#nbriefs').value||0,
