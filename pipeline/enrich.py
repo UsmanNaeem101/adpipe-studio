@@ -38,7 +38,7 @@ import products
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-MODELS = {"anthropic": "claude-opus-5", "openrouter": "deepseek/deepseek-v4"}
+MODELS = {"anthropic": "claude-opus-5", "openrouter": "deepseek/deepseek-v4-flash-0731"}
 
 # States that mean a person has already settled this field.
 PROTECTED = {"user_approved", "verified_fact"}

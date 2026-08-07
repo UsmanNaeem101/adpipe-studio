@@ -28,7 +28,7 @@ import sys
 import presets
 
 WRITE_MODELS = {"anthropic": "claude-opus-5",
-                "openrouter": "deepseek/deepseek-v4"}
+                "openrouter": "deepseek/deepseek-v4-flash-0731"}
 
 SYSTEM = (
     "You write briefs for static direct-response advertisements. You are given "

@@ -39,7 +39,7 @@ import products
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-MODELS = {"anthropic": "claude-opus-5", "openrouter": "deepseek/deepseek-v4"}
+MODELS = {"anthropic": "claude-opus-5", "openrouter": "deepseek/deepseek-v4-flash-0731"}
 
 # What counts as reviewed. research_derived is included because it came from the
 # pipeline rather than from a model guessing about the pipeline.
