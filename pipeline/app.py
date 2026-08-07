@@ -201,6 +201,65 @@ def add_product(project, doc):
     return {"project": project, "product": slug}
 
 
+def move_product(project, product, to):
+    """Relink an existing product to another project.
+
+    A product folder (products/<slug>/) is moved wholesale; its segments and
+    segment sheets move with it. The one thing that must not change is which
+    project's research a segment reads: segments with an explicit
+    `evidence_project` keep it (the product can legally point at research in
+    another project), but a segment with an EMPTY one defaulted to "this
+    product's own project" — so when the product moves, that segment's default
+    would silently switch to the destination project's research. Those segments
+    are pinned to the source project before the move so the meaning is preserved,
+    and the count is returned so the UI can say so.
+    """
+    if not SAFE_NAME.match(to or ""):
+        raise ValueError("destination project name is invalid")
+    if to not in projects():
+        raise ValueError(f"no project {to!r} — create it first")
+    if to == project:
+        raise ValueError("product already lives in that project")
+    have = products.list_products(project)
+    if product not in have:
+        raise ValueError(f"no product {product!r} in project {project!r}")
+    if product in products.list_products(to):
+        raise ValueError(
+            f"project {to!r} already has a product {product!r} — open the existing "
+            f"one or rename before moving")
+
+    src = products.product_dir(project, product)
+    dst = products.product_dir(to, product)
+
+    # Pin any segment that relied on the "own project" default so a move cannot
+    # silently re-point its research at the destination project.
+    pinned = 0
+    seg_path = os.path.join(src, "segments.json")
+    if os.path.exists(seg_path):
+        try:
+            rows = json.load(open(seg_path, encoding="utf-8"))
+        except (ValueError, OSError):
+            rows = []
+        changed = False
+        for r in rows:
+            c = ((r.get("doc") or {}).get("identity", {})
+                 .get("evidence_project", {}).get("value"))
+            if not c or not str(c).strip():
+                seg = r.setdefault("doc", {}).setdefault("identity", {})
+                seg["evidence_project"] = products.cell(
+                    project, "user_approved", "migration",
+                    f"pinned to source project before product moved from {project} "
+                    f"to {to}", "")
+                changed = True
+                pinned += 1
+        if changed:
+            json.dump(rows, open(seg_path, "w", encoding="utf-8"), indent=2)
+
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.rename(src, dst)
+    return {"project": to, "product": product, "pinned": pinned}
+
+
 def create_project(name, product, market):
     """A project is a folder, a project.json, and an empty product sheet.
 
@@ -1824,9 +1883,24 @@ async function loadProducts(){
         <small>${esc(p.project)} / ${esc(p.product)} · truth ${p.answered}/${p.total} (${pct}%)${score}
         · <b>${p.segments}</b> segment(s), ${p.active_segments} active
         ${p.missing_required?` · <b style=color:var(--signal)>${p.missing_required} required blank</b>`:''}</small>
+        <button class="btn ghost" data-move style="margin-top:8px;padding:4px 10px;font-size:12px;float:right">Move to project…</button>
         ${p.definition?`<small style="display:block;margin-top:4px">${esc(p.definition)}</small>`:''}`;
       el.title='Open this product sheet';
       el.onclick=()=>openSheet(p.project,p.product);
+      el.querySelector('[data-move]').onclick=async ev=>{
+        ev.stopPropagation();
+        const projs=(await (await fetch('/projects')).json()).projects||[];
+        const avail=projs.filter(x=>x!==p.project);
+        if(!avail.length){ alert('No other projects to move it into.'); return; }
+        const to=prompt(`Move "${p.name||p.product}" out of "${p.project}" into which project?\n\nAvailable: ${avail.map(x=>'  '+x).join('\n')}`);
+        if(!to||!to.trim()) return;
+        const r=await (await fetch('/product/move',{method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({project:p.project,product:p.product,to:to.trim()})})).json();
+        if(r.error){ alert('⚠ '+r.error); return; }
+        alert(`Moved to ${r.product} / ${r.product}${r.pinned?` — ${r.pinned} segment(s) pinned to ${p.project}'s research.`:''}`);
+        loadProducts();
+      };
       box.appendChild(el);
     });
   }catch(e){ box.innerHTML=`<p class=hint>⚠ ${e}</p>`; }
@@ -3158,6 +3232,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             req = self._json()
             try:
                 out = add_product(req.get("project", ""), req.get("doc") or {})
+            except (ValueError, products.ProductError) as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            return self._send(200, json.dumps({"ok": True, **out}))
+        if path == "/product/move":
+            req = self._json()
+            try:
+                out = move_product(req.get("project", ""), req.get("product", ""),
+                                   req.get("to", ""))
             except (ValueError, products.ProductError) as e:
                 return self._send(200, json.dumps({"error": str(e)}))
             return self._send(200, json.dumps({"ok": True, **out}))
