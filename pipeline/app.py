@@ -40,6 +40,7 @@ import presets  # noqa: E402
 import levers  # noqa: E402
 import briefs  # noqa: E402
 import products  # noqa: E402
+import enrich  # noqa: E402
 import auditlog  # noqa: E402
 
 REFS = os.path.join(ROOT, "references")
@@ -1008,6 +1009,30 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
         <button class="btn ghost" id=segimport style=white-space:nowrap>Import from pipeline</button>
       </div>
       <p class=hint id=segmsg style="margin:0 0 10px"></p>
+
+      <div style="border:1.5px solid var(--line);border-radius:11px;padding:13px 15px;
+        margin-bottom:14px">
+        <b style=font-size:13.5px>Enrich from research</b>
+        <p class=hint style="margin:5px 0 10px">Reads this segment's extraction
+          outputs and proposes values for its research fields. Evidence only — it
+          records what customers said, never what to do about it. Every suggestion
+          arrives as <i>ai&nbsp;suggested</i> for you to accept, edit or reject, and
+          fields you have already approved are left alone.</p>
+        <div class=row style="margin-bottom:9px">
+          <div><label>Segment</label><select id=en_seg></select></div>
+          <div><label>&nbsp;</label>
+            <div style="display:flex;gap:8px">
+              <button class="btn ghost" id=en_preview style="flex:1;white-space:nowrap">Preview prompt</button>
+              <button class=btn id=en_go style="flex:1;white-space:nowrap">Enrich</button>
+            </div></div>
+        </div>
+        <label>Sections to populate</label>
+        <div id=en_sections style="display:flex;flex-wrap:wrap;gap:12px;margin:6px 0 8px"></div>
+        <a href=# id=en_all style="font-size:13px;color:var(--accent)">select all recommended</a>
+        <p class=hint id=en_msg style="margin:9px 0 0"></p>
+        <div id=en_review style="margin-top:12px"></div>
+      </div>
+
       <div id=seglist></div>
     </div>
 
@@ -1829,6 +1854,7 @@ function blankSegDoc(){
   return d;
 }
 function renderSegments(){
+  renderEnrichPanel();
   const box=$('#seglist'); box.innerHTML='';
   if(!PSEGS.length){ box.innerHTML='<p class=hint>No segments yet. Research discovers '+
     'these — add one, or import a validated segment from the pipeline.</p>'; return; }
@@ -1881,6 +1907,144 @@ $('#segimport').onclick=()=>{
   $('#segmsg').textContent=`imported ${avail.length} pipeline segment(s) — review and save`;
   renderSegments();
 };
+
+/* ---- §6 enrich from research ---- */
+let ENSUG=null;
+
+function renderEnrichPanel(){
+  const sel=$('#en_seg'); if(!sel) return;
+  const was=sel.value;
+  sel.innerHTML=PSEGS.map((s,i)=>{
+    const n=cv(s.doc.identity.name)||s.slug;
+    return `<option value="${esc(s.slug||('#'+i))}">${esc(n)}${s.slug?'':' (unsaved)'}</option>`;
+  }).join('')||'<option value="">— no segments —</option>';
+  if(was) sel.value=was;
+  const box=$('#en_sections');
+  if(!box.children.length&&PSCHEMA&&PSCHEMA.enrich_sections){
+    box.innerHTML=PSCHEMA.enrich_sections.map(s=>
+      `<label style="font-weight:500;font-size:13px;display:flex;gap:6px;align-items:center;margin:0">
+        <input type=checkbox checked data-en="${esc(s.key)}" style="width:auto">
+        ${esc(s.title)} <span style=color:var(--soft)>(${s.fields})</span></label>`).join('');
+  }
+}
+$('#en_all').onclick=e=>{e.preventDefault();
+  $$('#en_sections [data-en]').forEach(c=>c.checked=true);};
+
+function enSections(){ return $$('#en_sections [data-en]:checked').map(c=>c.dataset.en); }
+
+async function runEnrich(dry){
+  const slug=$('#en_seg').value;
+  if(!slug||slug.startsWith('#')){ $('#en_msg').textContent=
+    'Save the segment first — enrichment reads its saved research link.'; return; }
+  const secs=enSections();
+  if(!secs.length){ $('#en_msg').textContent='Pick at least one section.'; return; }
+  const btn=dry?$('#en_preview'):$('#en_go'); btn.disabled=true;
+  $('#en_msg').textContent=dry?'building prompt…':'reading research…';
+  try{
+    const j=await (await fetch('/product/enrich',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project:PPROJ,product:PPRODUCT,segment:slug,
+                           sections:secs,dry_run:!!dry})})).json();
+    if(j.error){ $('#en_msg').textContent='⚠ '+j.error; btn.disabled=false; return; }
+    if(dry){
+      $('#pmtext').value=j.prompt;
+      $('#pmsub').textContent=`${j.asked} field(s) would be proposed`+
+        (j.skipped.length?`; ${j.skipped.length} already approved and left alone.`:'.');
+      $('#pmcost').textContent='Preview only — nothing sent.';
+      pending=null; $('#pmgo').disabled=true; $('#pmwrap').classList.remove('hide');
+      $('#en_msg').textContent='';
+    }else{
+      ENSUG={slug,data:j};
+      /* Apply immediately as ai_suggested. The spec stores proposals in that
+         state, so a review you have not finished survives a save instead of
+         being silently dropped; accept promotes, reject clears. */
+      const seg0=segBySlug(slug);
+      if(seg0) Object.entries(j.suggestions||{}).forEach(([sk,fs])=>
+        Object.entries(fs).forEach(([fk,cell])=>{ seg0.doc[sk][fk]={...cell}; }));
+      renderSegments();
+      $('#en_msg').textContent=`${j.model} proposed values for `+
+        `${Object.values(j.suggestions).reduce((n,o)=>n+Object.keys(o).length,0)} field(s)`+
+        (j.skipped.length?`; ${j.skipped.length} left alone (already approved).`:'.');
+      renderSuggestions();
+    }
+  }catch(e){ $('#en_msg').textContent='⚠ '+e; }
+  btn.disabled=false;
+}
+$('#en_preview').onclick=()=>runEnrich(true);
+$('#en_go').onclick=()=>runEnrich(false);
+
+function segBySlug(slug){ return PSEGS.find(s=>s.slug===slug); }
+function fieldMeta(seckey,fkey){
+  const sec=(PSCHEMA.segment||[]).find(s=>s.key===seckey);
+  return [sec, sec&&sec.fields.find(f=>f.key===fkey)];
+}
+
+function renderSuggestions(){
+  const box=$('#en_review'); box.innerHTML='';
+  if(!ENSUG) return;
+  const {slug,data}=ENSUG, seg=segBySlug(slug);
+  if(!seg){ box.innerHTML='<p class=hint>segment no longer loaded</p>'; return; }
+  const wrap=document.createElement('div');
+  wrap.style.cssText='border:1.5px solid var(--accent);border-radius:11px;padding:13px 15px';
+  wrap.innerHTML=`<b style=font-size:13.5px>Review suggestions</b>
+    <p class=hint style="margin:4px 0 10px">Accepting marks the field
+      <i>user approved</i> and it will not be re-proposed. Rejecting leaves it empty.
+      Nothing is written until you save.</p>`;
+  let n=0;
+  Object.entries(data.suggestions).forEach(([sk,fields])=>{
+    Object.entries(fields).forEach(([fk,cell])=>{
+      const [sec,f]=fieldMeta(sk,fk); if(!f) return;
+      n++;
+      const cur=seg.doc[sk][fk], applied=cur.state==='ai_suggested'||cur.state==='user_approved';
+      const el=document.createElement('div'); el.className='bf';
+      const val=Array.isArray(cell.value)?cell.value:[String(cell.value)];
+      el.innerHTML=`<h4 style="display:block"><span>${esc(sec.title)} · ${esc(f.label)}</span>
+        <span class=lvn style="float:right">${esc(cell.confidence||'')}${
+          cell.ref?' · '+esc(cell.ref):''}</span></h4>
+        <div style="font-size:13px;line-height:1.55">${
+          val.map(v=>`• ${esc(v)}`).join('<br>')}</div>
+        <div style="display:flex;gap:8px;margin-top:9px">
+          <button class="btn ghost" data-act=accept style="padding:6px 13px;font-size:13px">Accept</button>
+          <button class="btn ghost" data-act=edit style="padding:6px 13px;font-size:13px">Edit</button>
+          <button class="btn ghost" data-act=reject style="padding:6px 13px;font-size:13px">Reject</button>
+          <span class=hint data-state style="margin:0;align-self:center"></span>
+        </div>`;
+      const mark=t=>el.querySelector('[data-state]').textContent=t;
+      el.querySelector('[data-act=accept]').onclick=()=>{
+        seg.doc[sk][fk]={...cell,state:'user_approved'};
+        el.classList.add('on'); mark('accepted — save to persist'); renderSegments();};
+      el.querySelector('[data-act=reject]').onclick=()=>{
+        seg.doc[sk][fk]={value:(f.kind==='list'||f.kind==='table')?[]:'',
+          state:'rejected',source:'research',ref:cell.ref||'',confidence:''};
+        el.classList.remove('on'); mark('rejected'); renderSegments();};
+      el.querySelector('[data-act=edit]').onclick=()=>{
+        const isList=f.kind==='list';
+        const cur=prompt(`${f.label}`+(isList?'\n(one per line)':''),
+          isList?val.join('\n'):val[0]||'');
+        if(cur===null) return;
+        seg.doc[sk][fk]={...cell,
+          value:isList?cur.split('\n').map(x=>x.trim()).filter(Boolean):cur.trim(),
+          state:'user_approved'};
+        el.classList.add('on'); mark('edited and accepted — save to persist');
+        renderSegments();};
+      if(applied) el.classList.add('on');
+      wrap.appendChild(el);
+    });
+  });
+  if(!n){ box.innerHTML='<p class=hint>Nothing proposed.</p>'; return; }
+  const all=document.createElement('button'); all.className='btn';
+  all.style.cssText='margin-top:6px'; all.textContent='Accept all';
+  all.onclick=()=>{ wrap.querySelectorAll('[data-act=accept]').forEach(b=>b.click()); };
+  wrap.appendChild(all);
+  if(data.skipped&&data.skipped.length){
+    const sk=document.createElement('p'); sk.className='hint';
+    sk.style.marginTop='10px';
+    sk.innerHTML='<b>Left alone (already approved):</b> '+
+      data.skipped.map(x=>esc(x.label)).join(' · ');
+    wrap.appendChild(sk);
+  }
+  box.appendChild(wrap);
+}
 
 function renderReady(r){
   const box=$('#readybox');
@@ -2505,7 +2669,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "missing_required": products.missing_required(
                      doc, products.PRODUCT_SECTIONS)}))
         if u.path == "/product/schema":
-            return self._send(200, json.dumps(products.schema()))
+            sch = products.schema()
+            sch["enrich_sections"] = [
+                {"key": s["key"], "title": s["title"], "fields": len(fs)}
+                for s, fs in enrich.enrichable()]
+            return self._send(200, json.dumps(sch))
         if u.path == "/piccs":
             pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             return self._send(200, json.dumps(
@@ -2699,6 +2867,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(picked))
             except presets.PresetError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
+        if path == "/product/enrich":
+            req = self._json()
+            with _lock:
+                keys = dict(KEYS)
+            proj = req.get("project", "")
+            try:
+                prod = products.resolve_product(proj, req.get("product", ""))
+                segs = products.load_segments(proj, prod)
+            except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            slug = req.get("segment", "")
+            seg = next((x for x in segs if x["slug"] == slug), None)
+            if not seg:
+                return self._send(200, json.dumps(
+                    {"error": f"no saved segment {slug!r} — save the segment first"}))
+            # The segment's research lives under its pipeline slug; without one
+            # there are no extractions to read and nothing to propose from.
+            ev = products.value_of(seg["doc"]["identity"].get("evidence_slug")) or slug
+            try:
+                out = enrich.suggest(
+                    proj, prod, ev, seg["doc"],
+                    sections=req.get("sections") or None, keys=keys,
+                    dry_run=bool(req.get("dry_run")))
+            except enrich.EnrichError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            return self._send(200, json.dumps(out))
         if path == "/product/save":
             req = self._json()
             proj = req.get("project", "")
