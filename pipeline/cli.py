@@ -1164,14 +1164,46 @@ CONCEPT_SCHEMA = {
 }
 
 
+def picc_path(cfg, segment, chosen=None):
+    """Which PICC card the concepts stage should build on.
+
+    Defaults to the segment's own card, but `--picc` takes any card in the
+    project — you may have rewritten the card, kept a variant, or want to run
+    this segment's language against a card you prefer. The choice is explicit
+    rather than inferred, so re-running concepts cannot silently swap strategy
+    underneath you.
+    """
+    default = os.path.join(cfg["_dir"], "output", segment, "01_picc_card.md")
+    if not chosen:
+        if not os.path.exists(default):
+            sys.exit(f"No PICC card. Run: adpipe -p {cfg['name']} picc {segment}")
+        return default
+
+    p = chosen if os.path.isabs(chosen) else os.path.join(ROOT, chosen)
+    p = os.path.realpath(p)
+    # Keep it inside the project: the card decides everything downstream, so it
+    # is not a path to accept from anywhere on disk.
+    if os.path.commonpath([p, os.path.realpath(cfg["_dir"])]) != os.path.realpath(cfg["_dir"]):
+        sys.exit(f"--picc must point inside projects/{cfg['name']}/ — got {chosen}")
+    if not os.path.exists(p):
+        sys.exit(f"PICC card not found: {chosen}")
+    return p
+
+
 def cmd_concepts(cfg, args):
     """10 concepts, 2-3 in-image hooks each, each mapped to a real layout."""
-    card_p = os.path.join(cfg["_dir"], "output", args.segment, "01_picc_card.md")
-    if not os.path.exists(card_p):
-        sys.exit(f"No PICC card. Run: adpipe -p {cfg['name']} picc {args.segment}")
+    card_p = picc_path(cfg, args.segment, getattr(args, "picc", None))
     card = open(card_p, encoding="utf-8").read()
+    rel = os.path.relpath(card_p, ROOT)
+    print(f"  PICC card: {rel}")
+    # The card is the strategy, but it is one model's compression of 20
+    # dimensions. Pain, desired outcome, mechanism and desired proof go in raw
+    # alongside it so a lossy card cannot quietly drop what the ad is about;
+    # 24/25/26 supply the segment's own words, 14/18 the contrast and rebuttal.
     lang = read_extractions(cfg, args.segment, "terminology", "slang",
-                            "representative_voc", "failed_solutions", "objections")
+                            "representative_voc", "failed_solutions", "objections",
+                            "pain_points", "desired_outcomes", "mechanisms",
+                            "desired_proof")
     templates = _templates()
     n = getattr(args, "concepts", None) or cfg["creative"]["concepts_per_run"]
     hooks_n = getattr(args, "hooks", None) or 3
@@ -1182,7 +1214,11 @@ def cmd_concepts(cfg, args):
 
 ---
 
-And the segment's own language (skills 24/25/26) plus failed solutions and objections:
+And the underlying research the card was built from — pain points (07), desired
+outcomes (09), mechanisms (19) and desired proof (20), the segment's own language
+(24/25/26), plus failed solutions (14) and objections (18). Where the card and
+these disagree, the card decides strategy but these decide the wording, and
+anything the card dropped is still fair game here:
 
 {lang}
 
@@ -1388,6 +1424,9 @@ def main():
         if name in ("concepts", "run"):
             s.add_argument("--concepts", type=int, help="how many concepts")
             s.add_argument("--hooks", type=int, help="hooks per concept (default 3)")
+            s.add_argument("--picc", help="which PICC card to build on, as a path "
+                                          "inside the project (default: this "
+                                          "segment's output/<segment>/01_picc_card.md)")
         if name in ("brief", "run"):
             s.add_argument("--briefs", type=int, help="how many production briefs")
 

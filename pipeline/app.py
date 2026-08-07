@@ -510,6 +510,37 @@ def compliance_notes(project="montisella"):
         return ""
 
 
+def picc_cards(project):
+    """Every PICC card in a project, newest first.
+
+    The concepts stage builds on exactly one card, so the operator picks it
+    rather than having the segment's own card assumed. Any Markdown under
+    output/ whose name mentions "picc" counts, which means a card you saved
+    aside as a variant shows up next to the generated ones.
+    """
+    base = os.path.join(ROOT, "projects", project, "output")
+    if not os.path.isdir(base):
+        return []
+    out = []
+    for seg in sorted(os.listdir(base)):
+        d = os.path.join(base, seg)
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.endswith(".md") and "picc" in f.lower():
+                full = os.path.join(d, f)
+                out.append({
+                    "rel": os.path.relpath(full, ROOT),
+                    "segment": seg,
+                    "name": f,
+                    "label": f"{seg} · {f}",
+                    "bytes": os.path.getsize(full),
+                    "mtime": int(os.path.getmtime(full)),
+                })
+    out.sort(key=lambda r: -r["mtime"])
+    return out
+
+
 def build_image_prompt(req):
     """The exact prompt the image model receives, from one request payload.
 
@@ -920,6 +951,11 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
         <div><label>Concepts</label><input type=number id=nconcepts value=10 min=1 max=30></div>
         <div><label>Hooks each</label><input type=number id=nhooks value=3 min=1 max=6></div>
       </div>
+      <label style="margin-top:12px">PICC card to build on</label>
+      <select id=piccsel></select>
+      <p class=hint id=piccwhy>The concepts stage builds on exactly one card. Pick
+        it rather than letting the segment's own card be assumed — the card decides
+        the strategy every concept inherits.</p>
     </div>
     <div id=opt_brief class=opts style="margin-top:14px" hidden>
       <label>Production briefs</label><input type=number id=nbriefs value=4 min=1 max=10>
@@ -1532,7 +1568,38 @@ async function loadSegs(){
   const j=await r.json();
   $('#seg').innerHTML=j.segments.length?j.segments.map(x=>`<option>${x}</option>`).join('')
     :'<option value="">— none yet —</option>';
+  $('#seg').onchange=loadPiccs;
   if(stage&&stage.name==='segment')loadVocFiles();
+  loadPiccs();
+}
+/* The concepts stage builds on exactly one PICC card. Default to the selected
+   segment's own, but list every card in the project so a rewritten or set-aside
+   variant can be chosen deliberately. */
+async function loadPiccs(){
+  const sel=$('#piccsel'); if(!sel) return;
+  const pr=$('#proj').value, seg=$('#seg').value, was=sel.value;
+  sel.innerHTML='<option value="">— this segment\'s own card (default)</option>';
+  if(!pr) return;
+  try{
+    const j=await (await fetch('/piccs?project='+encodeURIComponent(pr))).json();
+    const cards=j.cards||[];
+    if(!cards.length){
+      $('#piccwhy').textContent='No PICC card in this project yet — run the picc stage first.';
+      return;
+    }
+    cards.forEach(c=>{const o=document.createElement('option');
+      o.value=c.rel;
+      const when=new Date(c.mtime*1000).toLocaleString([],{dateStyle:'medium',timeStyle:'short'});
+      o.textContent=(c.segment===seg?'★ ':'')+`${c.label} — ${when}`;
+      sel.appendChild(o);});
+    if(was&&[...sel.options].some(o=>o.value===was)) sel.value=was;
+    const mine=cards.filter(c=>c.segment===seg).length;
+    $('#piccwhy').innerHTML=mine
+      ? `★ marks this segment's own card. Leave it on default to use that, or pick `+
+        `another of the ${cards.length} card(s) in this project.`
+      : `<b>No card for <code>${seg}</code> yet</b> — run the picc stage for it, or `+
+        `pick one of the ${cards.length} card(s) from another segment.`;
+  }catch(e){ $('#piccwhy').textContent='Could not load PICC cards: '+e; }
 }
 async function loadVocFiles(){
   const pr=$('#proj').value; if(!pr)return;
@@ -1562,6 +1629,7 @@ $('#runbtn').onclick=async()=>{
               force:$('#force').checked,
               rules_only:$('#rulesonly').checked,
               n_concepts:+$('#nconcepts').value||0, n_hooks:+$('#nhooks').value||0,
+              picc:$('#piccsel')?$('#piccsel').value:'',
               n_briefs:+$('#nbriefs').value||0,
               provider:$('#provider')?$('#provider').value:'',
               model:$('#modelid')?$('#modelid').value.trim():''};
@@ -2007,6 +2075,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(project_summary(n) or {}))
         if u.path == "/library":
             return self._send(200, json.dumps(library()))
+        if u.path == "/piccs":
+            pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
+            return self._send(200, json.dumps(
+                {"cards": picc_cards(pr) if pr else []}))
         if u.path == "/levers":
             q = urllib.parse.parse_qs(u.query)
             try:
@@ -2390,6 +2462,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 cmd += ["--concepts", str(int(req["n_concepts"]))]
             if req.get("n_hooks"):
                 cmd += ["--hooks", str(int(req["n_hooks"]))]
+            if req.get("picc"):
+                cmd += ["--picc", str(req["picc"])]
         if stage in ("brief", "run"):
             if req.get("n_briefs"):
                 cmd += ["--briefs", str(int(req["n_briefs"]))]
