@@ -39,6 +39,7 @@ import exifstrip  # noqa: E402
 import presets  # noqa: E402
 import levers  # noqa: E402
 import briefs  # noqa: E402
+import products  # noqa: E402
 import auditlog  # noqa: E402
 
 REFS = os.path.join(ROOT, "references")
@@ -107,23 +108,75 @@ def segments(project):
 SAFE_NAME = __import__("re").compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
 
 
+TEMPLATE_PROJECT = {
+    "_comment": "Per-project config. Everything product-specific lives in this "
+                "folder: project.json, product.json, product_sheet.md, facts.json.",
+    "brand": "pipeline/brand.json",
+    "filter": {
+        "_comment": "Skill-01 filtering. TOPIC decides whether an item is about this "
+                    "market at all; the rest score relevance. Regexes are "
+                    "case-insensitive. These are EMPTY — write them for this niche "
+                    "before ingesting, or nothing will match.",
+        "topic": "", "pain": "", "first_person": "", "solution": "",
+        "emotion": "", "product": "", "min_words": 12, "min_score": 2,
+    },
+    "compliance": {
+        "_comment": "Which qa.py ruleset applies. Use 'health_adjacent' for anything "
+                    "wellness-adjacent; it is the strict Meta set.",
+        "profile": "health_adjacent", "platform": "meta", "notes": "",
+    },
+    "creative": {"awareness": "problem-aware", "traffic": "cold", "formats": ["4x5"],
+                 "concepts_per_run": 10, "briefs_per_run": 4},
+    "model": {"id": "claude-opus-5", "effort": "high"},
+}
+
+BLANK_FACTS = {
+    "_comment": "The ONLY numbers and product claims allowed to appear in an ad. "
+                "qa.py fails any stat not listed here or found verbatim in the "
+                "segment evidence file. Move a fact out of "
+                "candidate_facts_pending_confirmation and into approved_numbers "
+                "only once it is confirmed with the supplier or store.",
+    "product": "",
+    "approved_numbers": [],
+    "candidate_facts_pending_confirmation": {},
+    "safe_mechanism_language": {"allowed": [], "banned": []},
+    "safe_outcome_language": {"allowed": [], "banned": []},
+}
+
+
 def create_project(name, product, market):
-    """A project is a folder + a project.json. Clone montisella's config so the
-    filter regexes and compliance profile are a starting point, not blank."""
+    """A project is a folder, a project.json, and an empty product sheet.
+
+    Nothing is copied from another project. Cloning montisella used to carry its
+    filter regexes, compliance notes and — via the shared pipeline/facts.json —
+    its approved claims into every new product, which is exactly the kind of
+    inheritance that puts one product's claims in another product's ads. A new
+    project starts blank and says so.
+    """
     if not SAFE_NAME.match(name or ""):
         raise ValueError("name must be lowercase letters, digits, - or _ (2-41 chars)")
     dest = os.path.join(ROOT, "projects", name)
     if os.path.exists(dest):
         raise ValueError(f"project {name!r} already exists")
-    base = os.path.join(ROOT, "projects", "montisella", "project.json")
-    cfg = json.load(open(base, encoding="utf-8")) if os.path.exists(base) else {}
-    cfg.update({"name": name, "product": product or name, "market": market or ""})
-    cfg["_comment"] = ("Per-project config cloned from montisella. REPLACE the filter "
-                       "regexes and compliance profile for this niche before ingesting.")
+
+    cfg = json.loads(json.dumps(TEMPLATE_PROJECT))   # deep copy
+    cfg = {"_comment": cfg.pop("_comment"), "name": name,
+           "product": product or name, "market": market or "", **cfg}
     for sub in ("voc", "evidence", "extractions", "output"):
         os.makedirs(os.path.join(dest, sub), exist_ok=True)
     json.dump(cfg, open(os.path.join(dest, "project.json"), "w", encoding="utf-8"),
               indent=2)
+
+    facts = json.loads(json.dumps(BLANK_FACTS))
+    facts["product"] = product or name
+    json.dump(facts, open(os.path.join(dest, "facts.json"), "w", encoding="utf-8"),
+              indent=2)
+
+    # Seed the sheet with the two things we already know, so the Product tab
+    # opens on a form that is started rather than untouched.
+    doc = products.blank()
+    doc["identity"]["name"] = product or name
+    products.save(name, doc)
     return cfg
 
 
@@ -758,6 +811,7 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
   <div class=htop><b>adpipe studio</b><span>voice-of-customer → finished ads</span></div>
   <div class=tabs>
     <button class="tab on" data-t=remix>Remix</button>
+    <button class=tab data-t=product>Product</button>
     <button class=tab data-t=pipeline>Pipeline</button>
     <button class=tab data-t=library>Library</button>
     <button class=tab data-t=outputs>Outputs</button>
@@ -884,6 +938,53 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
       <div class=card id=resultscard hidden>
         <h2>Results</h2><div class=results id=results></div>
       </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= PRODUCT ================= -->
+<section id=t-product class=hide>
+  <div class=card>
+    <h2>Products</h2>
+    <p class=hint style="margin-top:0">One product per project. The sheet answers
+      who it is for, what it solves, whether it can be sold profitably, why buy it
+      here instead of Amazon, and whether ads can be made for it. The picc and
+      brief stages read it.</p>
+    <div id=prodlist>loading…</div>
+    <div style="margin-top:18px;border-top:1.5px solid var(--line);padding-top:16px">
+      <h3 style="font-size:14px;margin:0 0 10px">New product</h3>
+      <div class=row>
+        <div><label>Project key</label>
+          <input id=np_key placeholder="lowercase-with-dashes"></div>
+        <div><label>Product name</label>
+          <input id=np_name placeholder="Open-cell latex ergonomic pillow"></div>
+      </div>
+      <label style="margin-top:10px">Market</label>
+      <input id=np_market placeholder="who it is sold to, in one line">
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center">
+        <button class=btn id=np_go>Create product</button>
+        <span class=hint id=np_msg style="margin:0">Creates an empty project — no
+          filters, facts or claims copied from anything else.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class=card id=sheetcard hidden>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px">
+      <div>
+        <h2 style="margin:0" id=sheettitle>Product sheet</h2>
+        <p class=hint style="margin:4px 0 0" id=sheetstate></p>
+      </div>
+      <div style="display:flex;gap:9px;white-space:nowrap">
+        <button class="btn ghost" id=sheetclose>Close</button>
+        <button class=btn id=sheetsave>Save sheet</button>
+      </div>
+    </div>
+    <div id=sheetmissing style="margin-top:12px"></div>
+    <div id=sheetform style="margin-top:14px"></div>
+    <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
+      <button class=btn id=sheetsave2>Save sheet</button>
+      <span class=hint id=sheetmsg style="margin:0"></span>
     </div>
   </div>
 </section>
@@ -1120,6 +1221,7 @@ $$('.tab').forEach(b=>b.onclick=()=>{
   if(b.dataset.t==='library'  && typeof loadLibrary==='function') loadLibrary();
   if(b.dataset.t==='outputs'  && typeof loadOutputs==='function') loadOutputs();
   if(b.dataset.t==='settings' && typeof renderProjectList==='function') renderProjectList();
+  if(b.dataset.t==='product' && typeof loadProducts==='function') loadProducts();
 });
 
 // ---------- settings ----------
@@ -1539,6 +1641,162 @@ $('#pmgo').onclick=async()=>{
     }catch(e){ cards[i].innerHTML=`<div class=err>✕ ${e}</div>`; }
   }
   $('#go').disabled=false;
+};
+
+// ---------- product ----------
+let PSCHEMA=[], PDOC=null, PPROJ='';
+
+fetch('/product/schema').then(r=>r.json()).then(j=>{PSCHEMA=j.sections||[];});
+
+async function loadProducts(){
+  const box=$('#prodlist');
+  try{
+    const j=await (await fetch('/products')).json();
+    const rows=j.products||[];
+    if(!rows.length){ box.innerHTML='<p class=hint>No products yet.</p>'; return; }
+    box.innerHTML='';
+    rows.forEach(p=>{
+      const el=document.createElement('div'); el.className='stage';
+      const pct=p.total?Math.round(100*p.answered/p.total):0;
+      const verdict=p.verdict?`<span class=costs>${esc(p.verdict)}</span>`:'';
+      const score=(p.score!==null&&p.score!==undefined)?` · score ${p.score}/10`:'';
+      el.innerHTML=`<b>${esc(p.name||p.project)} ${verdict}</b>
+        <small>${esc(p.project)} · ${p.answered}/${p.total} fields (${pct}%)${score}
+        ${p.missing_required?` · <b style=color:var(--signal)>${p.missing_required} required blank</b>`:''}</small>
+        ${p.definition?`<small style="display:block;margin-top:4px">${esc(p.definition)}</small>`:''}`;
+      el.onclick=()=>openSheet(p.project);
+      box.appendChild(el);
+    });
+  }catch(e){ box.innerHTML=`<p class=hint>⚠ ${e}</p>`; }
+}
+
+async function openSheet(proj){
+  const j=await (await fetch('/product?project='+encodeURIComponent(proj))).json();
+  if(j.error){ alert(j.error); return; }
+  PPROJ=proj; PDOC=j.doc;
+  $('#sheetcard').hidden=false;
+  $('#sheettitle').textContent=(PDOC.identity&&PDOC.identity.name)||proj;
+  renderSheet(); updateSheetState(j.answered,j.total,j.missing_required);
+  $('#sheetcard').scrollIntoView({behavior:'smooth',block:'start'});
+}
+$('#sheetclose').onclick=()=>{ $('#sheetcard').hidden=true; PDOC=null; PPROJ=''; };
+
+function updateSheetState(a,t,missing){
+  $('#sheetstate').textContent=`${PPROJ} · ${a}/${t} fields answered`;
+  const m=$('#sheetmissing');
+  if(!missing||!missing.length){ m.innerHTML=''; return; }
+  m.innerHTML=`<div style="background:#FFF8F1;border:1px solid #E0A87A;border-radius:11px;
+    padding:12px 14px"><b style=font-size:13.5px>${missing.length} required field(s) still blank</b>
+    <div style="font-size:13px;margin-top:6px;line-height:1.6">${
+      missing.map(x=>esc(x)).join('<br>')}</div>
+    <div class=hint style="margin:8px 0 0">These are listed in the rendered sheet as
+      unanswered, so the model treats them as unknown rather than guessing.</div></div>`;
+}
+
+/* The form is rendered from the schema, so a new field appears here by being
+   added to products.py — there is no second copy of the field list to keep. */
+function renderSheet(){
+  const box=$('#sheetform'); box.innerHTML='';
+  PSCHEMA.forEach(sec=>{
+    const d=document.createElement('details'); d.className='lvg';
+    const vals=PDOC[sec.key]||{};
+    const done=sec.fields.filter(f=>{const v=vals[f.key];
+      return Array.isArray(v)?v.length:String(v||'').trim();}).length;
+    d.innerHTML=`<summary>${esc(sec.title)}
+      <span class=lvn>${done}/${sec.fields.length}</span></summary>`;
+    const body=document.createElement('div'); body.className='body';
+    if(sec.help) body.innerHTML=`<p class=hint style="margin:0 0 12px">${esc(sec.help)}</p>`;
+    sec.fields.forEach(f=>body.appendChild(fieldRow(sec,f,vals[f.key])));
+    d.appendChild(body); box.appendChild(d);
+  });
+}
+
+function fieldRow(sec,f,val){
+  const row=document.createElement('div'); row.className='lev';
+  const req=f.required?' <span class=req>*</span>':'';
+  const lab=`<label>${esc(f.label)}${req}</label>`;
+  const path=`${sec.key}.${f.key}`;
+  if(f.kind==='table'){
+    row.innerHTML=lab;
+    const t=document.createElement('div'); t.dataset.table=path;
+    const cols=f.columns;
+    const draw=()=>{
+      const rows=(PDOC[sec.key][f.key]||[]);
+      t.innerHTML=`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">
+        <thead><tr>${cols.map(c=>`<th style="text-align:left;padding:4px 6px;border-bottom:1.5px solid var(--line)">${esc(c)}</th>`).join('')}<th></th></tr></thead>
+        <tbody>${rows.map((r,i)=>`<tr>${cols.map((c,ci)=>
+          `<td style="padding:3px 4px"><input data-tr="${i}" data-tc="${ci}" value="${esc(r[ci]||'')}"></td>`).join('')}
+          <td style="padding:3px 4px"><a href=# data-del="${i}" style="color:var(--soft)">×</a></td></tr>`).join('')}</tbody></table></div>
+        <a href=# data-add style="font-size:13px;color:var(--accent)">+ add row</a>`;
+      t.querySelectorAll('input[data-tr]').forEach(inp=>inp.oninput=()=>{
+        PDOC[sec.key][f.key][+inp.dataset.tr][+inp.dataset.tc]=inp.value;});
+      t.querySelectorAll('[data-del]').forEach(a=>a.onclick=e=>{e.preventDefault();
+        PDOC[sec.key][f.key].splice(+a.dataset.del,1); draw();});
+      t.querySelector('[data-add]').onclick=e=>{e.preventDefault();
+        PDOC[sec.key][f.key]=PDOC[sec.key][f.key]||[];
+        PDOC[sec.key][f.key].push(cols.map(()=>'')); draw();};
+    };
+    if(!PDOC[sec.key][f.key]||!PDOC[sec.key][f.key].length){
+      // Seed the rows the schema suggests, so the shape of the answer is visible.
+      PDOC[sec.key][f.key]=(f.rows_hint||[]).map(h=>[h,...cols.slice(1).map(()=>'')]);
+    }
+    draw(); row.appendChild(t);
+    return row;
+  }
+  let ctl;
+  if(f.kind==='choice'){
+    ctl=`<select data-p="${path}"><option value="">—</option>`+
+        f.options.map(o=>`<option${val===o?' selected':''}>${esc(o)}</option>`).join('')+'</select>';
+  }else if(f.kind==='score'){
+    ctl=`<input type=number min=0 max=10 data-p="${path}" value="${esc(val||'')}">`;
+  }else if(f.kind==='list'){
+    ctl=`<textarea data-p="${path}" data-list=1 rows=4 placeholder="${esc(f.placeholder||'one per line')}">${
+      esc((val||[]).join('\n'))}</textarea>`;
+  }else if(f.kind==='long'){
+    ctl=`<textarea data-p="${path}" rows=3 placeholder="${esc(f.placeholder||'')}">${esc(val||'')}</textarea>`;
+  }else{
+    ctl=`<input data-p="${path}" value="${esc(val||'')}" placeholder="${esc(f.placeholder||'')}">`;
+  }
+  row.innerHTML=lab+ctl;
+  const el=row.querySelector('[data-p]');
+  const sync=()=>{
+    const [sk,fk]=path.split('.');
+    PDOC[sk][fk]=el.dataset.list?el.value.split('\n').map(s=>s.trim()).filter(Boolean):el.value;
+    row.classList.toggle('set',!!(el.dataset.list?PDOC[sk][fk].length:el.value.trim()));
+  };
+  el.oninput=el.onchange=sync; sync();
+  return row;
+}
+
+async function saveSheet(){
+  if(!PDOC) return;
+  $('#sheetmsg').textContent='saving…';
+  try{
+    const j=await (await fetch('/product/save',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project:PPROJ,doc:PDOC})})).json();
+    if(j.error){ $('#sheetmsg').textContent='⚠ '+j.error; return; }
+    $('#sheetmsg').textContent=`saved → ${j.sheet}`;
+    updateSheetState(j.answered,j.total,j.missing_required);
+    renderSheet(); loadProducts();
+  }catch(e){ $('#sheetmsg').textContent='⚠ '+e; }
+}
+$('#sheetsave').onclick=saveSheet; $('#sheetsave2').onclick=saveSheet;
+
+$('#np_go').onclick=async()=>{
+  const key=$('#np_key').value.trim(), name=$('#np_name').value.trim();
+  if(!key){ $('#np_msg').textContent='Give it a project key.'; return; }
+  $('#np_go').disabled=true;
+  try{
+    const j=await (await fetch('/project',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:key,product:name,market:$('#np_market').value.trim()})})).json();
+    if(j.error){ $('#np_msg').textContent='⚠ '+j.error; }
+    else{ $('#np_msg').textContent=`created ${j.project}`;
+      $('#np_key').value=$('#np_name').value=$('#np_market').value='';
+      await loadProducts(); openSheet(j.project); }
+  }catch(e){ $('#np_msg').textContent='⚠ '+e; }
+  $('#np_go').disabled=false;
 };
 
 // ---------- pipeline ----------
@@ -2075,6 +2333,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(project_summary(n) or {}))
         if u.path == "/library":
             return self._send(200, json.dumps(library()))
+        if u.path == "/products":
+            rows = []
+            for p in projects():
+                try:
+                    rows.append(products.summary(p))
+                except products.ProductError:
+                    continue
+            return self._send(200, json.dumps({"products": rows}))
+        if u.path == "/product":
+            n = urllib.parse.parse_qs(u.query).get("project", [""])[0]
+            try:
+                doc = products.load(n)
+            except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            a, t = products.completeness(doc)
+            return self._send(200, json.dumps(
+                {"project": n, "doc": doc, "answered": a, "total": t,
+                 "missing_required": products.missing_required(doc)}))
+        if u.path == "/product/schema":
+            return self._send(200, json.dumps({"sections": products.schema()}))
         if u.path == "/piccs":
             pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             return self._send(200, json.dumps(
@@ -2268,6 +2546,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(picked))
             except presets.PresetError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
+        if path == "/product/save":
+            req = self._json()
+            try:
+                doc = products.save(req.get("project", ""), req.get("doc") or {})
+            except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            a, t = products.completeness(doc)
+            return self._send(200, json.dumps(
+                {"ok": True, "answered": a, "total": t,
+                 "missing_required": products.missing_required(doc),
+                 "sheet": os.path.relpath(products.sheet_path(req["project"]), ROOT)}))
         if path == "/prompt":
             return self._prompt(self._json())
         if path == "/briefs":

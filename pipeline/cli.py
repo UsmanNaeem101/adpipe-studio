@@ -1168,6 +1168,25 @@ CONCEPT_SCHEMA = {
 }
 
 
+def facts_path(cfg):
+    """Approved facts for this project.
+
+    Per-project by default. These used to live at pipeline/facts.json, shared by
+    every project — which meant a second product silently inherited the first
+    one's approved numbers and claim language. An explicit "facts" key still
+    wins, for a project that deliberately points elsewhere.
+    """
+    p = cfg.get("facts")
+    return os.path.join(ROOT, p) if p else os.path.join(cfg["_dir"], "facts.json")
+
+
+def sheet_path(cfg):
+    """This project's product sheet, rendered from its product.json by the
+    Product tab. Same reasoning as facts: it belongs to one product."""
+    p = cfg.get("product_sheet")
+    return os.path.join(ROOT, p) if p else os.path.join(cfg["_dir"], "product_sheet.md")
+
+
 def product_context(cfg, sheet=True):
     """What is being sold, for the stages that decide strategy and write copy.
 
@@ -1185,17 +1204,16 @@ def product_context(cfg, sheet=True):
     parts = [f"PRODUCT\n{cfg.get('product') or '(unspecified)'}",
              f"MARKET\n{cfg.get('market') or '(unspecified)'}"]
 
-    if cfg.get("facts"):
-        p = os.path.join(ROOT, cfg["facts"])
-        if os.path.exists(p):
-            parts.append(
-                "APPROVED PRODUCT FACTS — the ONLY numbers and product claims that "
-                "may appear in an ad. Anything marked NEEDS INPUT is unconfirmed: "
-                "do not use it, and do not invent a value for it.\n\n"
-                + open(p, encoding="utf-8").read())
+    p = facts_path(cfg)
+    if os.path.exists(p):
+        parts.append(
+            "APPROVED PRODUCT FACTS — the ONLY numbers and product claims that "
+            "may appear in an ad. Anything marked NEEDS INPUT is unconfirmed: "
+            "do not use it, and do not invent a value for it.\n\n"
+            + open(p, encoding="utf-8").read())
 
-    if sheet and cfg.get("product_sheet"):
-        p = os.path.join(ROOT, cfg["product_sheet"])
+    if sheet:
+        p = sheet_path(cfg)
         if os.path.exists(p):
             parts.append(
                 "PRODUCT SHEET — background for strategy: what the product is, how "
