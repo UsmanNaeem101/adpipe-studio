@@ -97,7 +97,8 @@ def _provider(keys):
 
 def read_extractions(project, slug, skills=None):
     """The segment's extraction outputs, optionally only the ones asked for."""
-    d = os.path.join(ROOT, "projects", project, "extractions", slug)
+    import paths
+    d = paths.extractions(project, slug)
     if not os.path.isdir(d):
         raise EnrichError(
             f"No extractions for segment {slug!r}. Run the extract stage first.")
