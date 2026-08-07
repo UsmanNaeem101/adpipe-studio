@@ -41,6 +41,7 @@ import levers  # noqa: E402
 import briefs  # noqa: E402
 import products  # noqa: E402
 import enrich  # noqa: E402
+import synth  # noqa: E402
 import auditlog  # noqa: E402
 
 REFS = os.path.join(ROOT, "references")
@@ -1033,6 +1034,30 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
         <div id=en_review style="margin-top:12px"></div>
       </div>
 
+      <div style="border:1.5px solid var(--line);border-radius:11px;padding:13px 15px;
+        margin-bottom:14px">
+        <b style=font-size:13.5px>Product × segment strategy</b>
+        <p class=hint style="margin:5px 0 10px">Turns product truth and this
+          segment's <b>approved</b> research into positioning, primary benefit,
+          reason to buy, reason to believe, differentiation, creative territories
+          and landing page strategy. Fields still sitting as unreviewed suggestions
+          are excluded and listed — strategy built on unreviewed evidence is what
+          running §6 first exists to prevent.</p>
+        <div class=row style="margin-bottom:9px">
+          <div><label>Segment</label><select id=sy_seg></select></div>
+          <div><label>&nbsp;</label>
+            <div style="display:flex;gap:8px">
+              <button class="btn ghost" id=sy_preview style="flex:1;white-space:nowrap">Preview prompt</button>
+              <button class=btn id=sy_go style="flex:1;white-space:nowrap">Synthesise</button>
+            </div></div>
+        </div>
+        <label>Sections to produce</label>
+        <div id=sy_sections style="display:flex;flex-wrap:wrap;gap:12px;margin:6px 0 8px"></div>
+        <a href=# id=sy_all style="font-size:13px;color:var(--accent)">select all</a>
+        <p class=hint id=sy_msg style="margin:9px 0 0"></p>
+        <div id=sy_review style="margin-top:12px"></div>
+      </div>
+
       <div id=seglist></div>
     </div>
 
@@ -1854,7 +1879,7 @@ function blankSegDoc(){
   return d;
 }
 function renderSegments(){
-  renderEnrichPanel();
+  renderEnrichPanel(); renderSynthPanel();
   const box=$('#seglist'); box.innerHTML='';
   if(!PSEGS.length){ box.innerHTML='<p class=hint>No segments yet. Research discovers '+
     'these — add one, or import a validated segment from the pipeline.</p>'; return; }
@@ -1979,10 +2004,12 @@ function fieldMeta(seckey,fkey){
   return [sec, sec&&sec.fields.find(f=>f.key===fkey)];
 }
 
-function renderSuggestions(){
-  const box=$('#en_review'); box.innerHTML='';
-  if(!ENSUG) return;
-  const {slug,data}=ENSUG, seg=segBySlug(slug);
+/* Shared by §6 and §7 — the review contract is identical: proposals arrive as
+   ai_suggested, and Accept / Edit / Reject is the only way they become truth. */
+function renderReview(store, boxId){
+  const box=$(boxId); box.innerHTML='';
+  if(!store) return;
+  const {slug,data}=store, seg=segBySlug(slug);
   if(!seg){ box.innerHTML='<p class=hint>segment no longer loaded</p>'; return; }
   const wrap=document.createElement('div');
   wrap.style.cssText='border:1.5px solid var(--accent);border-radius:11px;padding:13px 15px';
@@ -1992,6 +2019,7 @@ function renderSuggestions(){
       Nothing is written until you save.</p>`;
   let n=0;
   Object.entries(data.suggestions).forEach(([sk,fields])=>{
+    if(sk==='_notes') return;
     Object.entries(fields).forEach(([fk,cell])=>{
       const [sec,f]=fieldMeta(sk,fk); if(!f) return;
       n++;
@@ -2036,15 +2064,85 @@ function renderSuggestions(){
   all.style.cssText='margin-top:6px'; all.textContent='Accept all';
   all.onclick=()=>{ wrap.querySelectorAll('[data-act=accept]').forEach(b=>b.click()); };
   wrap.appendChild(all);
-  if(data.skipped&&data.skipped.length){
+  const held=data.skipped||data.unreviewed;
+  if(held&&held.length){
     const sk=document.createElement('p'); sk.className='hint';
     sk.style.marginTop='10px';
-    sk.innerHTML='<b>Left alone (already approved):</b> '+
-      data.skipped.map(x=>esc(x.label)).join(' · ');
+    sk.innerHTML=(data.skipped?'<b>Left alone (already approved):</b> '
+                              :'<b>Excluded (still unreviewed):</b> ')+
+      held.map(x=>esc(x.label||x)).join(' · ');
     wrap.appendChild(sk);
   }
   box.appendChild(wrap);
 }
+function renderSuggestions(){ renderReview(ENSUG,'#en_review'); }
+
+/* ---- §7 product x segment strategy ---- */
+let SYSUG=null;
+
+function renderSynthPanel(){
+  const sel=$('#sy_seg'); if(!sel) return;
+  const was=sel.value;
+  sel.innerHTML=PSEGS.map((s,i)=>{
+    const n=cv(s.doc.identity.name)||s.slug;
+    return `<option value="${esc(s.slug||('#'+i))}">${esc(n)}${s.slug?'':' (unsaved)'}</option>`;
+  }).join('')||'<option value="">— no segments —</option>';
+  if(was) sel.value=was;
+  const box=$('#sy_sections');
+  if(!box.children.length&&PSCHEMA&&PSCHEMA.synth_sections){
+    box.innerHTML=PSCHEMA.synth_sections.map(s=>
+      `<label style="font-weight:500;font-size:13px;display:flex;gap:6px;align-items:center;margin:0">
+        <input type=checkbox checked data-sy="${esc(s.key)}" style="width:auto">
+        ${esc(s.title)} <span style=color:var(--soft)>(${s.fields})</span></label>`).join('');
+  }
+}
+$('#sy_all').onclick=e=>{e.preventDefault();
+  $$('#sy_sections [data-sy]').forEach(c=>c.checked=true);};
+
+async function runSynth(dry){
+  const slug=$('#sy_seg').value;
+  if(!slug||slug.startsWith('#')){ $('#sy_msg').textContent=
+    'Save the segment first.'; return; }
+  const secs=$$('#sy_sections [data-sy]:checked').map(c=>c.dataset.sy);
+  if(!secs.length){ $('#sy_msg').textContent='Pick at least one section.'; return; }
+  const btn=dry?$('#sy_preview'):$('#sy_go'); btn.disabled=true;
+  $('#sy_msg').textContent=dry?'building prompt…':'synthesising…';
+  try{
+    const j=await (await fetch('/product/synth',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project:PPROJ,product:PPRODUCT,segment:slug,
+                           sections:secs,dry_run:!!dry})})).json();
+    if(j.error){ $('#sy_msg').textContent='⚠ '+j.error; btn.disabled=false; return; }
+    if(dry){
+      $('#pmtext').value=j.prompt;
+      $('#pmsub').textContent=`${j.asked} strategy field(s) would be produced`+
+        (j.unreviewed.length?`; ${j.unreviewed.length} unreviewed research field(s) excluded.`:'.');
+      $('#pmcost').textContent='Preview only — nothing sent.';
+      pending=null; $('#pmgo').disabled=true; $('#pmwrap').classList.remove('hide');
+      $('#sy_msg').textContent='';
+    }else{
+      SYSUG={slug,data:j};
+      const seg0=segBySlug(slug);
+      if(seg0) Object.entries(j.suggestions||{}).forEach(([sk,fs])=>{
+        if(sk==='_notes') return;
+        Object.entries(fs).forEach(([fk,cell])=>{ if(seg0.doc[sk]) seg0.doc[sk][fk]={...cell}; });
+      });
+      renderSegments();
+      const n=Object.entries(j.suggestions||{}).filter(([k])=>k!=='_notes')
+        .reduce((a,[,o])=>a+Object.keys(o).length,0);
+      const drop=(j.suggestions._notes||{}).dropped_unlicensed;
+      $('#sy_msg').innerHTML=`${esc(j.model)} produced ${n} strategy field(s)`+
+        (j.unreviewed.length?`; ${j.unreviewed.length} unreviewed research field(s) excluded.`:'.')+
+        (drop&&drop.value&&drop.value.length
+          ? `<br><b style=color:var(--signal)>Dropped ${drop.value.length} claim(s) with no licensing product fact:</b> ${
+              drop.value.map(esc).join(' · ')}`:'');
+      renderReview(SYSUG,'#sy_review');
+    }
+  }catch(e){ $('#sy_msg').textContent='⚠ '+e; }
+  btn.disabled=false;
+}
+$('#sy_preview').onclick=()=>runSynth(true);
+$('#sy_go').onclick=()=>runSynth(false);
 
 function renderReady(r){
   const box=$('#readybox');
@@ -2673,6 +2771,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sch["enrich_sections"] = [
                 {"key": s["key"], "title": s["title"], "fields": len(fs)}
                 for s, fs in enrich.enrichable()]
+            sch["synth_sections"] = synth.sections()
             return self._send(200, json.dumps(sch))
         if u.path == "/piccs":
             pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
@@ -2893,6 +2992,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except enrich.EnrichError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
             except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            return self._send(200, json.dumps(out))
+        if path == "/product/synth":
+            req = self._json()
+            with _lock:
+                keys = dict(KEYS)
+            proj = req.get("project", "")
+            try:
+                prod = products.resolve_product(proj, req.get("product", ""))
+                segs = products.load_segments(proj, prod)
+            except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            slug = req.get("segment", "")
+            seg = next((x for x in segs if x["slug"] == slug), None)
+            if not seg:
+                return self._send(200, json.dumps(
+                    {"error": f"no saved segment {slug!r} — save the segment first"}))
+            try:
+                out = synth.synthesise(
+                    proj, prod, slug, seg["doc"],
+                    sections_wanted=req.get("sections") or None, keys=keys,
+                    dry_run=bool(req.get("dry_run")))
+            except (synth.SynthError, products.ProductError) as e:
                 return self._send(200, json.dumps({"error": str(e)}))
             return self._send(200, json.dumps(out))
         if path == "/product/save":
