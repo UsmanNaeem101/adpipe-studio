@@ -490,14 +490,167 @@ def _post_json(url, headers, body, timeout=60, label="auto-pick"):
         raise
 
 
+def _json_end(raw, start):
+    """Index just past the closing brace of the object opening at `start`.
+
+    Walks the text tracking strings and escapes so a '}' inside a quoted value
+    cannot terminate the scan early — the failure mode of a plain {.*} regex
+    (the parser used to grab up to the first stray '}' and blame the model for
+    JSON that was actually fine up to that point). Returns -1 if the object is
+    never closed.
+    """
+    depth = 0
+    i = start
+    n = len(raw)
+    in_str = False
+    esc = False
+    while i < n:
+        ch = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+        i += 1
+    return -1
+
+
 def _extract_json(text):
-    m = re.search(r"\{.*\}", text or "", re.S)
-    if not m:
+    """Parse a JSON object from a model reply, tolerating wrapping and drift.
+
+    Three problems are handled here that a plain `json.loads` cannot:
+
+      - The reply may be wrapped in a markdown code fence (```json ... ```).
+      - There may be prose before or after the actual object.
+      - The reply may be truncated mid-structure. That is a real failure, and
+        the error message should say so — "the model output ends mid-string"
+        — rather than blaming a comma at a character that is actually the end
+        of the truncated text.
+    """
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, count=1, flags=re.I)
+        raw = re.sub(r"\s*```$", "", raw, count=1)
+
+    start = raw.find("{")
+    if start < 0:
         raise PresetError(f"the model didn't return JSON: {(text or '')[:160]}")
+    end = _json_end(raw, start)
+    if end < 0:
+        tail = raw[-80:]
+        raise PresetError(
+            f"the model response is truncated — a JSON string or object is left "
+            f"unclosed near: …{tail[:-20]}")
+
+    block = raw[start:end]
+
+    def attempt(s):
+        try:
+            return json.loads(s)
+        except ValueError:
+            return None
+
+    # A greedy '{.*}' used to grab up to the first stray '}'. We now cut exactly
+    # at the object's real end, so the only remaining JSON errors are real ones.
+    obj = attempt(block)
+    if obj is not None:
+        return obj
+
+    # Trailing commas are the most common real violation a cheap model emits:
+    #   {"a": 1, "b": [1, 2,]}   ->   the last element is followed by a comma.
+    fixed = re.sub(r",(\s*[}\]])", r"\1", block)
+    obj = attempt(fixed)
+    if obj is not None:
+        return obj
+
     try:
-        return json.loads(m.group(0))
+        json.loads(block)
     except ValueError as e:
         raise PresetError(f"the model returned unreadable JSON: {e}")
+
+
+def _post_text(provider, keys, model, system, prompt, max_tokens, timeout, label):
+    """One provider round-trip returning the raw model text.
+
+    Parsing happens in the caller so a malformed reply never loses the raw
+    text: the repair pass needs the original bytes to show the model.
+    """
+    if provider == "anthropic":
+        payload = _post_json(
+            ANTHROPIC_URL,
+            {"x-api-key": keys["anthropic"], "anthropic-version": "2023-06-01",
+             "Content-Type": "application/json"},
+            {"model": model, "max_tokens": max_tokens, "system": system,
+             "messages": [{"role": "user", "content": prompt}]},
+            timeout=timeout, label=label)
+        return "".join(b.get("text", "") for b in payload.get("content", [])) or ""
+    payload = _post_json(
+        OPENROUTER_URL,
+        {"Authorization": f"Bearer {keys['openrouter']}",
+         "Content-Type": "application/json",
+         "HTTP-Referer": "https://localhost/adpipe", "X-Title": "adpipe"},
+        {"model": model, "max_tokens": max_tokens,
+         "messages": [{"role": "system", "content": system},
+                      {"role": "user", "content": prompt}]},
+        timeout=timeout, label=label)
+    return ((payload.get("choices") or [{}])[0].get("message") or {}).get(
+        "content", "") or ""
+
+
+def model_json(provider, keys, model, system, prompt, max_tokens=10000,
+               timeout=300, label="model"):
+    """A single JSON-forcing model call with one automatic shape-repair retry.
+
+    Cheap models occasionally return truncated or slightly malformed JSON
+    (a string left unclosed at the end of the response, a trailing comma).
+    Instead of failing the stage, send the model its own broken output and ask
+    it to return the JSON again, complete and valid — repair is cheap because it
+    preserves the content already produced. This mirrors the batch recovery pass
+    in cli.py for the single-call siblings.
+
+    Raises PresetError if the first reply cannot be repaired.
+    """
+    raw = _post_text(provider, keys, model, system, prompt,
+                     max_tokens, timeout, label)
+    try:
+        return _extract_json(raw)
+    except PresetError as parse_err:
+        reason = str(parse_err)  # capture before the except block clears it
+
+    # One repair attempt: hand the model its own output and ask it to fix the
+    # shape, not reconsider the content.
+    prior = raw if raw.strip() else "[No response was returned. Re-run the request.]"
+    repair_prompt = (
+        "RECOVERY TASK: The previous model response could not be consumed by the "
+        f"pipeline because: {reason}.\n\n"
+        "Return JSON only and obey the shape the original request asked for. "
+        "Preserve every field, list item, decision, reason and value that is "
+        "already present in the previous response — this is data-shape repair, "
+        "not a chance to reconsider the content. Most importantly: close every "
+        "quoted string, close every array and object, and remove any trailing "
+        "commas. Do not add commentary or Markdown.\n\n"
+        "ORIGINAL REQUEST:\n\n" + prompt +
+        "\n\nPREVIOUS RESPONSE:\n\n" + prior)
+    try:
+        repaired = _post_text(provider, keys, model, system,
+                              repair_prompt, max_tokens, timeout,
+                              f"{label} repair")
+        return _extract_json(repaired)
+    except PresetError as repair_err:
+        raise PresetError(
+            f"{label}: the model returned unreadable JSON ({reason}); a repair pass "
+            f"also failed ({repair_err}). Response saved to the model audit log.") from repair_err
 
 
 def pick(brief, reference_rel="", keys=None, model=None):
