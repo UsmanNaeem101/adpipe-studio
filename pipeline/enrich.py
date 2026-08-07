@@ -177,8 +177,14 @@ def build_prompt(product_doc, segment_doc, corpus, groups, protected):
 
 
 def suggest(project, product, slug, segment_doc, sections=None, keys=None,
-            model=None, dry_run=False):
-    """Propose values for one segment. Returns suggestions; writes nothing."""
+            model=None, dry_run=False, evidence_project=None):
+    """Propose values for one segment. Returns suggestions; writes nothing.
+
+    `evidence_project` is where the research lives, which is not always where the
+    product lives: a product created in a new project can legitimately be sold to
+    a segment researched under an older one, and forcing the two to coincide
+    would mean re-running the pipeline to reach research that already exists.
+    """
     keys = keys or {}
     groups = enrichable(sections)
     if not groups:
@@ -186,7 +192,8 @@ def suggest(project, product, slug, segment_doc, sections=None, keys=None,
 
     product_doc = products.load(project, product)
     skills = ",".join(f.get("skills", "") for _, fs in groups for f in fs)
-    corpus = read_extractions(project, slug, skills if skills.strip(",") else None)
+    corpus = read_extractions(evidence_project or project, slug,
+                              skills if skills.strip(",") else None)
     protected = _skipped(segment_doc, groups)
     prompt, asked = build_prompt(product_doc, segment_doc, corpus, groups, protected)
 

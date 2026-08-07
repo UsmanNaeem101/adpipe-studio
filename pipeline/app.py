@@ -1011,6 +1011,8 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
         <button class="btn ghost" id=segimport style=white-space:nowrap>Import from pipeline</button>
       </div>
       <p class=hint id=segmsg style="margin:0 0 10px"></p>
+      <div id=segpick hidden style="border:1.5px solid var(--accent);border-radius:11px;
+        padding:13px 15px;margin-bottom:12px"></div>
 
       <div style="border:1.5px solid var(--line);border-radius:11px;padding:13px 15px;
         margin-bottom:14px">
@@ -1918,22 +1920,53 @@ $('#segadd').onclick=()=>{
   $('#segmsg').textContent=`added "${n}" — save to persist`; renderSegments();
 };
 /* The pipeline already discovers segments; importing one links the Product
-   segment to the evidence and extractions that already exist for it. */
+   segment to the evidence and extractions that already exist for it — including
+   research done under a different project, which is normal when a product is
+   created after the research rather than before it. */
 $('#segimport').onclick=()=>{
-  const have=new Set(PSEGS.map(s=>cv(s.doc.identity.evidence_slug)).filter(Boolean));
-  const avail=PPIPESEGS.filter(s=>!have.has(s));
+  const have=new Set(PSEGS.map(s=>
+    (cv(s.doc.identity.evidence_project)||PPROJ)+'/'+cv(s.doc.identity.evidence_slug))
+    .filter(x=>!x.endsWith('/')));
+  const avail=(PPIPESEGS||[]).filter(s=>!have.has(s.project+'/'+s.slug));
   if(!avail.length){ $('#segmsg').textContent=
-    PPIPESEGS.length?'Every pipeline segment is already linked.'
-                    :'No pipeline segments yet — run the segment stage first.'; return; }
-  avail.forEach(slug=>{
-    const doc=blankSegDoc();
-    doc.identity.name={value:slug.replace(/_/g,' '),state:'research_derived',source:'research',ref:'',confidence:''};
-    doc.identity.evidence_slug={value:slug,state:'research_derived',source:'research',ref:'',confidence:''};
-    doc.identity.status={value:'Discovered',state:'research_derived',source:'research',ref:'',confidence:''};
-    PSEGS.push({slug:'',doc});
-  });
-  $('#segmsg').textContent=`imported ${avail.length} pipeline segment(s) — review and save`;
-  renderSegments();
+    (PPIPESEGS||[]).length?'Every pipeline segment is already linked.'
+      :'No pipeline segments found in any project — run ingest and the segment '+
+       'stage first.'; return; }
+  const box=$('#segpick');
+  box.hidden=false;
+  const byProj={};
+  avail.forEach(s=>(byProj[s.project]=byProj[s.project]||[]).push(s.slug));
+  box.innerHTML='<b style=font-size:13.5px>Import a researched segment</b>'+
+    '<p class=hint style="margin:4px 0 9px">Segments found across every project. '+
+    'Importing keeps the research where it is and points this product at it.</p>'+
+    Object.entries(byProj).map(([pr,slugs])=>
+      `<div style="margin-bottom:8px"><div style="font-size:12.5px;color:var(--soft);
+        font-weight:600">${esc(pr)}${pr===PPROJ?' (this product\'s project)':''}</div>`+
+      slugs.map(sl=>`<label style="font-weight:500;font-size:13px;display:flex;gap:7px;
+        align-items:center;margin:3px 0 0">
+        <input type=checkbox data-imp="${esc(pr)}|${esc(sl)}" style="width:auto">
+        ${esc(sl)}</label>`).join('')+'</div>').join('')+
+    '<div style="display:flex;gap:9px;margin-top:10px">'+
+    '<button class=btn id=impgo style="padding:7px 15px;font-size:13px">Import selected</button>'+
+    '<button class="btn ghost" id=impcancel style="padding:7px 15px;font-size:13px">Cancel</button></div>';
+  $('#impcancel').onclick=()=>{ box.hidden=true; };
+  $('#impgo').onclick=()=>{
+    const picked=$$('#segpick [data-imp]:checked').map(c=>c.dataset.imp);
+    if(!picked.length){ $('#segmsg').textContent='Tick at least one.'; return; }
+    picked.forEach(k=>{
+      const [pr,sl]=k.split('|');
+      const doc=blankSegDoc();
+      const rd=v=>({value:v,state:'research_derived',source:'research',ref:'',confidence:''});
+      doc.identity.name=rd(sl.replace(/[-_]/g,' '));
+      doc.identity.evidence_slug=rd(sl);
+      doc.identity.evidence_project=rd(pr);
+      doc.identity.status=rd('Discovered');
+      PSEGS.push({slug:'',doc});
+    });
+    box.hidden=true;
+    $('#segmsg').textContent=`imported ${picked.length} segment(s) — review and save`;
+    renderSegments();
+  };
 };
 
 /* ---- §6 enrich from research ---- */
@@ -2801,7 +2834,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(
                 {"project": n, "product": prod, "doc": doc, "segments": segs,
                  "readiness": ready, "answered": a, "total": t,
-                 "pipeline_segments": segments(n),
+                 "pipeline_segments": [
+                     {"project": pr, "slug": sl}
+                     for pr in ([n] + [x for x in projects() if x != n])
+                     for sl in segments(pr)],
                  "missing_required": products.missing_required(
                      doc, products.PRODUCT_SECTIONS)}))
         if u.path == "/product/schema":
@@ -3022,11 +3058,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # The segment's research lives under its pipeline slug; without one
             # there are no extractions to read and nothing to propose from.
             ev = products.value_of(seg["doc"]["identity"].get("evidence_slug")) or slug
+            ev_proj = products.value_of(
+                seg["doc"]["identity"].get("evidence_project")) or proj
             try:
                 out = enrich.suggest(
                     proj, prod, ev, seg["doc"],
                     sections=req.get("sections") or None, keys=keys,
-                    dry_run=bool(req.get("dry_run")))
+                    dry_run=bool(req.get("dry_run")), evidence_project=ev_proj)
             except enrich.EnrichError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
             except products.ProductError as e:
