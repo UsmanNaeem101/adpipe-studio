@@ -230,7 +230,7 @@ class StructuredBatchTests(unittest.TestCase):
             with mock.patch.object(cli, "client", return_value=FakeClient()), \
                     mock.patch.object(llm, "confirm", return_value=True):
                 cli.cmd_ingest(cfg, args)
-            with open(os.path.join(tmp, "voc", "filtered_voc.jsonl"),
+            with open(os.path.join(tmp, "research", "voc", "filtered_voc.jsonl"),
                       encoding="utf-8") as fh:
                 rows = [json.loads(line) for line in fh]
         self.assertEqual(len(rows), 2)
@@ -283,12 +283,12 @@ class StructuredBatchTests(unittest.TestCase):
             with mock.patch.object(cli, "client", return_value=fake_client), \
                     mock.patch.object(llm, "confirm", return_value=True):
                 cli.cmd_ingest(cfg, args)
-            audit_dir = os.path.join(tmp, "voc", "_model_failures", "01_filter")
+            audit_dir = os.path.join(tmp, "research", "voc", "_model_failures", "01_filter")
             self.assertTrue(os.path.exists(os.path.join(
                 audit_dir, "f0000.original.txt")))
             self.assertTrue(os.path.exists(os.path.join(
                 audit_dir, "f0000.repaired.txt")))
-            with open(os.path.join(tmp, "voc", "filtered_voc.jsonl"),
+            with open(os.path.join(tmp, "research", "voc", "filtered_voc.jsonl"),
                       encoding="utf-8") as fh:
                 rows = [json.loads(line) for line in fh]
 

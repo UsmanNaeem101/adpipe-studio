@@ -40,6 +40,7 @@ import presets  # noqa: E402
 import levers  # noqa: E402
 import briefs  # noqa: E402
 import products  # noqa: E402
+import paths  # noqa: E402
 import enrich  # noqa: E402
 import synth  # noqa: E402
 import auditlog  # noqa: E402
@@ -80,7 +81,15 @@ STAGES = [
 ]
 
 
+_migrated = False
+
+
 def projects():
+    global _migrated
+    if not _migrated:
+        _migrated = True
+        for p, moves in paths.migrate_all().items():
+            print(f"  [{p}] layout updated: " + ", ".join(moves))
     d = os.path.join(ROOT, "projects")
     if not os.path.isdir(d):
         return []
@@ -98,10 +107,10 @@ def segments(project):
     """
     base = os.path.join(ROOT, "projects", project)
     out = set()
-    ev = os.path.join(base, "evidence")
+    ev = paths.evidence(base)
     if os.path.isdir(ev):
         out |= {f[:-4] for f in os.listdir(ev) if f.endswith(".txt")}
-    ex = os.path.join(base, "extractions")
+    ex = paths.extractions(base)
     if os.path.isdir(ex):
         out |= {d for d in os.listdir(ex) if os.path.isdir(os.path.join(ex, d))}
     return sorted(out)
@@ -167,8 +176,7 @@ def ensure_project(name, product="", market=""):
     cfg = json.loads(json.dumps(TEMPLATE_PROJECT))
     cfg = {"_comment": cfg.pop("_comment"), "name": name,
            "product": product or name, "market": market or "", **cfg}
-    for sub in ("voc", "evidence", "extractions", "output"):
-        os.makedirs(os.path.join(dest, sub), exist_ok=True)
+    paths.scaffold(name)
     json.dump(cfg, open(existing, "w", encoding="utf-8"), indent=2)
 
     facts = json.loads(json.dumps(BLANK_FACTS))
@@ -211,8 +219,7 @@ def create_project(name, product, market):
     cfg = json.loads(json.dumps(TEMPLATE_PROJECT))   # deep copy
     cfg = {"_comment": cfg.pop("_comment"), "name": name,
            "product": product or name, "market": market or "", **cfg}
-    for sub in ("voc", "evidence", "extractions", "output"):
-        os.makedirs(os.path.join(dest, sub), exist_ok=True)
+    paths.scaffold(name)
     json.dump(cfg, open(os.path.join(dest, "project.json"), "w", encoding="utf-8"),
               indent=2)
 
@@ -284,7 +291,7 @@ def project_outputs(project):
     if not os.path.isdir(root):
         return {}
     prov = {}
-    pp = os.path.join(root, "evidence", "_provenance.json")
+    pp = paths.evidence(root, "_provenance.json")
     if os.path.exists(pp):
         try:
             prov = json.load(open(pp, encoding="utf-8"))
@@ -305,7 +312,7 @@ def project_outputs(project):
                                       stat.st_mtime).astimezone().isoformat(
                                           timespec="seconds")})
 
-    voc = os.path.join(root, "voc")
+    voc = paths.voc(root)
     entry("ingest", "filtered_voc.jsonl · segment-ready corpus",
           os.path.join(voc, "filtered_voc.jsonl"), role="final")
     for f, lbl in INGEST_ADDITIONAL_FILES:
@@ -320,13 +327,13 @@ def project_outputs(project):
                    ("missing_evidence.jsonl", "06 missing")):
         entry("segment", lbl, os.path.join(voc, f))
 
-    ed = os.path.join(root, "evidence")
+    ed = paths.evidence(root)
     if os.path.isdir(ed):
         for f in sorted(os.listdir(ed)):
             if f.endswith(".txt"):
                 entry("segment", f"06 evidence · {f[:-4]}", os.path.join(ed, f))
 
-    xd = os.path.join(root, "extractions")
+    xd = paths.extractions(root)
     if os.path.isdir(xd):
         for seg in sorted(os.listdir(xd)):
             d = os.path.join(xd, seg)
@@ -334,7 +341,7 @@ def project_outputs(project):
                 for f in sorted(os.listdir(d)):
                     entry("extract", f"{seg} · {f[:-3]}", os.path.join(d, f))
 
-    od = os.path.join(root, "output")
+    od = paths.assets(root)
     if os.path.isdir(od):
         for seg in sorted(os.listdir(od)):
             d = os.path.join(od, seg)
@@ -367,7 +374,7 @@ def segment_voc_files(project):
     """Only completed ingest contracts that skills 03-06 may consume."""
     if project not in projects():
         return []
-    voc_dir = os.path.join(ROOT, "projects", project, "voc")
+    voc_dir = paths.voc(os.path.join(ROOT, "projects", project))
     files = []
     for name in SEGMENT_VOC_FILES:
         path = os.path.join(voc_dir, name)
@@ -624,7 +631,7 @@ def picc_cards(project):
     output/ whose name mentions "picc" counts, which means a card you saved
     aside as a variant shows up next to the generated ones.
     """
-    base = os.path.join(ROOT, "projects", project, "output")
+    base = paths.assets(os.path.join(ROOT, "projects", project))
     if not os.path.isdir(base):
         return []
     out = []
@@ -3231,7 +3238,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"error": "could not decode upload"}))
         if not raw:
             return self._send(200, json.dumps({"error": "empty file"}))
-        dest_dir = os.path.join(ROOT, "projects", proj, "voc", "raw")
+        dest_dir = paths.voc(os.path.join(ROOT, "projects", proj), "raw")
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, name)
         open(dest, "wb").write(raw)

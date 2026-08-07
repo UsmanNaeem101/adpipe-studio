@@ -31,6 +31,8 @@ from collections import Counter, defaultdict
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 
+import paths  # noqa: E402
+
 SKILLS = os.path.join(ROOT, "skills")
 
 # Skills 07-26 all read the evidence file and write one dimension each.
@@ -80,6 +82,11 @@ def load_project(name):
         sys.exit(f"No project {name!r}. Available: {', '.join(sorted(avail))}")
     cfg = json.load(open(p, encoding="utf-8"))
     cfg["_dir"] = os.path.dirname(p)
+    # Fold a flat project into research/products/assets the first time it is
+    # touched, so an old checkout keeps working without a manual step.
+    moved = paths.migrate(name)
+    if moved:
+        print(f"  [{name}] layout updated: " + ", ".join(moved))
     return cfg
 
 
@@ -90,7 +97,7 @@ def pdir(cfg, *parts):
 
 
 def provenance_path(cfg):
-    return os.path.join(cfg["_dir"], "evidence", "_provenance.json")
+    return paths.evidence(cfg["_dir"], "_provenance.json")
 
 
 def read_provenance(cfg):
@@ -471,7 +478,7 @@ def cmd_ingest(cfg, args):
     with open(args.source, encoding="utf-8", errors="ignore") as fh:
         raw = fh.read()
     blocks = parse_voc(raw)
-    voc = pdir(cfg, "voc")
+    voc = paths.voc(cfg["_dir"]); os.makedirs(voc, exist_ok=True)
 
     # ---- deterministic pre-pass: chrome + byte-identical captures ------------
     pre, seen, dropped = [], {}, Counter()
@@ -692,12 +699,12 @@ def cmd_segment(cfg, args):
     from llm import Job, confirm
 
     src = (getattr(args, "source", None)
-           or os.path.join(cfg["_dir"], "voc", "filtered_voc.jsonl"))
+           or paths.voc(cfg["_dir"], "filtered_voc.jsonl"))
     if not os.path.exists(src):
         sys.exit(f"No VOC source at {src}. Run: adpipe -p {cfg['name']} ingest <raw.txt>")
     items = [json.loads(l) for l in open(src, encoding="utf-8")]
     by_id = {i["id"]: i for i in items}
-    voc = pdir(cfg, "voc")
+    voc = paths.voc(cfg["_dir"]); os.makedirs(voc, exist_ok=True)
     c = client(cfg, args)
     corpus = _corpus_text(items)
     print(f"  {len(items):,} deduplicated evidence items")
@@ -831,7 +838,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
     One evidence item -> exactly one primary segment, or unassigned. Never two
     files. An item carrying more than one active assignment fails the build.
     """
-    ev = pdir(cfg, "evidence")
+    ev = paths.evidence(cfg["_dir"]); os.makedirs(ev, exist_ok=True)
     _, s06 = skill(6)
     open(os.path.join(voc, "06_build_contract.md"), "w", encoding="utf-8").write(s06)
     seen, conflicts, missing = {}, [], []
@@ -932,13 +939,13 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
 # ------------------------------------------------------------------ 07-26
 
 def evidence_path(cfg, segment):
-    p = os.path.join(cfg["_dir"], "evidence", f"{segment}.txt")
+    p = paths.evidence(cfg["_dir"], f"{segment}.txt")
     if not os.path.exists(p):
         p2 = os.path.join(ROOT, "evidence", f"{segment}.txt")
         if os.path.exists(p2):
             return p2
         avail = []
-        for d in (os.path.join(cfg["_dir"], "evidence"), os.path.join(ROOT, "evidence")):
+        for d in (paths.evidence(cfg["_dir"]), os.path.join(ROOT, "evidence")):
             if os.path.isdir(d):
                 avail += [f[:-4] for f in os.listdir(d) if f.endswith(".txt")]
         sys.exit(f"No evidence file for {segment!r}. Available: {', '.join(sorted(set(avail))) or 'none'}")
@@ -954,7 +961,7 @@ def cmd_extract(cfg, args):
     c = client(cfg, args)
     with open(evidence_path(cfg, args.segment), encoding="utf-8") as fh:
         corpus = fh.read()
-    out = pdir(cfg, "extractions", args.segment)
+    out = paths.extractions(cfg["_dir"], args.segment); os.makedirs(out, exist_ok=True)
 
     picked = chosen_extractors(args)
     print(f"  {len(picked)} of {len(EXTRACTORS)} dimensions: "
@@ -1035,7 +1042,7 @@ def cmd_extract(cfg, args):
 
 
 def read_extractions(cfg, segment, *want):
-    d = os.path.join(cfg["_dir"], "extractions", segment)
+    d = paths.extractions(cfg["_dir"], segment)
     if not os.path.isdir(d):
         sys.exit(f"No extractions. Run: adpipe -p {cfg['name']} extract {segment}")
     parts = []
@@ -1140,7 +1147,7 @@ failed-solution, desired-outcome, mechanism, objection-busting.
 Output Markdown: the barrier ranking, then the card as a table, then the angles.
 """
     synth(cfg, args, "picc", prompt,
-          os.path.join(cfg["_dir"], "output", args.segment, "01_picc_card.md"), 16000)
+          paths.assets(cfg["_dir"], args.segment, "01_picc_card.md"), 16000)
 
 
 CONCEPT_SCHEMA = {
@@ -1269,7 +1276,7 @@ def picc_path(cfg, segment, chosen=None):
     rather than inferred, so re-running concepts cannot silently swap strategy
     underneath you.
     """
-    default = os.path.join(cfg["_dir"], "output", segment, "01_picc_card.md")
+    default = paths.assets(cfg["_dir"], segment, "01_picc_card.md")
     if not chosen:
         if not os.path.exists(default):
             sys.exit(f"No PICC card. Run: adpipe -p {cfg['name']} picc {segment}")
@@ -1359,7 +1366,7 @@ Hard constraints on slot copy:
 
 Set "evidence_file" to "{os.path.relpath(evidence_path(cfg, args.segment), ROOT)}".
 """
-    dest = os.path.join(cfg["_dir"], "output", args.segment, "concepts.json")
+    dest = paths.assets(cfg["_dir"], args.segment, "concepts.json")
     text = synth(cfg, args, "concepts", prompt, dest, 32000, CONCEPT_SCHEMA)
     if text:
         doc = json.loads(text)
@@ -1391,7 +1398,7 @@ def _templates():
 def cmd_brief(cfg, args):
     """Production briefs for the strongest concepts — the artefact a designer or
     image model builds from."""
-    cp = os.path.join(cfg["_dir"], "output", args.segment, "concepts.json")
+    cp = paths.assets(cfg["_dir"], args.segment, "concepts.json")
     if not os.path.exists(cp):
         sys.exit(f"No concepts. Run: adpipe -p {cfg['name']} concepts {args.segment}")
     concepts = open(cp, encoding="utf-8").read()
@@ -1432,13 +1439,13 @@ traceable to a real comment or a stated product fact.
 Output Markdown.
 """
     synth(cfg, args, "brief", prompt,
-          os.path.join(cfg["_dir"], "output", args.segment, "03_production_brief.md"), 24000)
+          paths.assets(cfg["_dir"], args.segment, "03_production_brief.md"), 24000)
 
 
 # ------------------------------------------------------------------ code stages
 
 def _script(cfg, args, name, extra=()):
-    cp = os.path.join(cfg["_dir"], "output", args.segment, "concepts.json")
+    cp = paths.assets(cfg["_dir"], args.segment, "concepts.json")
     if not os.path.exists(cp):
         sys.exit(f"No concepts.json for {args.segment}.")
     r = subprocess.run([sys.executable, os.path.join(ROOT, "pipeline", name), cp, *extra])

@@ -261,7 +261,8 @@ def extraction_dir(project: str, segment: str) -> str:
     for part in (project, segment):
         if os.path.sep in part or part in ("..", ".") or part.startswith("."):
             raise LeverError(f"bad path component: {part!r}")
-    return os.path.join(ROOT, "projects", project, "extractions", segment)
+    import paths
+    return paths.extractions(project, segment)
 
 
 def _file_for(directory: str, skill_n: int):

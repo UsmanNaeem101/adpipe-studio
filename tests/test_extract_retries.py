@@ -45,7 +45,7 @@ class ExtractRetryTests(unittest.TestCase):
 
     def project(self, root):
         project = os.path.join(root, "project")
-        evidence = os.path.join(project, "evidence")
+        evidence = os.path.join(project, "research", "evidence")
         os.makedirs(evidence)
         with open(os.path.join(evidence, "shoulder.txt"), "w",
                   encoding="utf-8") as fh:
@@ -65,7 +65,7 @@ class ExtractRetryTests(unittest.TestCase):
             fake = FakeClient(retry_texts=["", "  ", "# Pain points\nRecovered"])
             self.run_extract(cfg, fake)
             dest = os.path.join(
-                cfg["_dir"], "extractions", "shoulder", "07_pain_points.md")
+                cfg["_dir"], "research", "extractions", "shoulder", "07_pain_points.md")
             with open(dest, encoding="utf-8") as fh:
                 written = fh.read()
 
@@ -83,7 +83,7 @@ class ExtractRetryTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "failed after 3 retries"):
                 self.run_extract(cfg, fake)
             dest = os.path.join(
-                cfg["_dir"], "extractions", "shoulder", "07_pain_points.md")
+                cfg["_dir"], "research", "extractions", "shoulder", "07_pain_points.md")
             self.assertFalse(os.path.exists(dest))
         self.assertEqual(len(fake.one_calls), 3)
 
@@ -91,7 +91,7 @@ class ExtractRetryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.project(tmp)
             dest = os.path.join(
-                cfg["_dir"], "extractions", "shoulder", "07_pain_points.md")
+                cfg["_dir"], "research", "extractions", "shoulder", "07_pain_points.md")
             os.makedirs(os.path.dirname(dest))
             open(dest, "w", encoding="utf-8").close()
             fake = FakeClient(batch_text="# Pain points\nRebuilt")

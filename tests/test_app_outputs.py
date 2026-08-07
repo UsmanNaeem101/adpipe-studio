@@ -16,7 +16,7 @@ import cli
 class AppOutputTests(unittest.TestCase):
     def make_project(self, root):
         project = os.path.join(root, "projects", "shoulder")
-        voc = os.path.join(project, "voc")
+        voc = os.path.join(project, "research", "voc")
         os.makedirs(voc)
         for name in (
                 "filtered_voc.jsonl", "deduplicated_voc.jsonl",
