@@ -1102,7 +1102,13 @@ def cmd_picc(cfg, args):
     _, s27 = skill(27)
     prior = read_extractions(cfg, args.segment)
     cr = cfg["creative"]
+    seg_ctx = segment_context(cfg, args.segment, getattr(args, "product", None))
     prompt = f"""{s27}
+
+{product_context(cfg, product=getattr(args, "product", None))}
+
+---
+{(seg_ctx + chr(10) + chr(10) + '---' + chr(10)) if seg_ctx else ''}
 
 Below are this segment's completed extraction outputs (skills 07-26).
 
@@ -1164,25 +1170,156 @@ CONCEPT_SCHEMA = {
 }
 
 
+def facts_path(cfg):
+    """Approved facts for this project.
+
+    Per-project by default. These used to live at pipeline/facts.json, shared by
+    every project — which meant a second product silently inherited the first
+    one's approved numbers and claim language. An explicit "facts" key still
+    wins, for a project that deliberately points elsewhere.
+    """
+    p = cfg.get("facts")
+    return os.path.join(ROOT, p) if p else os.path.join(cfg["_dir"], "facts.json")
+
+
+def sheet_path(cfg, product=None):
+    """The active product's sheet, rendered from its product.json by the Product
+    tab. A project may hold several products, so this resolves which one: an
+    explicit --product wins, a project with exactly one needs no argument."""
+    p = cfg.get("product_sheet")
+    if p:
+        return os.path.join(ROOT, p)
+    import products
+    try:
+        products.migrate_legacy(cfg["name"])
+        prod = products.resolve_product(cfg["name"], product)
+    except products.ProductError:
+        return os.path.join(cfg["_dir"], "product_sheet.md")   # legacy layout
+    return products.sheet_path(cfg["name"], prod)
+
+
+def segment_context(cfg, segment, product=None):
+    """This segment's Customer Truth and strategy, if the Product tab has any.
+
+    Segment-scoped on purpose: one segment's research must not reach another's
+    ads. Returns "" when the segment has no sheet yet, so the pipeline still
+    runs on research alone rather than failing closed on an optional layer.
+    """
+    import products
+    p = os.path.join(cfg["_dir"], "segments", f"{segment}.md")   # legacy layout
+    try:
+        prod = products.resolve_product(cfg["name"], product)
+        cand = products.segment_sheet_path(cfg["name"], prod, segment)
+        if os.path.exists(cand):
+            p = cand
+    except products.ProductError:
+        pass
+    if not os.path.exists(p):
+        return ""
+    return ("SEGMENT STRATEGY — this segment's customer truth and the strategy "
+            "built from it. It applies to THIS segment only; do not carry it to "
+            "another.\n\n" + open(p, encoding="utf-8").read())
+
+
+def product_context(cfg, sheet=True, product=None):
+    """What is being sold, for the stages that decide strategy and write copy.
+
+    Until this existed, only the brief stage knew the product: picc and concepts
+    ranked barriers, chose angles and wrote headlines without ever being told
+    what the ad was for, which is how you get plausible copy for a product that
+    does not exist.
+
+    The two sources are kept apart on purpose. facts.json is the only thing that
+    licenses a number or a product claim — qa.py fails anything else — while the
+    product sheet is background for choosing an angle. Merging them would turn
+    240 lines of unconfirmed research into apparent permission to make claims,
+    so the prompt says which is which.
+    """
+    parts = [f"PRODUCT\n{cfg.get('product') or '(unspecified)'}",
+             f"MARKET\n{cfg.get('market') or '(unspecified)'}"]
+
+    p = facts_path(cfg)
+    if os.path.exists(p):
+        parts.append(
+            "APPROVED PRODUCT FACTS — the ONLY numbers and product claims that "
+            "may appear in an ad. Anything marked NEEDS INPUT is unconfirmed: "
+            "do not use it, and do not invent a value for it.\n\n"
+            + open(p, encoding="utf-8").read())
+
+    if sheet:
+        p = sheet_path(cfg, product)
+        if os.path.exists(p):
+            parts.append(
+                "PRODUCT SHEET — background for strategy: what the product is, how "
+                "it actually works, who it suits, what it competes with, and where "
+                "the objections are. This is NOT a claims source. Any number or "
+                "claim here that is absent from the approved facts above is "
+                "unconfirmed and must not appear in an ad.\n\n"
+                + open(p, encoding="utf-8").read())
+
+    return "\n\n---\n\n".join(parts)
+
+
+def picc_path(cfg, segment, chosen=None):
+    """Which PICC card the concepts stage should build on.
+
+    Defaults to the segment's own card, but `--picc` takes any card in the
+    project — you may have rewritten the card, kept a variant, or want to run
+    this segment's language against a card you prefer. The choice is explicit
+    rather than inferred, so re-running concepts cannot silently swap strategy
+    underneath you.
+    """
+    default = os.path.join(cfg["_dir"], "output", segment, "01_picc_card.md")
+    if not chosen:
+        if not os.path.exists(default):
+            sys.exit(f"No PICC card. Run: adpipe -p {cfg['name']} picc {segment}")
+        return default
+
+    p = chosen if os.path.isabs(chosen) else os.path.join(ROOT, chosen)
+    p = os.path.realpath(p)
+    # Keep it inside the project: the card decides everything downstream, so it
+    # is not a path to accept from anywhere on disk.
+    if os.path.commonpath([p, os.path.realpath(cfg["_dir"])]) != os.path.realpath(cfg["_dir"]):
+        sys.exit(f"--picc must point inside projects/{cfg['name']}/ — got {chosen}")
+    if not os.path.exists(p):
+        sys.exit(f"PICC card not found: {chosen}")
+    return p
+
+
 def cmd_concepts(cfg, args):
     """10 concepts, 2-3 in-image hooks each, each mapped to a real layout."""
-    card_p = os.path.join(cfg["_dir"], "output", args.segment, "01_picc_card.md")
-    if not os.path.exists(card_p):
-        sys.exit(f"No PICC card. Run: adpipe -p {cfg['name']} picc {args.segment}")
+    card_p = picc_path(cfg, args.segment, getattr(args, "picc", None))
     card = open(card_p, encoding="utf-8").read()
+    rel = os.path.relpath(card_p, ROOT)
+    print(f"  PICC card: {rel}")
+    # The card is the strategy, but it is one model's compression of 20
+    # dimensions. Pain, desired outcome, mechanism and desired proof go in raw
+    # alongside it so a lossy card cannot quietly drop what the ad is about;
+    # 24/25/26 supply the segment's own words, 14/18 the contrast and rebuttal.
     lang = read_extractions(cfg, args.segment, "terminology", "slang",
-                            "representative_voc", "failed_solutions", "objections")
+                            "representative_voc", "failed_solutions", "objections",
+                            "pain_points", "desired_outcomes", "mechanisms",
+                            "desired_proof")
     templates = _templates()
     n = getattr(args, "concepts", None) or cfg["creative"]["concepts_per_run"]
     hooks_n = getattr(args, "hooks", None) or 3
 
-    prompt = f"""Here is the completed PICC card and 5 angles for this segment:
+    seg_ctx = segment_context(cfg, args.segment, getattr(args, "product", None))
+    prompt = f"""{product_context(cfg, sheet=False, product=getattr(args, "product", None))}
+
+---
+{(seg_ctx + chr(10) + chr(10) + '---' + chr(10)) if seg_ctx else ''}
+Here is the completed PICC card and 5 angles for this segment:
 
 {card}
 
 ---
 
-And the segment's own language (skills 24/25/26) plus failed solutions and objections:
+And the underlying research the card was built from — pain points (07), desired
+outcomes (09), mechanisms (19) and desired proof (20), the segment's own language
+(24/25/26), plus failed solutions (14) and objections (18). Where the card and
+these disagree, the card decides strategy but these decide the wording, and
+anything the card dropped is still fair game here:
 
 {lang}
 
@@ -1258,17 +1395,15 @@ def cmd_brief(cfg, args):
     if not os.path.exists(cp):
         sys.exit(f"No concepts. Run: adpipe -p {cfg['name']} concepts {args.segment}")
     concepts = open(cp, encoding="utf-8").read()
-    facts = open(os.path.join(ROOT, cfg["facts"]), encoding="utf-8").read()
     n = getattr(args, "briefs", None) or cfg["creative"]["briefs_per_run"]
 
     prompt = f"""These are the approved concepts:
 
 {concepts}
 
-And the approved product facts (anything marked NEEDS INPUT is NOT yet usable in
-an ad — do not invent a value for it):
+---
 
-{facts}
+{product_context(cfg, product=getattr(args, "product", None))}
 
 ---
 
@@ -1385,9 +1520,15 @@ def main():
             s.add_argument("--preset", choices=sorted(PRESETS),
                            help="extraction depth: fast, standard, or deep (default: deep)")
             s.add_argument("--skills", help="explicit list, e.g. 7,8,14,18,24,25")
+        if name in ("picc", "concepts", "brief", "run"):
+            s.add_argument("--product", help="which product in this project to "
+                                             "build on (default: the only one)")
         if name in ("concepts", "run"):
             s.add_argument("--concepts", type=int, help="how many concepts")
             s.add_argument("--hooks", type=int, help="hooks per concept (default 3)")
+            s.add_argument("--picc", help="which PICC card to build on, as a path "
+                                          "inside the project (default: this "
+                                          "segment's output/<segment>/01_picc_card.md)")
         if name in ("brief", "run"):
             s.add_argument("--briefs", type=int, help="how many production briefs")
 

@@ -95,7 +95,8 @@ def main():
     ap = argparse.ArgumentParser(description="QA gate for ad copy.")
     ap.add_argument("concepts")
     ap.add_argument("--evidence", help="segment evidence file (default: from concepts.json)")
-    ap.add_argument("--facts", help="approved product facts json (default: pipeline/facts.json)")
+    ap.add_argument("--facts", help="approved product facts json (default: the "
+                                    "facts.json of the project the concepts live in)")
     ap.add_argument("--strict-numbers", action="store_true",
                     help="fail (not warn) on any number missing from facts/evidence")
     args = ap.parse_args()
@@ -113,10 +114,24 @@ def main():
         else:
             print(f"! evidence file not found: {p} - quote checks DISABLED\n")
 
-    facts_path = args.facts or os.path.join(ROOT, "pipeline", "facts.json")
+    # Facts belong to the product, not the pipeline. concepts.json lives at
+    # projects/<name>/output/<segment>/, so walk up to the project root rather
+    # than falling back to a shared file every product would inherit.
+    facts_path = args.facts
+    if not facts_path:
+        d = base_dir
+        for _ in range(4):
+            cand = os.path.join(d, "facts.json")
+            if os.path.exists(cand):
+                facts_path = cand
+                break
+            d = os.path.dirname(d)
     facts = {}
-    if os.path.exists(facts_path):
+    if facts_path and os.path.exists(facts_path):
         facts = json.load(open(facts_path, encoding="utf-8"))
+    else:
+        print("! no facts.json found for this project - every number will be "
+              "flagged, which is the safe default\n")
     approved_nums = {str(n) for n in facts.get("approved_numbers", [])}
 
     fails, warns = [], []

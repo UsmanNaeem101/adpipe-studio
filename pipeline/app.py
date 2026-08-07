@@ -39,6 +39,9 @@ import exifstrip  # noqa: E402
 import presets  # noqa: E402
 import levers  # noqa: E402
 import briefs  # noqa: E402
+import products  # noqa: E402
+import enrich  # noqa: E402
+import synth  # noqa: E402
 import auditlog  # noqa: E402
 
 REFS = os.path.join(ROOT, "references")
@@ -107,23 +110,79 @@ def segments(project):
 SAFE_NAME = __import__("re").compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
 
 
+TEMPLATE_PROJECT = {
+    "_comment": "Per-project config. Everything product-specific lives in this "
+                "folder: project.json, product.json, product_sheet.md, facts.json.",
+    "brand": "pipeline/brand.json",
+    "filter": {
+        "_comment": "Skill-01 filtering. TOPIC decides whether an item is about this "
+                    "market at all; the rest score relevance. Regexes are "
+                    "case-insensitive. These are EMPTY — write them for this niche "
+                    "before ingesting, or nothing will match.",
+        "topic": "", "pain": "", "first_person": "", "solution": "",
+        "emotion": "", "product": "", "min_words": 12, "min_score": 2,
+    },
+    "compliance": {
+        "_comment": "Which qa.py ruleset applies. Use 'health_adjacent' for anything "
+                    "wellness-adjacent; it is the strict Meta set.",
+        "profile": "health_adjacent", "platform": "meta", "notes": "",
+    },
+    "creative": {"awareness": "problem-aware", "traffic": "cold", "formats": ["4x5"],
+                 "concepts_per_run": 10, "briefs_per_run": 4},
+    "model": {"id": "claude-opus-5", "effort": "high"},
+}
+
+BLANK_FACTS = {
+    "_comment": "The ONLY numbers and product claims allowed to appear in an ad. "
+                "qa.py fails any stat not listed here or found verbatim in the "
+                "segment evidence file. Move a fact out of "
+                "candidate_facts_pending_confirmation and into approved_numbers "
+                "only once it is confirmed with the supplier or store.",
+    "product": "",
+    "approved_numbers": [],
+    "candidate_facts_pending_confirmation": {},
+    "safe_mechanism_language": {"allowed": [], "banned": []},
+    "safe_outcome_language": {"allowed": [], "banned": []},
+}
+
+
 def create_project(name, product, market):
-    """A project is a folder + a project.json. Clone montisella's config so the
-    filter regexes and compliance profile are a starting point, not blank."""
+    """A project is a folder, a project.json, and an empty product sheet.
+
+    Nothing is copied from another project. Cloning montisella used to carry its
+    filter regexes, compliance notes and — via the shared pipeline/facts.json —
+    its approved claims into every new product, which is exactly the kind of
+    inheritance that puts one product's claims in another product's ads. A new
+    project starts blank and says so.
+    """
     if not SAFE_NAME.match(name or ""):
         raise ValueError("name must be lowercase letters, digits, - or _ (2-41 chars)")
     dest = os.path.join(ROOT, "projects", name)
     if os.path.exists(dest):
         raise ValueError(f"project {name!r} already exists")
-    base = os.path.join(ROOT, "projects", "montisella", "project.json")
-    cfg = json.load(open(base, encoding="utf-8")) if os.path.exists(base) else {}
-    cfg.update({"name": name, "product": product or name, "market": market or ""})
-    cfg["_comment"] = ("Per-project config cloned from montisella. REPLACE the filter "
-                       "regexes and compliance profile for this niche before ingesting.")
+
+    cfg = json.loads(json.dumps(TEMPLATE_PROJECT))   # deep copy
+    cfg = {"_comment": cfg.pop("_comment"), "name": name,
+           "product": product or name, "market": market or "", **cfg}
     for sub in ("voc", "evidence", "extractions", "output"):
         os.makedirs(os.path.join(dest, sub), exist_ok=True)
     json.dump(cfg, open(os.path.join(dest, "project.json"), "w", encoding="utf-8"),
               indent=2)
+
+    facts = json.loads(json.dumps(BLANK_FACTS))
+    facts["product"] = product or name
+    json.dump(facts, open(os.path.join(dest, "facts.json"), "w", encoding="utf-8"),
+              indent=2)
+
+    # Seed only what we were actually told. The market line is a pre-research
+    # guess about buyers, so it is stored as a hypothesis rather than as fact —
+    # it must not read as Customer Truth until research validates it.
+    doc = products.blank_product()
+    doc["identity"]["name"] = products.cell(product or name, "user_approved", "merchant")
+    if market:
+        doc["hypothesis"]["guess"] = products.cell(
+            market, "unvalidated_hypothesis", "user")
+    products.save(name, products.slugify(product or name)[:40], doc)
     return cfg
 
 
@@ -510,6 +569,37 @@ def compliance_notes(project="montisella"):
         return ""
 
 
+def picc_cards(project):
+    """Every PICC card in a project, newest first.
+
+    The concepts stage builds on exactly one card, so the operator picks it
+    rather than having the segment's own card assumed. Any Markdown under
+    output/ whose name mentions "picc" counts, which means a card you saved
+    aside as a variant shows up next to the generated ones.
+    """
+    base = os.path.join(ROOT, "projects", project, "output")
+    if not os.path.isdir(base):
+        return []
+    out = []
+    for seg in sorted(os.listdir(base)):
+        d = os.path.join(base, seg)
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.endswith(".md") and "picc" in f.lower():
+                full = os.path.join(d, f)
+                out.append({
+                    "rel": os.path.relpath(full, ROOT),
+                    "segment": seg,
+                    "name": f,
+                    "label": f"{seg} · {f}",
+                    "bytes": os.path.getsize(full),
+                    "mtime": int(os.path.getmtime(full)),
+                })
+    out.sort(key=lambda r: -r["mtime"])
+    return out
+
+
 def build_image_prompt(req):
     """The exact prompt the image model receives, from one request payload.
 
@@ -727,6 +817,7 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
   <div class=htop><b>adpipe studio</b><span>voice-of-customer → finished ads</span></div>
   <div class=tabs>
     <button class="tab on" data-t=remix>Remix</button>
+    <button class=tab data-t=product>Product</button>
     <button class=tab data-t=pipeline>Pipeline</button>
     <button class=tab data-t=library>Library</button>
     <button class=tab data-t=outputs>Outputs</button>
@@ -857,6 +948,133 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
   </div>
 </section>
 
+<!-- ================= PRODUCT ================= -->
+<section id=t-product class=hide>
+  <div class=card>
+    <h2>Products</h2>
+    <p class=hint style="margin-top:0">One product per project. The sheet answers
+      who it is for, what it solves, whether it can be sold profitably, why buy it
+      here instead of Amazon, and whether ads can be made for it. The picc and
+      brief stages read it.</p>
+    <div id=prodlist>loading…</div>
+    <div style="margin-top:18px;border-top:1.5px solid var(--line);padding-top:16px">
+      <h3 style="font-size:14px;margin:0 0 10px">New product</h3>
+      <div class=row>
+        <div><label>Project key</label>
+          <input id=np_key placeholder="lowercase-with-dashes"></div>
+        <div><label>Product name</label>
+          <input id=np_name placeholder="Open-cell latex ergonomic pillow"></div>
+      </div>
+      <label style="margin-top:10px">Market</label>
+      <input id=np_market placeholder="who it is sold to, in one line">
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center">
+        <button class=btn id=np_go>Create product</button>
+        <span class=hint id=np_msg style="margin:0">Creates an empty project — no
+          filters, facts or claims copied from anything else.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class=card id=sheetcard hidden>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px">
+      <div>
+        <h2 style="margin:0" id=sheettitle>Product</h2>
+        <p class=hint style="margin:4px 0 0" id=sheetstate></p>
+      </div>
+      <div style="display:flex;gap:9px;white-space:nowrap">
+        <button class="btn ghost" id=sheetclose>Close</button>
+        <button class=btn id=sheetsave>Save</button>
+      </div>
+    </div>
+
+    <div class=tabs style="margin:14px 0 0;gap:6px">
+      <button class="tab on" data-pt=truth>Product truth</button>
+      <button class=tab data-pt=segments>Segments</button>
+      <button class=tab data-pt=ready>Readiness</button>
+    </div>
+
+    <div id=pt-truth>
+      <p class=hint>Layer 1 — true regardless of who it is sold to. Nothing
+        customer-related belongs here; that lives on each segment.</p>
+      <div id=sheetmissing></div>
+      <div id=sheetform style="margin-top:12px"></div>
+    </div>
+
+    <div id=pt-segments class=hide>
+      <p class=hint>Layers 2 and 3 — each segment carries its own research and its
+        own strategy. A product legitimately has several, with different problems
+        and different positioning.</p>
+      <div style="display:flex;gap:9px;align-items:center;margin:10px 0">
+        <input id=segnew placeholder="new segment name" style="flex:1">
+        <button class="btn ghost" id=segadd style=white-space:nowrap>Add segment</button>
+        <button class="btn ghost" id=segimport style=white-space:nowrap>Import from pipeline</button>
+      </div>
+      <p class=hint id=segmsg style="margin:0 0 10px"></p>
+
+      <div style="border:1.5px solid var(--line);border-radius:11px;padding:13px 15px;
+        margin-bottom:14px">
+        <b style=font-size:13.5px>Enrich from research</b>
+        <p class=hint style="margin:5px 0 10px">Reads this segment's extraction
+          outputs and proposes values for its research fields. Evidence only — it
+          records what customers said, never what to do about it. Every suggestion
+          arrives as <i>ai&nbsp;suggested</i> for you to accept, edit or reject, and
+          fields you have already approved are left alone.</p>
+        <div class=row style="margin-bottom:9px">
+          <div><label>Segment</label><select id=en_seg></select></div>
+          <div><label>&nbsp;</label>
+            <div style="display:flex;gap:8px">
+              <button class="btn ghost" id=en_preview style="flex:1;white-space:nowrap">Preview prompt</button>
+              <button class=btn id=en_go style="flex:1;white-space:nowrap">Enrich</button>
+            </div></div>
+        </div>
+        <label>Sections to populate</label>
+        <div id=en_sections style="display:flex;flex-wrap:wrap;gap:12px;margin:6px 0 8px"></div>
+        <a href=# id=en_all style="font-size:13px;color:var(--accent)">select all recommended</a>
+        <p class=hint id=en_msg style="margin:9px 0 0"></p>
+        <div id=en_review style="margin-top:12px"></div>
+      </div>
+
+      <div style="border:1.5px solid var(--line);border-radius:11px;padding:13px 15px;
+        margin-bottom:14px">
+        <b style=font-size:13.5px>Product × segment strategy</b>
+        <p class=hint style="margin:5px 0 10px">Turns product truth and this
+          segment's <b>approved</b> research into positioning, primary benefit,
+          reason to buy, reason to believe, differentiation, creative territories
+          and landing page strategy. Fields still sitting as unreviewed suggestions
+          are excluded and listed — strategy built on unreviewed evidence is what
+          running §6 first exists to prevent.</p>
+        <div class=row style="margin-bottom:9px">
+          <div><label>Segment</label><select id=sy_seg></select></div>
+          <div><label>&nbsp;</label>
+            <div style="display:flex;gap:8px">
+              <button class="btn ghost" id=sy_preview style="flex:1;white-space:nowrap">Preview prompt</button>
+              <button class=btn id=sy_go style="flex:1;white-space:nowrap">Synthesise</button>
+            </div></div>
+        </div>
+        <label>Sections to produce</label>
+        <div id=sy_sections style="display:flex;flex-wrap:wrap;gap:12px;margin:6px 0 8px"></div>
+        <a href=# id=sy_all style="font-size:13px;color:var(--accent)">select all</a>
+        <p class=hint id=sy_msg style="margin:9px 0 0"></p>
+        <div id=sy_review style="margin-top:12px"></div>
+      </div>
+
+      <div id=seglist></div>
+    </div>
+
+    <div id=pt-ready class=hide>
+      <p class=hint>What each stage can actually run on. Readiness differs per
+        segment on purpose — a barely-researched segment must not inherit a
+        well-researched one's green light.</p>
+      <div id=readybox></div>
+    </div>
+
+    <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
+      <button class=btn id=sheetsave2>Save</button>
+      <span class=hint id=sheetmsg style="margin:0"></span>
+    </div>
+  </div>
+</section>
+
 <!-- ================= PIPELINE ================= -->
 <section id=t-pipeline class=hide>
   <div class=card>
@@ -920,6 +1138,11 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
         <div><label>Concepts</label><input type=number id=nconcepts value=10 min=1 max=30></div>
         <div><label>Hooks each</label><input type=number id=nhooks value=3 min=1 max=6></div>
       </div>
+      <label style="margin-top:12px">PICC card to build on</label>
+      <select id=piccsel></select>
+      <p class=hint id=piccwhy>The concepts stage builds on exactly one card. Pick
+        it rather than letting the segment's own card be assumed — the card decides
+        the strategy every concept inherits.</p>
     </div>
     <div id=opt_brief class=opts style="margin-top:14px" hidden>
       <label>Production briefs</label><input type=number id=nbriefs value=4 min=1 max=10>
@@ -1084,6 +1307,7 @@ $$('.tab').forEach(b=>b.onclick=()=>{
   if(b.dataset.t==='library'  && typeof loadLibrary==='function') loadLibrary();
   if(b.dataset.t==='outputs'  && typeof loadOutputs==='function') loadOutputs();
   if(b.dataset.t==='settings' && typeof renderProjectList==='function') renderProjectList();
+  if(b.dataset.t==='product' && typeof loadProducts==='function') loadProducts();
 });
 
 // ---------- settings ----------
@@ -1505,6 +1729,481 @@ $('#pmgo').onclick=async()=>{
   $('#go').disabled=false;
 };
 
+// ---------- product ----------
+/* Three layers, three editors: Product Truth is global to the product, each
+   Segment carries its own customer truth and strategy, and readiness is derived
+   from both. Field values are cells {value,state,source,...} so provenance
+   survives a round-trip through the form. */
+let PSCHEMA=null, PDOC=null, PSEGS=[], PPROJ='', PPRODUCT='', PPIPESEGS=[];
+
+fetch('/product/schema').then(r=>r.json()).then(j=>{PSCHEMA=j;});
+
+const cv=c=>(c&&typeof c==='object'&&'value' in c)?c.value:(c===undefined?'':c);
+function setcv(c,v){ if(c&&typeof c==='object'&&'value' in c){ c.value=v;
+  if(c.state==='empty'||!c.state) c.state='user_approved'; } return c; }
+
+async function loadProducts(){
+  const box=$('#prodlist');
+  try{
+    const j=await (await fetch('/products')).json();
+    const rows=j.products||[];
+    if(!rows.length){ box.innerHTML='<p class=hint>No products yet.</p>'; return; }
+    box.innerHTML='';
+    rows.forEach(p=>{
+      const el=document.createElement('div'); el.className='stage';
+      const pct=p.total?Math.round(100*p.answered/p.total):0;
+      const verdict=p.verdict?`<span class=costs>${esc(p.verdict)}</span>`:'';
+      const score=(p.score!==null&&p.score!==undefined)?` · score ${p.score}/10`:'';
+      el.innerHTML=`<b>${esc(p.name||p.product)} ${verdict}</b>
+        <small>${esc(p.project)} / ${esc(p.product)} · truth ${p.answered}/${p.total} (${pct}%)${score}
+        · <b>${p.segments}</b> segment(s), ${p.active_segments} active
+        ${p.missing_required?` · <b style=color:var(--signal)>${p.missing_required} required blank</b>`:''}</small>
+        ${p.definition?`<small style="display:block;margin-top:4px">${esc(p.definition)}</small>`:''}`;
+      el.onclick=()=>openSheet(p.project,p.product);
+      box.appendChild(el);
+    });
+  }catch(e){ box.innerHTML=`<p class=hint>⚠ ${e}</p>`; }
+}
+
+async function openSheet(proj,prod){
+  const j=await (await fetch(`/product?project=${encodeURIComponent(proj)}&product=${encodeURIComponent(prod||'')}`)).json();
+  if(j.error){ alert(j.error); return; }
+  PPROJ=proj; PPRODUCT=j.product; PDOC=j.doc; PSEGS=j.segments||[];
+  PPIPESEGS=j.pipeline_segments||[];
+  $('#sheetcard').hidden=false;
+  $('#sheettitle').textContent=cv(PDOC.identity.name)||j.product;
+  renderTruth(); renderSegments(); renderReady(j.readiness);
+  updateSheetState(j.answered,j.total,j.missing_required);
+  $('#sheetcard').scrollIntoView({behavior:'smooth',block:'start'});
+}
+$('#sheetclose').onclick=()=>{ $('#sheetcard').hidden=true; PDOC=null; PSEGS=[]; };
+
+$$('[data-pt]').forEach(b=>b.onclick=()=>{
+  $$('[data-pt]').forEach(x=>x.classList.toggle('on',x===b));
+  ['truth','segments','ready'].forEach(k=>
+    $('#pt-'+k).classList.toggle('hide',k!==b.dataset.pt));
+});
+
+function updateSheetState(a,t,missing){
+  $('#sheetstate').textContent=`${PPROJ} / ${PPRODUCT} · product truth ${a}/${t} · ${PSEGS.length} segment(s)`;
+  const m=$('#sheetmissing');
+  if(!missing||!missing.length){ m.innerHTML=''; return; }
+  m.innerHTML=`<div style="background:#FFF8F1;border:1px solid #E0A87A;border-radius:11px;
+    padding:12px 14px"><b style=font-size:13.5px>${missing.length} required product fact(s) still blank</b>
+    <div style="font-size:13px;margin-top:6px;line-height:1.6">${missing.map(esc).join('<br>')}</div>
+    <div class=hint style="margin:8px 0 0">These are Product Truth. Until they are
+      answered the pipeline treats them as unknown — and an unanswered fact cannot
+      license a claim.</div></div>`;
+}
+
+function renderTruth(){
+  const box=$('#sheetform'); box.innerHTML='';
+  (PSCHEMA.product||[]).forEach(sec=>{
+    box.appendChild(sectionEl(sec, PDOC[sec.key], sec.stage==='create'));
+  });
+}
+
+/* One collapsible section, generic over the schema. */
+function sectionEl(sec, vals, openByDefault){
+  const d=document.createElement('details'); d.className='lvg';
+  const done=sec.fields.filter(f=>{const v=cv(vals[f.key]);
+    return Array.isArray(v)?v.length:String(v||'').trim();}).length;
+  d.innerHTML=`<summary>${esc(sec.title)}
+    <span class=lvn>${done}/${sec.fields.length}</span></summary>`;
+  const body=document.createElement('div'); body.className='body';
+  if(sec.help) body.innerHTML=`<p class=hint style="margin:0 0 12px">${esc(sec.help)}</p>`;
+  sec.fields.forEach(f=>body.appendChild(cellRow(vals,f)));
+  d.appendChild(body);
+  if(openByDefault&&done<sec.fields.length) d.open=true;
+  return d;
+}
+
+function cellRow(vals,f){
+  const row=document.createElement('div'); row.className='lev';
+  const c=vals[f.key], val=cv(c);
+  const req=f.required?' <span class=req>*</span>':'';
+  const state=(c&&c.state)||'empty';
+  const chip=state!=='empty'&&state!=='user_approved'
+    ? ` <span class=lvn>${esc(state.replace(/_/g,' '))}</span>`:'';
+  row.innerHTML=`<label>${esc(f.label)}${req}${chip}</label>`;
+  let ctl;
+  if(f.kind==='table'){
+    const t=document.createElement('div'); const cols=f.columns;
+    if(!Array.isArray(cv(c))||!cv(c).length)
+      setcv(c,(f.rows_hint||[]).map(h=>[h,...cols.slice(1).map(()=>'')]));
+    const draw=()=>{
+      const rows=cv(c)||[];
+      t.innerHTML=`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">
+        <thead><tr>${cols.map(x=>`<th style="text-align:left;padding:4px 6px;border-bottom:1.5px solid var(--line)">${esc(x)}</th>`).join('')}<th></th></tr></thead>
+        <tbody>${rows.map((r,i)=>`<tr>${cols.map((x,ci)=>
+          `<td style="padding:3px 4px"><input data-tr="${i}" data-tc="${ci}" value="${esc(r[ci]||'')}"></td>`).join('')}
+          <td><a href=# data-del="${i}" style="color:var(--soft)">×</a></td></tr>`).join('')}</tbody></table></div>
+        <a href=# data-add style="font-size:13px;color:var(--accent)">+ add row</a>`;
+      t.querySelectorAll('input[data-tr]').forEach(inp=>inp.oninput=()=>{
+        cv(c)[+inp.dataset.tr][+inp.dataset.tc]=inp.value; if(c.state==='empty')c.state='user_approved';});
+      t.querySelectorAll('[data-del]').forEach(a=>a.onclick=e=>{e.preventDefault();
+        cv(c).splice(+a.dataset.del,1); draw();});
+      t.querySelector('[data-add]').onclick=e=>{e.preventDefault();
+        cv(c).push(cols.map(()=>'')); draw();};
+    };
+    draw(); row.appendChild(t); return row;
+  }
+  if(f.kind==='choice'){
+    ctl=`<select><option value="">—</option>`+
+      f.options.map(o=>`<option${val===o?' selected':''}>${esc(o)}</option>`).join('')+`</select>`;
+  }else if(f.kind==='score'){
+    ctl=`<input type=number min=0 max=10 value="${esc(val||'')}">`;
+  }else if(f.kind==='list'){
+    ctl=`<textarea data-list=1 rows=3 placeholder="${esc(f.placeholder||'one per line')}">${esc((val||[]).join('\n'))}</textarea>`;
+  }else if(f.kind==='long'){
+    ctl=`<textarea rows=3 placeholder="${esc(f.placeholder||'')}">${esc(val||'')}</textarea>`;
+  }else{
+    ctl=`<input value="${esc(val||'')}" placeholder="${esc(f.placeholder||'')}">`;
+  }
+  row.insertAdjacentHTML('beforeend',ctl);
+  const el=row.querySelector('input,textarea,select');
+  el.oninput=el.onchange=()=>{
+    setcv(c, el.dataset.list?el.value.split('\n').map(x=>x.trim()).filter(Boolean):el.value);
+    row.classList.toggle('set',!!(el.dataset.list?cv(c).length:el.value.trim()));
+  };
+  row.classList.toggle('set',!!(Array.isArray(val)?val.length:String(val||'').trim()));
+  return row;
+}
+
+/* ---- segments ---- */
+function blankSegDoc(){
+  const d={};
+  (PSCHEMA.segment||[]).forEach(sec=>{ d[sec.key]={};
+    sec.fields.forEach(f=>d[sec.key][f.key]=
+      {value:(f.kind==='list'||f.kind==='table')?[]:'',state:'empty',source:'',ref:'',confidence:''});});
+  return d;
+}
+function renderSegments(){
+  renderEnrichPanel(); renderSynthPanel();
+  const box=$('#seglist'); box.innerHTML='';
+  if(!PSEGS.length){ box.innerHTML='<p class=hint>No segments yet. Research discovers '+
+    'these — add one, or import a validated segment from the pipeline.</p>'; return; }
+  PSEGS.forEach((seg,i)=>{
+    const name=cv(seg.doc.identity.name)||seg.slug;
+    const status=cv(seg.doc.identity.status)||'Discovered';
+    const compat=cv(seg.doc.compatibility.status)||'';
+    const d=document.createElement('details'); d.className='lvg';
+    d.innerHTML=`<summary>${esc(name)}
+      <span class=lvn>${esc(status)}${compat?' · '+esc(compat):''}</span></summary>`;
+    const body=document.createElement('div'); body.className='body';
+    if(compat==='Incompatible') body.innerHTML=
+      `<p class=hint style="color:var(--signal);margin:0 0 10px"><b>Marked incompatible</b>
+       — PICC and concepts are blocked for this pair.</p>`;
+    (PSCHEMA.segment||[]).forEach(sec=>
+      body.appendChild(sectionEl(sec, seg.doc[sec.key], sec.key==='identity')));
+    const rm=document.createElement('a'); rm.href='#'; rm.textContent='remove this segment';
+    rm.style.cssText='color:var(--soft);font-size:13px';
+    rm.onclick=e=>{e.preventDefault();
+      if(confirm(`Remove segment "${name}"? Its research files are not deleted.`)){
+        PSEGS.splice(i,1); renderSegments(); }};
+    body.appendChild(rm);
+    d.appendChild(body); box.appendChild(d);
+  });
+}
+$('#segadd').onclick=()=>{
+  const n=$('#segnew').value.trim();
+  if(!n){ $('#segmsg').textContent='Give the segment a name.'; return; }
+  const doc=blankSegDoc();
+  doc.identity.name={value:n,state:'user_approved',source:'user',ref:'',confidence:''};
+  doc.identity.status={value:'Discovered',state:'user_approved',source:'user',ref:'',confidence:''};
+  PSEGS.push({slug:'',doc}); $('#segnew').value='';
+  $('#segmsg').textContent=`added "${n}" — save to persist`; renderSegments();
+};
+/* The pipeline already discovers segments; importing one links the Product
+   segment to the evidence and extractions that already exist for it. */
+$('#segimport').onclick=()=>{
+  const have=new Set(PSEGS.map(s=>cv(s.doc.identity.evidence_slug)).filter(Boolean));
+  const avail=PPIPESEGS.filter(s=>!have.has(s));
+  if(!avail.length){ $('#segmsg').textContent=
+    PPIPESEGS.length?'Every pipeline segment is already linked.'
+                    :'No pipeline segments yet — run the segment stage first.'; return; }
+  avail.forEach(slug=>{
+    const doc=blankSegDoc();
+    doc.identity.name={value:slug.replace(/_/g,' '),state:'research_derived',source:'research',ref:'',confidence:''};
+    doc.identity.evidence_slug={value:slug,state:'research_derived',source:'research',ref:'',confidence:''};
+    doc.identity.status={value:'Discovered',state:'research_derived',source:'research',ref:'',confidence:''};
+    PSEGS.push({slug:'',doc});
+  });
+  $('#segmsg').textContent=`imported ${avail.length} pipeline segment(s) — review and save`;
+  renderSegments();
+};
+
+/* ---- §6 enrich from research ---- */
+let ENSUG=null;
+
+function renderEnrichPanel(){
+  const sel=$('#en_seg'); if(!sel) return;
+  const was=sel.value;
+  sel.innerHTML=PSEGS.map((s,i)=>{
+    const n=cv(s.doc.identity.name)||s.slug;
+    return `<option value="${esc(s.slug||('#'+i))}">${esc(n)}${s.slug?'':' (unsaved)'}</option>`;
+  }).join('')||'<option value="">— no segments —</option>';
+  if(was) sel.value=was;
+  const box=$('#en_sections');
+  if(!box.children.length&&PSCHEMA&&PSCHEMA.enrich_sections){
+    box.innerHTML=PSCHEMA.enrich_sections.map(s=>
+      `<label style="font-weight:500;font-size:13px;display:flex;gap:6px;align-items:center;margin:0">
+        <input type=checkbox checked data-en="${esc(s.key)}" style="width:auto">
+        ${esc(s.title)} <span style=color:var(--soft)>(${s.fields})</span></label>`).join('');
+  }
+}
+$('#en_all').onclick=e=>{e.preventDefault();
+  $$('#en_sections [data-en]').forEach(c=>c.checked=true);};
+
+function enSections(){ return $$('#en_sections [data-en]:checked').map(c=>c.dataset.en); }
+
+async function runEnrich(dry){
+  const slug=$('#en_seg').value;
+  if(!slug||slug.startsWith('#')){ $('#en_msg').textContent=
+    'Save the segment first — enrichment reads its saved research link.'; return; }
+  const secs=enSections();
+  if(!secs.length){ $('#en_msg').textContent='Pick at least one section.'; return; }
+  const btn=dry?$('#en_preview'):$('#en_go'); btn.disabled=true;
+  $('#en_msg').textContent=dry?'building prompt…':'reading research…';
+  try{
+    const j=await (await fetch('/product/enrich',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project:PPROJ,product:PPRODUCT,segment:slug,
+                           sections:secs,dry_run:!!dry})})).json();
+    if(j.error){ $('#en_msg').textContent='⚠ '+j.error; btn.disabled=false; return; }
+    if(dry){
+      $('#pmtext').value=j.prompt;
+      $('#pmsub').textContent=`${j.asked} field(s) would be proposed`+
+        (j.skipped.length?`; ${j.skipped.length} already approved and left alone.`:'.');
+      $('#pmcost').textContent='Preview only — nothing sent.';
+      pending=null; $('#pmgo').disabled=true; $('#pmwrap').classList.remove('hide');
+      $('#en_msg').textContent='';
+    }else{
+      ENSUG={slug,data:j};
+      /* Apply immediately as ai_suggested. The spec stores proposals in that
+         state, so a review you have not finished survives a save instead of
+         being silently dropped; accept promotes, reject clears. */
+      const seg0=segBySlug(slug);
+      if(seg0) Object.entries(j.suggestions||{}).forEach(([sk,fs])=>
+        Object.entries(fs).forEach(([fk,cell])=>{ seg0.doc[sk][fk]={...cell}; }));
+      renderSegments();
+      $('#en_msg').textContent=`${j.model} proposed values for `+
+        `${Object.values(j.suggestions).reduce((n,o)=>n+Object.keys(o).length,0)} field(s)`+
+        (j.skipped.length?`; ${j.skipped.length} left alone (already approved).`:'.');
+      renderSuggestions();
+    }
+  }catch(e){ $('#en_msg').textContent='⚠ '+e; }
+  btn.disabled=false;
+}
+$('#en_preview').onclick=()=>runEnrich(true);
+$('#en_go').onclick=()=>runEnrich(false);
+
+function segBySlug(slug){ return PSEGS.find(s=>s.slug===slug); }
+function fieldMeta(seckey,fkey){
+  const sec=(PSCHEMA.segment||[]).find(s=>s.key===seckey);
+  return [sec, sec&&sec.fields.find(f=>f.key===fkey)];
+}
+
+/* Shared by §6 and §7 — the review contract is identical: proposals arrive as
+   ai_suggested, and Accept / Edit / Reject is the only way they become truth. */
+function renderReview(store, boxId){
+  const box=$(boxId); box.innerHTML='';
+  if(!store) return;
+  const {slug,data}=store, seg=segBySlug(slug);
+  if(!seg){ box.innerHTML='<p class=hint>segment no longer loaded</p>'; return; }
+  const wrap=document.createElement('div');
+  wrap.style.cssText='border:1.5px solid var(--accent);border-radius:11px;padding:13px 15px';
+  wrap.innerHTML=`<b style=font-size:13.5px>Review suggestions</b>
+    <p class=hint style="margin:4px 0 10px">Accepting marks the field
+      <i>user approved</i> and it will not be re-proposed. Rejecting leaves it empty.
+      Nothing is written until you save.</p>`;
+  let n=0;
+  Object.entries(data.suggestions).forEach(([sk,fields])=>{
+    if(sk==='_notes') return;
+    Object.entries(fields).forEach(([fk,cell])=>{
+      const [sec,f]=fieldMeta(sk,fk); if(!f) return;
+      n++;
+      const cur=seg.doc[sk][fk], applied=cur.state==='ai_suggested'||cur.state==='user_approved';
+      const el=document.createElement('div'); el.className='bf';
+      const val=Array.isArray(cell.value)?cell.value:[String(cell.value)];
+      el.innerHTML=`<h4 style="display:block"><span>${esc(sec.title)} · ${esc(f.label)}</span>
+        <span class=lvn style="float:right">${esc(cell.confidence||'')}${
+          cell.ref?' · '+esc(cell.ref):''}</span></h4>
+        <div style="font-size:13px;line-height:1.55">${
+          val.map(v=>`• ${esc(v)}`).join('<br>')}</div>
+        <div style="display:flex;gap:8px;margin-top:9px">
+          <button class="btn ghost" data-act=accept style="padding:6px 13px;font-size:13px">Accept</button>
+          <button class="btn ghost" data-act=edit style="padding:6px 13px;font-size:13px">Edit</button>
+          <button class="btn ghost" data-act=reject style="padding:6px 13px;font-size:13px">Reject</button>
+          <span class=hint data-state style="margin:0;align-self:center"></span>
+        </div>`;
+      const mark=t=>el.querySelector('[data-state]').textContent=t;
+      el.querySelector('[data-act=accept]').onclick=()=>{
+        seg.doc[sk][fk]={...cell,state:'user_approved'};
+        el.classList.add('on'); mark('accepted — save to persist'); renderSegments();};
+      el.querySelector('[data-act=reject]').onclick=()=>{
+        seg.doc[sk][fk]={value:(f.kind==='list'||f.kind==='table')?[]:'',
+          state:'rejected',source:'research',ref:cell.ref||'',confidence:''};
+        el.classList.remove('on'); mark('rejected'); renderSegments();};
+      el.querySelector('[data-act=edit]').onclick=()=>{
+        const isList=f.kind==='list';
+        const cur=prompt(`${f.label}`+(isList?'\n(one per line)':''),
+          isList?val.join('\n'):val[0]||'');
+        if(cur===null) return;
+        seg.doc[sk][fk]={...cell,
+          value:isList?cur.split('\n').map(x=>x.trim()).filter(Boolean):cur.trim(),
+          state:'user_approved'};
+        el.classList.add('on'); mark('edited and accepted — save to persist');
+        renderSegments();};
+      if(applied) el.classList.add('on');
+      wrap.appendChild(el);
+    });
+  });
+  if(!n){ box.innerHTML='<p class=hint>Nothing proposed.</p>'; return; }
+  const all=document.createElement('button'); all.className='btn';
+  all.style.cssText='margin-top:6px'; all.textContent='Accept all';
+  all.onclick=()=>{ wrap.querySelectorAll('[data-act=accept]').forEach(b=>b.click()); };
+  wrap.appendChild(all);
+  const held=data.skipped||data.unreviewed;
+  if(held&&held.length){
+    const sk=document.createElement('p'); sk.className='hint';
+    sk.style.marginTop='10px';
+    sk.innerHTML=(data.skipped?'<b>Left alone (already approved):</b> '
+                              :'<b>Excluded (still unreviewed):</b> ')+
+      held.map(x=>esc(x.label||x)).join(' · ');
+    wrap.appendChild(sk);
+  }
+  box.appendChild(wrap);
+}
+function renderSuggestions(){ renderReview(ENSUG,'#en_review'); }
+
+/* ---- §7 product x segment strategy ---- */
+let SYSUG=null;
+
+function renderSynthPanel(){
+  const sel=$('#sy_seg'); if(!sel) return;
+  const was=sel.value;
+  sel.innerHTML=PSEGS.map((s,i)=>{
+    const n=cv(s.doc.identity.name)||s.slug;
+    return `<option value="${esc(s.slug||('#'+i))}">${esc(n)}${s.slug?'':' (unsaved)'}</option>`;
+  }).join('')||'<option value="">— no segments —</option>';
+  if(was) sel.value=was;
+  const box=$('#sy_sections');
+  if(!box.children.length&&PSCHEMA&&PSCHEMA.synth_sections){
+    box.innerHTML=PSCHEMA.synth_sections.map(s=>
+      `<label style="font-weight:500;font-size:13px;display:flex;gap:6px;align-items:center;margin:0">
+        <input type=checkbox checked data-sy="${esc(s.key)}" style="width:auto">
+        ${esc(s.title)} <span style=color:var(--soft)>(${s.fields})</span></label>`).join('');
+  }
+}
+$('#sy_all').onclick=e=>{e.preventDefault();
+  $$('#sy_sections [data-sy]').forEach(c=>c.checked=true);};
+
+async function runSynth(dry){
+  const slug=$('#sy_seg').value;
+  if(!slug||slug.startsWith('#')){ $('#sy_msg').textContent=
+    'Save the segment first.'; return; }
+  const secs=$$('#sy_sections [data-sy]:checked').map(c=>c.dataset.sy);
+  if(!secs.length){ $('#sy_msg').textContent='Pick at least one section.'; return; }
+  const btn=dry?$('#sy_preview'):$('#sy_go'); btn.disabled=true;
+  $('#sy_msg').textContent=dry?'building prompt…':'synthesising…';
+  try{
+    const j=await (await fetch('/product/synth',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project:PPROJ,product:PPRODUCT,segment:slug,
+                           sections:secs,dry_run:!!dry})})).json();
+    if(j.error){ $('#sy_msg').textContent='⚠ '+j.error; btn.disabled=false; return; }
+    if(dry){
+      $('#pmtext').value=j.prompt;
+      $('#pmsub').textContent=`${j.asked} strategy field(s) would be produced`+
+        (j.unreviewed.length?`; ${j.unreviewed.length} unreviewed research field(s) excluded.`:'.');
+      $('#pmcost').textContent='Preview only — nothing sent.';
+      pending=null; $('#pmgo').disabled=true; $('#pmwrap').classList.remove('hide');
+      $('#sy_msg').textContent='';
+    }else{
+      SYSUG={slug,data:j};
+      const seg0=segBySlug(slug);
+      if(seg0) Object.entries(j.suggestions||{}).forEach(([sk,fs])=>{
+        if(sk==='_notes') return;
+        Object.entries(fs).forEach(([fk,cell])=>{ if(seg0.doc[sk]) seg0.doc[sk][fk]={...cell}; });
+      });
+      renderSegments();
+      const n=Object.entries(j.suggestions||{}).filter(([k])=>k!=='_notes')
+        .reduce((a,[,o])=>a+Object.keys(o).length,0);
+      const drop=(j.suggestions._notes||{}).dropped_unlicensed;
+      $('#sy_msg').innerHTML=`${esc(j.model)} produced ${n} strategy field(s)`+
+        (j.unreviewed.length?`; ${j.unreviewed.length} unreviewed research field(s) excluded.`:'.')+
+        (drop&&drop.value&&drop.value.length
+          ? `<br><b style=color:var(--signal)>Dropped ${drop.value.length} claim(s) with no licensing product fact:</b> ${
+              drop.value.map(esc).join(' · ')}`:'');
+      renderReview(SYSUG,'#sy_review');
+    }
+  }catch(e){ $('#sy_msg').textContent='⚠ '+e; }
+  btn.disabled=false;
+}
+$('#sy_preview').onclick=()=>runSynth(true);
+$('#sy_go').onclick=()=>runSynth(false);
+
+function renderReady(r){
+  const box=$('#readybox');
+  if(!r){ box.innerHTML=''; return; }
+  const bar=v=>`<div style="background:var(--surface);border-radius:5px;height:7px;width:110px;
+     display:inline-block;vertical-align:middle;overflow:hidden">
+     <div style="background:${v>=80?'var(--accent)':v>=40?'#E0A87A':'var(--signal)'};
+     height:100%;width:${v}%"></div></div> ${v}%`;
+  let h=`<p style="font-size:13.5px;margin:0 0 10px"><b>Product facts</b> ${bar(r.product_facts)}</p>`;
+  if(!r.segments.length){ h+='<p class=hint>No segments — nothing to be ready for yet.</p>'; }
+  else{
+    h+=`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr>${['Segment','Status','Compatibility','Research','Strategy','PICC','Concepts','Briefs']
+        .map(c=>`<th style="text-align:left;padding:5px 7px;border-bottom:1.5px solid var(--line)">${c}</th>`).join('')}</tr></thead><tbody>`;
+    r.segments.forEach(s=>{
+      h+=`<tr${s.blocked?' style="opacity:.55"':''}>
+        <td style="padding:5px 7px">${esc(s.name||s.slug)}</td>
+        <td style="padding:5px 7px">${esc(s.status||'—')}</td>
+        <td style="padding:5px 7px">${esc(s.compatibility||'—')}</td>
+        <td style="padding:5px 7px">${bar(s.research)}</td>
+        <td style="padding:5px 7px">${bar(s.strategy)}</td>
+        <td style="padding:5px 7px">${s.blocked?'blocked':bar(s.picc)}</td>
+        <td style="padding:5px 7px">${s.blocked?'blocked':bar(s.concepts)}</td>
+        <td style="padding:5px 7px">${s.blocked?'blocked':bar(s.briefs)}</td></tr>`;
+    });
+    h+='</tbody></table></div>';
+  }
+  box.innerHTML=h;
+}
+
+async function saveSheet(){
+  if(!PDOC) return;
+  $('#sheetmsg').textContent='saving…';
+  try{
+    const j=await (await fetch('/product/save',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project:PPROJ,product:PPRODUCT,doc:PDOC,segments:PSEGS})})).json();
+    if(j.error){ $('#sheetmsg').textContent='⚠ '+j.error; return; }
+    $('#sheetmsg').textContent=`saved → ${j.sheet}`;
+    updateSheetState(j.answered,j.total,j.missing_required);
+    renderReady(j.readiness); loadProducts();
+  }catch(e){ $('#sheetmsg').textContent='⚠ '+e; }
+}
+$('#sheetsave').onclick=saveSheet; $('#sheetsave2').onclick=saveSheet;
+
+$('#np_go').onclick=async()=>{
+  const key=$('#np_key').value.trim(), name=$('#np_name').value.trim();
+  if(!key){ $('#np_msg').textContent='Give it a project key.'; return; }
+  $('#np_go').disabled=true;
+  try{
+    const j=await (await fetch('/project',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:key,product:name,market:$('#np_market').value.trim()})})).json();
+    if(j.error){ $('#np_msg').textContent='⚠ '+j.error; }
+    else{ $('#np_msg').textContent=`created ${j.project}`;
+      $('#np_key').value=$('#np_name').value=$('#np_market').value='';
+      await loadProducts(); }
+  }catch(e){ $('#np_msg').textContent='⚠ '+e; }
+  $('#np_go').disabled=false;
+};
+
 // ---------- pipeline ----------
 let stage=null;
 const STAGES=__STAGES__;
@@ -1532,7 +2231,38 @@ async function loadSegs(){
   const j=await r.json();
   $('#seg').innerHTML=j.segments.length?j.segments.map(x=>`<option>${x}</option>`).join('')
     :'<option value="">— none yet —</option>';
+  $('#seg').onchange=loadPiccs;
   if(stage&&stage.name==='segment')loadVocFiles();
+  loadPiccs();
+}
+/* The concepts stage builds on exactly one PICC card. Default to the selected
+   segment's own, but list every card in the project so a rewritten or set-aside
+   variant can be chosen deliberately. */
+async function loadPiccs(){
+  const sel=$('#piccsel'); if(!sel) return;
+  const pr=$('#proj').value, seg=$('#seg').value, was=sel.value;
+  sel.innerHTML='<option value="">— this segment\'s own card (default)</option>';
+  if(!pr) return;
+  try{
+    const j=await (await fetch('/piccs?project='+encodeURIComponent(pr))).json();
+    const cards=j.cards||[];
+    if(!cards.length){
+      $('#piccwhy').textContent='No PICC card in this project yet — run the picc stage first.';
+      return;
+    }
+    cards.forEach(c=>{const o=document.createElement('option');
+      o.value=c.rel;
+      const when=new Date(c.mtime*1000).toLocaleString([],{dateStyle:'medium',timeStyle:'short'});
+      o.textContent=(c.segment===seg?'★ ':'')+`${c.label} — ${when}`;
+      sel.appendChild(o);});
+    if(was&&[...sel.options].some(o=>o.value===was)) sel.value=was;
+    const mine=cards.filter(c=>c.segment===seg).length;
+    $('#piccwhy').innerHTML=mine
+      ? `★ marks this segment's own card. Leave it on default to use that, or pick `+
+        `another of the ${cards.length} card(s) in this project.`
+      : `<b>No card for <code>${seg}</code> yet</b> — run the picc stage for it, or `+
+        `pick one of the ${cards.length} card(s) from another segment.`;
+  }catch(e){ $('#piccwhy').textContent='Could not load PICC cards: '+e; }
 }
 async function loadVocFiles(){
   const pr=$('#proj').value; if(!pr)return;
@@ -1562,6 +2292,7 @@ $('#runbtn').onclick=async()=>{
               force:$('#force').checked,
               rules_only:$('#rulesonly').checked,
               n_concepts:+$('#nconcepts').value||0, n_hooks:+$('#nhooks').value||0,
+              picc:$('#piccsel')?$('#piccsel').value:'',
               n_briefs:+$('#nbriefs').value||0,
               provider:$('#provider')?$('#provider').value:'',
               model:$('#modelid')?$('#modelid').value.trim():''};
@@ -2007,6 +2738,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(project_summary(n) or {}))
         if u.path == "/library":
             return self._send(200, json.dumps(library()))
+        if u.path == "/products":
+            rows = []
+            for p in projects():
+                try:
+                    products.migrate_legacy(p)
+                    for prod in products.list_products(p):
+                        rows.append(products.summary(p, prod))
+                except products.ProductError:
+                    continue
+            return self._send(200, json.dumps({"products": rows}))
+        if u.path == "/product":
+            q = urllib.parse.parse_qs(u.query)
+            n = q.get("project", [""])[0]
+            try:
+                products.migrate_legacy(n)
+                prod = products.resolve_product(n, q.get("product", [""])[0])
+                doc = products.load(n, prod)
+                segs = products.load_segments(n, prod)
+                ready = products.readiness(n, prod)
+            except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            a, t = products.completeness(doc, products.PRODUCT_SECTIONS)
+            return self._send(200, json.dumps(
+                {"project": n, "product": prod, "doc": doc, "segments": segs,
+                 "readiness": ready, "answered": a, "total": t,
+                 "pipeline_segments": segments(n),
+                 "missing_required": products.missing_required(
+                     doc, products.PRODUCT_SECTIONS)}))
+        if u.path == "/product/schema":
+            sch = products.schema()
+            sch["enrich_sections"] = [
+                {"key": s["key"], "title": s["title"], "fields": len(fs)}
+                for s, fs in enrich.enrichable()]
+            sch["synth_sections"] = synth.sections()
+            return self._send(200, json.dumps(sch))
+        if u.path == "/piccs":
+            pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
+            return self._send(200, json.dumps(
+                {"cards": picc_cards(pr) if pr else []}))
         if u.path == "/levers":
             q = urllib.parse.parse_qs(u.query)
             try:
@@ -2196,6 +2966,74 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(picked))
             except presets.PresetError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
+        if path == "/product/enrich":
+            req = self._json()
+            with _lock:
+                keys = dict(KEYS)
+            proj = req.get("project", "")
+            try:
+                prod = products.resolve_product(proj, req.get("product", ""))
+                segs = products.load_segments(proj, prod)
+            except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            slug = req.get("segment", "")
+            seg = next((x for x in segs if x["slug"] == slug), None)
+            if not seg:
+                return self._send(200, json.dumps(
+                    {"error": f"no saved segment {slug!r} — save the segment first"}))
+            # The segment's research lives under its pipeline slug; without one
+            # there are no extractions to read and nothing to propose from.
+            ev = products.value_of(seg["doc"]["identity"].get("evidence_slug")) or slug
+            try:
+                out = enrich.suggest(
+                    proj, prod, ev, seg["doc"],
+                    sections=req.get("sections") or None, keys=keys,
+                    dry_run=bool(req.get("dry_run")))
+            except enrich.EnrichError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            return self._send(200, json.dumps(out))
+        if path == "/product/synth":
+            req = self._json()
+            with _lock:
+                keys = dict(KEYS)
+            proj = req.get("project", "")
+            try:
+                prod = products.resolve_product(proj, req.get("product", ""))
+                segs = products.load_segments(proj, prod)
+            except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            slug = req.get("segment", "")
+            seg = next((x for x in segs if x["slug"] == slug), None)
+            if not seg:
+                return self._send(200, json.dumps(
+                    {"error": f"no saved segment {slug!r} — save the segment first"}))
+            try:
+                out = synth.synthesise(
+                    proj, prod, slug, seg["doc"],
+                    sections_wanted=req.get("sections") or None, keys=keys,
+                    dry_run=bool(req.get("dry_run")))
+            except (synth.SynthError, products.ProductError) as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            return self._send(200, json.dumps(out))
+        if path == "/product/save":
+            req = self._json()
+            proj = req.get("project", "")
+            try:
+                prod = products.resolve_product(proj, req.get("product", ""))
+                doc = products.save(proj, prod, req.get("doc") or {})
+                if req.get("segments") is not None:
+                    products.save_segments(proj, prod, req["segments"])
+                ready = products.readiness(proj, prod)
+            except products.ProductError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            a, t = products.completeness(doc, products.PRODUCT_SECTIONS)
+            return self._send(200, json.dumps(
+                {"ok": True, "answered": a, "total": t, "readiness": ready,
+                 "missing_required": products.missing_required(
+                     doc, products.PRODUCT_SECTIONS),
+                 "sheet": os.path.relpath(products.sheet_path(proj, prod), ROOT)}))
         if path == "/prompt":
             return self._prompt(self._json())
         if path == "/briefs":
@@ -2390,6 +3228,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 cmd += ["--concepts", str(int(req["n_concepts"]))]
             if req.get("n_hooks"):
                 cmd += ["--hooks", str(int(req["n_hooks"]))]
+            if req.get("picc"):
+                cmd += ["--picc", str(req["picc"])]
         if stage in ("brief", "run"):
             if req.get("n_briefs"):
                 cmd += ["--briefs", str(int(req["n_briefs"]))]

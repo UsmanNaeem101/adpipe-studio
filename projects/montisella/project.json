@@ -1,13 +1,9 @@
 {
   "_comment": "Per-project config. Everything niche-specific lives here; the pipeline and ad templates are shared. Copy this folder to start a second product.",
-
   "name": "montisella",
   "product": "Montisella latex ergonomic pillow",
   "market": "upper back, shoulder and neck pain sufferers (UK/US)",
-
   "brand": "pipeline/brand.json",
-  "facts": "pipeline/facts.json",
-
   "filter": {
     "_comment": "Skill-01 filtering. TOPIC decides whether an item is about this market at all; the rest score relevance. Regexes are case-insensitive. Replace all of these for a new niche.",
     "topic": "\\b(shoulder|shoulder blade|upper back|upper[- ]back|thoracic|trap(?:s|ezius)?|rhomboid|scapula|scapular|neck pain|posture|rotator cuff|impingement|frozen shoulder|between (?:my |the )?shoulder blades|bra strap|binder|side sleep|sleeping on (?:my )?side|pillow)\\b",
@@ -19,22 +15,21 @@
     "min_words": 12,
     "min_score": 2
   },
-
   "compliance": {
     "_comment": "Which qa.py ruleset applies. 'health_adjacent' is the strict Meta wellness set in qa.py. A non-health product would use a different profile.",
     "profile": "health_adjacent",
     "platform": "meta",
     "notes": "Felt experience only. Never: corrects posture, realigns spine/neck, relieves nerve compression, treats or cures a named condition."
   },
-
   "creative": {
     "awareness": "problem-aware",
     "traffic": "cold",
-    "formats": ["4x5"],
+    "formats": [
+      "4x5"
+    ],
     "concepts_per_run": 10,
     "briefs_per_run": 4
   },
-
   "model": {
     "id": "claude-opus-5",
     "effort": "high",
