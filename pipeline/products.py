@@ -233,6 +233,9 @@ SEGMENT_SECTIONS = [
          {"key": "awareness", "label": "Awareness level", "kind": "choice", "enrich": True,
           "options": ["Unaware", "Problem aware", "Solution aware", "Product aware",
                       "Most aware"]},
+         {"key": "evidence_project", "label": "Research project", "kind": "text",
+          "placeholder": "which project holds this segment's evidence and "
+                         "extractions (default: this product's own project)"},
          {"key": "evidence_slug", "label": "Pipeline segment slug", "kind": "text",
           "placeholder": "the evidence/<slug>.txt this segment's research lives under"},
      ]},
