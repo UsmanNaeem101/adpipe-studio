@@ -1145,7 +1145,7 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
     <div class=row style="margin-bottom:16px">
       <div><label>Project</label><select id=proj></select></div>
       <div><label>Segment</label><select id=seg></select></div>
-      <div id=prodwrap hidden><label>Product</label><select id=prod></select></div>
+      <div id=prodwrap class="hide"><label>Product</label><select id=prod></select></div>
     </div>
     <div class=stagelist id=stages></div>
     <div id=ingestbox class="hide" style="margin-top:16px">
