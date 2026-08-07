@@ -85,6 +85,15 @@ class PresetError(Exception):
     """Raised instead of exiting — the web app returns it as JSON, the CLI prints."""
 
 
+class OutputBudgetError(PresetError):
+    """The model hit its max_tokens while reasoning, before writing content.
+
+    Raised instead of a generic "didn't return JSON" so the caller can tell a
+    truncated-for-token-budget reply (which a retry with more room can fix)
+    apart from a reply that genuinely contains no JSON.
+    """
+
+
 def _plain(s):
     """Drop markdown emphasis. The document leans on **bold** for stress, which is
     noise in a dropdown and wasted tokens in an image prompt."""
@@ -594,18 +603,27 @@ def _post_text(provider, keys, model, system, prompt, max_tokens, timeout, label
             {"model": model, "max_tokens": max_tokens, "system": system,
              "messages": [{"role": "user", "content": prompt}]},
             timeout=timeout, label=label)
-        return "".join(b.get("text", "") for b in payload.get("content", [])) or ""
-    payload = _post_json(
-        OPENROUTER_URL,
-        {"Authorization": f"Bearer {keys['openrouter']}",
-         "Content-Type": "application/json",
-         "HTTP-Referer": "https://localhost/adpipe", "X-Title": "adpipe"},
-        {"model": model, "max_tokens": max_tokens,
-         "messages": [{"role": "system", "content": system},
-                      {"role": "user", "content": prompt}]},
-        timeout=timeout, label=label)
-    return ((payload.get("choices") or [{}])[0].get("message") or {}).get(
-        "content", "") or ""
+        text = "".join(b.get("text", "") for b in payload.get("content", [])) or ""
+        finish = payload.get("stop_reason")
+    else:
+        payload = _post_json(
+            OPENROUTER_URL,
+            {"Authorization": f"Bearer {keys['openrouter']}",
+             "Content-Type": "application/json",
+             "HTTP-Referer": "https://localhost/adpipe", "X-Title": "adpipe"},
+            {"model": model, "max_tokens": max_tokens,
+             "messages": [{"role": "system", "content": system},
+                          {"role": "user", "content": prompt}]},
+            timeout=timeout, label=label)
+        text = ((payload.get("choices") or [{}])[0].get("message") or {}).get(
+            "content", "") or ""
+        finish = (payload.get("choices") or [{}])[0].get("finish_reason")
+    if not text.strip() and finish in ("length", "max_tokens"):
+        raise OutputBudgetError(
+            f"the model hit its output token budget ({max_tokens}) during "
+            f"reasoning and stopped before writing any JSON (finish_reason="
+            f"{finish!r}). Retrying with a larger budget usually fixes this.")
+    return text
 
 
 def model_json(provider, keys, model, system, prompt, max_tokens=10000,
@@ -621,8 +639,22 @@ def model_json(provider, keys, model, system, prompt, max_tokens=10000,
 
     Raises PresetError if the first reply cannot be repaired.
     """
-    raw = _post_text(provider, keys, model, system, prompt,
-                     max_tokens, timeout, label)
+    try:
+        raw = _post_text(provider, keys, model, system, prompt,
+                         max_tokens, timeout, label)
+    except OutputBudgetError as budget_err:
+        # The model ran out of output tokens mid-reasoning. Re-ask with a
+        # bigger budget so it can finish thinking AND write the JSON.
+        try:
+            return _extract_json(_post_text(
+                provider, keys, model, system, prompt,
+                max_tokens * 3, timeout, label))
+        except PresetError as e:
+            raise PresetError(
+                f"{label}: the model hit its output token budget and the retry "
+                f"also failed ({e}). Response saved to the model audit log.") from e
+    except PresetError as e:
+        raise
     try:
         return _extract_json(raw)
     except PresetError as parse_err:

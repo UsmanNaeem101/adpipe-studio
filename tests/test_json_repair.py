@@ -104,6 +104,47 @@ class ModelJsonRepairTests(unittest.TestCase):
         self.assertIn("repair pass also failed", str(ctx.exception))
         self.assertEqual(self.calls, ["model", "model repair"])
 
+    def test_token_budget_cutoff_retries_with_larger_budget(self):
+        # First call raises OutputBudgetError (model consumed max_tokens on
+        # reasoning, wrote nothing). The retry must use a larger budget and
+        # return the parsed JSON.
+        seen = {}
+        def fake(provider, keys, model, system, prompt, max_tokens, timeout, label):
+            seen["max_tokens"] = max_tokens
+            seen["calls"] = seen.get("calls", 0) + 1
+            if seen["calls"] == 1:
+                raise presets.OutputBudgetError(
+                    "the model hit its output token budget (10000) during "
+                    "reasoning and stopped before writing any JSON")
+            return '{"a": 1, "b": 2}'
+        presets._post_text = fake
+        out = presets.model_json("openrouter", {"openrouter": "k"}, "m",
+                                 "sys", "prompt", max_tokens=10000)
+        self.assertEqual(out, {"a": 1, "b": 2})
+        self.assertEqual(seen["calls"], 2)
+        self.assertEqual(seen["max_tokens"], 30000)  # 3x budget
+
+    def test_token_budget_cutoff_retry_failure_is_clear(self):
+        def fake(provider, keys, model, system, prompt, max_tokens, timeout, label):
+            raise presets.OutputBudgetError("ran out of tokens")
+        presets._post_text = fake
+        with self.assertRaises(presets.PresetError) as ctx:
+            presets.model_json("openrouter", {"openrouter": "k"}, "m",
+                               "sys", "prompt", max_tokens=10000)
+        self.assertIn("output token budget", str(ctx.exception))
+        self.assertIn("retry also failed", str(ctx.exception))
+
+    def test_empty_content_without_length_reason_propagates(self):
+        # Empty content but a normal finish reason (not a budget cut) should not
+        # be misclassified as a budget issue.
+        def fake(provider, keys, model, system, prompt, max_tokens, timeout, label):
+            self.calls.append(label)
+            return ""  # empty, but _post_text's length-check lives upstream
+        presets._post_text = fake
+        with self.assertRaises(presets.PresetError):
+            presets.model_json("openrouter", {"openrouter": "k"}, "m",
+                               "sys", "prompt")
+
 
 if __name__ == "__main__":
     unittest.main()
