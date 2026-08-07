@@ -146,6 +146,53 @@ BLANK_FACTS = {
 }
 
 
+def ensure_project(name, product="", market=""):
+    """The project scaffolding, created only if it is not already there.
+
+    A product lives inside a project, and the project that holds the research is
+    usually older than the product — you segment a market first and decide what
+    to sell into it afterwards. Refusing to touch an existing project meant those
+    projects could never hold a product at all, which put their research out of
+    reach of the thing that needed it.
+
+    Returns (cfg, created).
+    """
+    if not SAFE_NAME.match(name or ""):
+        raise ValueError("name must be lowercase letters, digits, - or _ (2-41 chars)")
+    dest = os.path.join(ROOT, "projects", name)
+    existing = os.path.join(dest, "project.json")
+    if os.path.exists(existing):
+        return json.load(open(existing, encoding="utf-8")), False
+
+    cfg = json.loads(json.dumps(TEMPLATE_PROJECT))
+    cfg = {"_comment": cfg.pop("_comment"), "name": name,
+           "product": product or name, "market": market or "", **cfg}
+    for sub in ("voc", "evidence", "extractions", "output"):
+        os.makedirs(os.path.join(dest, sub), exist_ok=True)
+    json.dump(cfg, open(existing, "w", encoding="utf-8"), indent=2)
+
+    facts = json.loads(json.dumps(BLANK_FACTS))
+    facts["product"] = product or name
+    json.dump(facts, open(os.path.join(dest, "facts.json"), "w", encoding="utf-8"),
+              indent=2)
+    return cfg, True
+
+
+def add_product(project, doc):
+    """Put a product into a project, creating the project only if it is missing."""
+    name = products.value_of((doc.get("identity") or {}).get("name")) or ""
+    if not name.strip():
+        raise ValueError("the product needs a name")
+    slug = products.slugify(name)[:40]
+    ensure_project(project, name)
+    if slug in products.list_products(project):
+        raise ValueError(
+            f"project {project!r} already has a product {slug!r} — rename this one "
+            f"or open the existing product")
+    products.save(project, slug, doc)
+    return {"project": project, "product": slug}
+
+
 def create_project(name, product, market):
     """A project is a folder, a project.json, and an empty product sheet.
 
@@ -965,8 +1012,14 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
         it costs and what you may claim. Who it is for and how to position it are
         discovered later, per segment. You can fill any of this in now or after
         creating.</p>
-      <label>Project key</label>
-      <input id=np_key placeholder="lowercase-with-dashes">
+      <label>Project</label>
+      <div style="display:flex;gap:9px;align-items:center">
+        <select id=np_proj style=flex:1></select>
+        <input id=np_key placeholder="new-project-key" class=hide style=flex:1>
+      </div>
+      <p class=hint id=np_projwhy style="margin:5px 0 0">Put this product in a
+        project that already holds research and its segments become importable
+        straight away.</p>
       <div id=np_form style="margin-top:12px"></div>
       <div style="margin-top:12px;display:flex;gap:10px;align-items:center">
         <button class=btn id=np_go>Create product</button>
@@ -1310,7 +1363,7 @@ $$('.tab').forEach(b=>b.onclick=()=>{
   if(b.dataset.t==='library'  && typeof loadLibrary==='function') loadLibrary();
   if(b.dataset.t==='outputs'  && typeof loadOutputs==='function') loadOutputs();
   if(b.dataset.t==='settings' && typeof renderProjectList==='function') renderProjectList();
-  if(b.dataset.t==='product' && typeof loadProducts==='function'){ loadProducts(); renderNewProduct(); }
+  if(b.dataset.t==='product' && typeof loadProducts==='function'){ loadProducts(); renderNewProduct(); loadNewProjectPicker(); }
 });
 
 // ---------- settings ----------
@@ -1740,6 +1793,7 @@ $('#pmgo').onclick=async()=>{
 let PSCHEMA=null, PDOC=null, PSEGS=[], PPROJ='', PPRODUCT='', PPIPESEGS=[];
 
 fetch('/product/schema').then(r=>r.json()).then(j=>{PSCHEMA=j; renderNewProduct();});
+loadNewProjectPicker();
 
 const cv=c=>(c&&typeof c==='object'&&'value' in c)?c.value:(c===undefined?'':c);
 function setcv(c,v){ if(c&&typeof c==='object'&&'value' in c){ c.value=v;
@@ -1979,7 +2033,10 @@ function renderEnrichPanel(){
     const n=cv(s.doc.identity.name)||s.slug;
     return `<option value="${esc(s.slug||('#'+i))}">${esc(n)}${s.slug?'':' (unsaved)'}</option>`;
   }).join('')||'<option value="">— no segments —</option>';
-  if(was) sel.value=was;
+  /* Only restore a selection that still exists: after a save assigns real slugs
+     the placeholder value no longer matches any option, and setting it blanks
+     the select — which then reads as "no segment chosen" to enrich/synthesise. */
+  if(was&&[...sel.options].some(o=>o.value===was)) sel.value=was;
   const box=$('#en_sections');
   if(!box.children.length&&PSCHEMA&&PSCHEMA.enrich_sections){
     box.innerHTML=PSCHEMA.enrich_sections.map(s=>
@@ -2123,7 +2180,10 @@ function renderSynthPanel(){
     const n=cv(s.doc.identity.name)||s.slug;
     return `<option value="${esc(s.slug||('#'+i))}">${esc(n)}${s.slug?'':' (unsaved)'}</option>`;
   }).join('')||'<option value="">— no segments —</option>';
-  if(was) sel.value=was;
+  /* Only restore a selection that still exists: after a save assigns real slugs
+     the placeholder value no longer matches any option, and setting it blanks
+     the select — which then reads as "no segment chosen" to enrich/synthesise. */
+  if(was&&[...sel.options].some(o=>o.value===was)) sel.value=was;
   const box=$('#sy_sections');
   if(!box.children.length&&PSCHEMA&&PSCHEMA.synth_sections){
     box.innerHTML=PSCHEMA.synth_sections.map(s=>
@@ -2220,6 +2280,14 @@ async function saveSheet(){
     $('#sheetmsg').textContent=`saved → ${j.sheet}`;
     updateSheetState(j.answered,j.total,j.missing_required);
     renderReady(j.readiness); loadProducts();
+    /* Slugs are assigned server-side on save. Without pulling them back, a
+       freshly imported segment stays marked "(unsaved)" in the enrich and
+       strategy pickers and both refuse to run on it. */
+    try{
+      const fresh=await (await fetch(
+        `/product?project=${encodeURIComponent(PPROJ)}&product=${encodeURIComponent(PPRODUCT)}`)).json();
+      if(!fresh.error&&fresh.segments){ PSEGS=fresh.segments; renderSegments(); }
+    }catch(e){}
   }catch(e){ $('#sheetmsg').textContent='⚠ '+e; }
 }
 $('#sheetsave').onclick=saveSheet; $('#sheetsave2').onclick=saveSheet;
@@ -2250,27 +2318,45 @@ function blankProductDoc(){
   return d;
 }
 
+/* Attach to an existing project or start a new one. Existing matters most: the
+   project holding the research is normally older than the product, and that is
+   where its segments live. */
+async function loadNewProjectPicker(){
+  const sel=$('#np_proj'); if(!sel) return;
+  const was=sel.value;
+  try{
+    const j=await (await fetch('/projects')).json();
+    sel.innerHTML=(j.projects||[]).map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join('')
+      +'<option value="__new">＋ new project…</option>';
+    if(was&&[...sel.options].some(o=>o.value===was)) sel.value=was;
+  }catch(e){ sel.innerHTML='<option value="__new">＋ new project…</option>'; }
+  syncProjPicker();
+}
+function syncProjPicker(){
+  const isNew=$('#np_proj').value==='__new';
+  $('#np_key').classList.toggle('hide',!isNew);
+  $('#np_projwhy').textContent=isNew
+    ? 'A new project starts with no VOC and no segments — you will need to run ingest and the segment stage before there is anything to enrich from.'
+    : 'Segments already researched under this project become importable on the Segments tab straight away.';
+}
+$('#np_proj').onchange=syncProjPicker;
+
 $('#np_go').onclick=async()=>{
-  const key=$('#np_key').value.trim();
-  if(!key){ $('#np_msg').textContent='Give it a project key.'; return; }
+  const sel=$('#np_proj').value;
+  const proj=sel==='__new'?$('#np_key').value.trim():sel;
+  if(!proj){ $('#np_msg').textContent='Give the new project a key.'; return; }
   const name=NEWDOC?cv(NEWDOC.identity.name).trim():'';
   if(!name){ $('#np_msg').textContent='Give the product a name.'; return; }
   $('#np_go').disabled=true; $('#np_msg').textContent='creating…';
   try{
-    const j=await (await fetch('/project',{method:'POST',
+    const j=await (await fetch('/product/create',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:key,product:name,market:''})})).json();
+      body:JSON.stringify({project:proj,doc:NEWDOC})})).json();
     if(j.error){ $('#np_msg').textContent='⚠ '+j.error; $('#np_go').disabled=false; return; }
-    /* Everything typed above is merchant truth, so it is saved as entered
-       rather than left in the browser. */
-    const sv=await (await fetch('/product/save',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({project:j.project,doc:NEWDOC})})).json();
-    if(sv.error){ $('#np_msg').textContent='created, but saving the details failed: '+sv.error; }
-    else $('#np_msg').textContent=`created ${j.project} — opening its sheet`;
+    $('#np_msg').textContent=`created ${j.project}/${j.product} — opening its sheet`;
     $('#np_key').value=''; $('#np_form').dataset.built=''; renderNewProduct();
-    await loadProducts();
-    openSheet(j.project,'');
+    await loadProducts(); await loadNewProjectPicker();
+    openSheet(j.project,j.product);
   }catch(e){ $('#np_msg').textContent='⚠ '+e; }
   $('#np_go').disabled=false;
 };
@@ -3040,6 +3126,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(picked))
             except presets.PresetError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
+        if path == "/product/create":
+            req = self._json()
+            try:
+                out = add_product(req.get("project", ""), req.get("doc") or {})
+            except (ValueError, products.ProductError) as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            return self._send(200, json.dumps({"ok": True, **out}))
         if path == "/product/enrich":
             req = self._json()
             with _lock:
