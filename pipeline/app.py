@@ -913,6 +913,14 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
  .bf h4 input{width:auto;margin-top:2px}
  .bf p{margin:4px 0;font-size:13px;line-height:1.45}
  .bf .vis{color:var(--soft);font-size:12.5px;margin-top:7px;font-style:italic}
+ /* move-product modal — same overlay pattern as the prompt confirm */
+ #mvwrap{position:fixed;inset:0;background:rgba(20,20,20,.5);z-index:60;
+   display:flex;align-items:center;justify-content:center;padding:24px}
+ #mvwrap.hide{display:none}
+ #mvbox{background:var(--paper);border-radius:14px;width:100%;max-width:460px;
+   padding:20px 22px}
+ #mvsel{background:var(--surface);border:1.5px solid var(--line);border-radius:9px;
+   padding:9px 10px;min-height:42px}
  /* prompt confirm */
  #pmwrap{position:fixed;inset:0;background:rgba(20,20,20,.5);z-index:60;
    display:flex;align-items:center;justify-content:center;padding:24px}
@@ -1400,6 +1408,19 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 
 <!-- Nothing is sent until this is accepted. The text in the box IS what goes to
      the image model — edit it here and the edit is what gets sent. -->
+<div id=mvwrap class=hide>
+  <div id=mvbox>
+    <h2 style="margin-top:0" id=mvtitle>Move product</h2>
+    <p class=hint id=mvdesc style="margin-top:0"></p>
+    <select id=mvsel style="width:100%;margin:6px 0 4px"></select>
+    <p class=hint id=mvnote style="margin:6px 0 0"></p>
+    <div style="display:flex;gap:10px;margin-top:16px;align-items:center">
+      <button class=btn id=mvgo>Move</button>
+      <button class="btn ghost" id=mvcancel>Cancel</button>
+      <span class=hint id=mvmsg style="margin:0"></span>
+    </div>
+  </div>
+</div>
 <div id=pmwrap class=hide>
   <div id=pmbox>
     <h2 style="margin-top:0">Confirm the prompt</h2>
@@ -1892,20 +1913,41 @@ async function loadProducts(){
         const projs=(await (await fetch('/projects')).json()).projects||[];
         const avail=projs.filter(x=>x!==p.project);
         if(!avail.length){ alert('No other projects to move it into.'); return; }
-        const to=prompt(`Move "${p.name||p.product}" out of "${p.project}" into which project?\n\nAvailable: ${avail.map(x=>'  '+x).join('\n')}`);
-        if(!to||!to.trim()) return;
-        const r=await (await fetch('/product/move',{method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({project:p.project,product:p.product,to:to.trim()})})).json();
-        if(r.error){ alert('⚠ '+r.error); return; }
-        alert(`Moved to ${r.product} / ${r.product}${r.pinned?` — ${r.pinned} segment(s) pinned to ${p.project}'s research.`:''}`);
-        loadProducts();
+        openMoveModal(p, avail);
       };
       box.appendChild(el);
     });
   }catch(e){ box.innerHTML=`<p class=hint>⚠ ${e}</p>`; }
 }
 
+/* ---- move-product modal ---- */
+let MVMOVE=null;   // {project, product, name, avail[]} current move target
+function openMoveModal(p, avail){
+  MVMOVE=null;
+  $('#mvtitle').textContent=`Move "${p.name||p.product}" to a project`;
+  $('#mvdesc').textContent=`Currently in ${p.project}. Its segments keep their research links.`;
+  const sel=$('#mvsel'); sel.innerHTML=avail.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');
+  $('#mvnote').textContent='Segments pointing at research here stay pointed at it.';
+  $('#mvmsg').textContent='';
+  MVMOVE={project:p.project, product:p.product, name:p.name||p.product};
+  $('#mvwrap').classList.remove('hide');
+}
+$('#mvcancel').onclick=()=>{ $('#mvwrap').classList.add('hide'); MVMOVE=null; };
+$('#mvwrap').onclick=e=>{ if(e.target===$('#mvwrap')) $('#mvcancel').click(); };
+$('#mvgo').onclick=async()=>{
+  if(!MVMOVE) return;
+  const to=$('#mvsel').value; if(!to){ $('#mvmsg').textContent='Pick a destination.'; return; }
+  $('#mvgo').disabled=true; $('#mvmsg').textContent='moving…';
+  try{
+    const r=await (await fetch('/product/move',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project:MVMOVE.project, product:MVMOVE.product, to})})).json();
+    if(r.error){ $('#mvmsg').textContent='⚠ '+r.error; $('#mvgo').disabled=false; return; }
+    $('#mvwrap').classList.add('hide'); MVMOVE=null;
+    loadProducts();
+  }catch(e){ $('#mvmsg').textContent='⚠ '+e; }
+  $('#mvgo').disabled=false;
+};
 async function openSheet(proj,prod){
   const j=await (await fetch(`/product?project=${encodeURIComponent(proj)}&product=${encodeURIComponent(prod||'')}`)).json();
   if(j.error){ alert(j.error); return; }
