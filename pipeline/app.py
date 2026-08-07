@@ -2779,15 +2779,110 @@ async function loadOutputs(){
     assignment records exist behind them, so anything built on them inherits an
     unverifiable lineage.</p></div>`:'';
 }
+/* Render a subset of markdown to HTML, safely.
+   Input is escaped first, so no user/model content can become markup — this
+   is display only. Supported: headings, paragraphs, bold, italic, inline and
+   fenced code, bullet + numbered lists, blockquotes, tables, hr, links. */
+const MD_INLINE=[
+  [/`([^`]+)`/g, '<code>$1</code>'],
+  [/\*\*([^*]+)\*\*/g, '<strong>$1</strong>'],
+  [/(^|[^\w*])\*([^*\n]+)\*(?!\w)/g, '$1<em>$2</em>'],
+  [/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target=_blank rel=noopener>$1</a>'],
+];
+function mdInline(s){
+  s=outEsc(s);
+  MD_INLINE.forEach(([re,rep])=>s=s.replace(re,rep));
+  return s;
+}
+function mdRender(text){
+  const src=String(text??'').replace(/\r\n?/g,'\n').split('\n');
+  const out=[]; let i=0;
+  const flushPara=()=>{ if(buf.length){ out.push('<p>'+buf.join('<br>')+'</p>'); buf=[]; } };
+  let buf=[]; let fence=false;
+  while(i<src.length){
+    const line=src[i];
+    // fenced code blocks
+    if(/^```/.test(line.trim())){
+      flushPara(); fence=!fence; i++; continue;
+    }
+    if(fence){ out.push('<pre><code>'+outEsc(line)+'</code></pre>'); i++; continue; }
+    const t=line.trim();
+    // blank line -> paragraph break
+    if(!t){ flushPara(); i++; continue; }
+    // headings
+    const h=/^(#{1,6})\s+(.*)$/.exec(t);
+    if(h){ flushPara(); const n=h[1].length;
+      out.push(`<h${Math.min(n,4)} style="margin:14px 0 6px">${mdInline(h[2])}</h${Math.min(n,4)}>`);
+      i++; continue; }
+    // horizontal rule
+    if(/^(-{3,}|\*{3,}|_{3,})$/.test(t)){ flushPara();
+      out.push('<hr style="border:none;border-top:1.5px solid var(--line);margin:14px 0">');
+      i++; continue; }
+    // table: a header row then a separator row
+    if(/^\|.*\|$/.test(t)&&i+1<src.length&&/^\s*\|?[\s:|-]+\|?\s*$/.test(src[i+1].trim())&&
+       /-/.test(src[i+1])){
+      flushPara();
+      const head=t.split('|').map(c=>c.trim()).filter((c,ix,a)=>ix>0||c);
+      const headCells=head.slice(0,head.length);
+      i+=2; // consume header + separator
+      const rows=[];
+      while(i<src.length&&/^\|.*\|$/.test(src[i].trim())){
+        const cells=src[i].split('|').map(c=>c.trim());
+        rows.push(cells);
+        i++;
+      }
+      let table='<table style="border-collapse:collapse;margin:10px 0;width:100%;font-size:12.5px">';
+      table+='<thead><tr>'+headCells.map(c=>`<th style="border:1px solid var(--line);padding:5px 8px;text-align:left;background:var(--surface);white-space:nowrap">${mdInline(c)}</th>`).join('')+'</tr></thead>';
+      table+='<tbody>'+rows.map(r=>'<tr>'+headCells.map((_,ix)=>`<td style="border:1px solid var(--line);padding:5px 8px">${mdInline(r[ix]??'')}</td>`).join('')+'</tr>').join('')+'</tbody></table>';
+      out.push(table);
+      continue;
+    }
+    // blockquote
+    if(/^>\s?/.test(t)){
+      const q=[];
+      while(i<src.length&&/^>\s?/.test(src[i].trim())){ q.push(src[i].trim().replace(/^>\s?/,'')); i++; }
+      out.push('<blockquote style="margin:8px 0;padding:6px 12px;border-left:3px solid var(--accent);background:var(--surface);color:var(--soft);border-radius:0 8px 8px 0">'
+        +mdInline(q.join(' '))+'</blockquote>');
+      continue;
+    }
+    // lists
+    const b=/^([-*])\s+(.*)$/.exec(t);
+    const n=/^(\d+)[.)]\s+(.*)$/.exec(t);
+    if(b||n){
+      flushPara();
+      const ordered=!!n;
+      out.push(ordered?'<ol style="margin:8px 0;padding-left:22px">':'<ul style="margin:8px 0;padding-left:22px">');
+      while(i<src.length){
+        const tt=src[i].trim();
+        const mb=/^([-*])\s+(.*)$/.exec(tt);
+        const mn=/^(\d+)[.)]\s+(.*)$/.exec(tt);
+        const item=ordered?mn:mb;
+        if(!item) break;
+        out.push(`<li style="margin:2px 0">${mdInline(item[2])}</li>`);
+        i++;
+      }
+      out.push(ordered?'</ol>':'</ul>');
+      continue;
+    }
+    buf.push(mdInline(line));
+    i++;
+  }
+  flushPara();
+  return out.join('\n');
+}
 async function viewFile(path,kind){
   const v=$('#oview');
   if(kind==='image'){v.innerHTML=`<img src="/file?path=${encodeURIComponent(path)}"
     style="max-width:100%;border-radius:10px"><p class=hint>${outEsc(path)}</p>`;return}
   v.innerHTML='<p class=hint>Loading…</p>';
   const d=await (await fetch('/file?path='+encodeURIComponent(path))).json();
-  v.innerHTML=`<p class=hint style=margin:0>${outEsc(path)}${d.clipped?' — first 200KB of '+(d.bytes/1024).toFixed(0)+'KB':''}</p>
-    <pre style="white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;background:var(--surface);
-      padding:14px;border-radius:9px;max-height:520px;overflow:auto;margin-top:10px">${outEsc(d.text)}</pre>`;
+  const isMd=/\.(md|markdown)$/i.test(path);
+  v.innerHTML=`<p class=hint style=margin:0>${outEsc(path)}${d.clipped?' — first 200KB of '+(d.bytes/1024).toFixed(0)+'KB':''}</p>`+
+    (isMd
+      ? `<div style="font:13px/1.6 -apple-system,'Helvetica Neue',Inter,sans-serif;background:var(--surface);
+         padding:16px 20px;border-radius:9px;max-height:520px;overflow:auto;margin-top:10px">${mdRender(d.text)}</div>`
+      : `<pre style="white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;background:var(--surface);
+         padding:14px;border-radius:9px;max-height:520px;overflow:auto;margin-top:10px">${outEsc(d.text)}</pre>`);
 }
 $('#orefresh')&&($('#orefresh').onclick=loadOutputs);
 $('#oproj')&&($('#oproj').onchange=loadOutputs);
