@@ -952,25 +952,26 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 <section id=t-product class=hide>
   <div class=card>
     <h2>Products</h2>
-    <p class=hint style="margin-top:0">One product per project. The sheet answers
-      who it is for, what it solves, whether it can be sold profitably, why buy it
-      here instead of Amazon, and whether ads can be made for it. The picc and
-      brief stages read it.</p>
+    <p class=hint style="margin-top:0">A project can hold several products, and each
+      product several customer segments. Product truth is what is true whatever you
+      sell it for; who it is for, what it solves and how to position it belong to
+      each segment, and come from research rather than from guessing here. The picc,
+      concepts and brief stages read what you approve.</p>
     <div id=prodlist>loading…</div>
     <div style="margin-top:18px;border-top:1.5px solid var(--line);padding-top:16px">
-      <h3 style="font-size:14px;margin:0 0 10px">New product</h3>
-      <div class=row>
-        <div><label>Project key</label>
-          <input id=np_key placeholder="lowercase-with-dashes"></div>
-        <div><label>Product name</label>
-          <input id=np_name placeholder="Open-cell latex ergonomic pillow"></div>
-      </div>
-      <label style="margin-top:10px">Market</label>
-      <input id=np_market placeholder="who it is sold to, in one line">
+      <h3 style="font-size:14px;margin:0 0 4px">New product</h3>
+      <p class=hint style="margin:0 0 12px">Only what you already know before any
+        research — what the thing is, what it is made of, what it does not do, what
+        it costs and what you may claim. Who it is for and how to position it are
+        discovered later, per segment. You can fill any of this in now or after
+        creating.</p>
+      <label>Project key</label>
+      <input id=np_key placeholder="lowercase-with-dashes">
+      <div id=np_form style="margin-top:12px"></div>
       <div style="margin-top:12px;display:flex;gap:10px;align-items:center">
         <button class=btn id=np_go>Create product</button>
-        <span class=hint id=np_msg style="margin:0">Creates an empty project — no
-          filters, facts or claims copied from anything else.</span>
+        <span class=hint id=np_msg style="margin:0">Nothing is copied from another
+          product — no filters, facts or claims.</span>
       </div>
     </div>
   </div>
@@ -1307,7 +1308,7 @@ $$('.tab').forEach(b=>b.onclick=()=>{
   if(b.dataset.t==='library'  && typeof loadLibrary==='function') loadLibrary();
   if(b.dataset.t==='outputs'  && typeof loadOutputs==='function') loadOutputs();
   if(b.dataset.t==='settings' && typeof renderProjectList==='function') renderProjectList();
-  if(b.dataset.t==='product' && typeof loadProducts==='function') loadProducts();
+  if(b.dataset.t==='product' && typeof loadProducts==='function'){ loadProducts(); renderNewProduct(); }
 });
 
 // ---------- settings ----------
@@ -1736,7 +1737,7 @@ $('#pmgo').onclick=async()=>{
    survives a round-trip through the form. */
 let PSCHEMA=null, PDOC=null, PSEGS=[], PPROJ='', PPRODUCT='', PPIPESEGS=[];
 
-fetch('/product/schema').then(r=>r.json()).then(j=>{PSCHEMA=j;});
+fetch('/product/schema').then(r=>r.json()).then(j=>{PSCHEMA=j; renderNewProduct();});
 
 const cv=c=>(c&&typeof c==='object'&&'value' in c)?c.value:(c===undefined?'':c);
 function setcv(c,v){ if(c&&typeof c==='object'&&'value' in c){ c.value=v;
@@ -1748,7 +1749,8 @@ async function loadProducts(){
     const j=await (await fetch('/products')).json();
     const rows=j.products||[];
     if(!rows.length){ box.innerHTML='<p class=hint>No products yet.</p>'; return; }
-    box.innerHTML='';
+    box.innerHTML='<p class=hint style="margin:0 0 9px">Click a product to open '+
+      'its sheet, segments and readiness.</p>';
     rows.forEach(p=>{
       const el=document.createElement('div'); el.className='stage';
       const pct=p.total?Math.round(100*p.answered/p.total):0;
@@ -1759,6 +1761,7 @@ async function loadProducts(){
         · <b>${p.segments}</b> segment(s), ${p.active_segments} active
         ${p.missing_required?` · <b style=color:var(--signal)>${p.missing_required} required blank</b>`:''}</small>
         ${p.definition?`<small style="display:block;margin-top:4px">${esc(p.definition)}</small>`:''}`;
+      el.title='Open this product sheet';
       el.onclick=()=>openSheet(p.project,p.product);
       box.appendChild(el);
     });
@@ -2188,18 +2191,53 @@ async function saveSheet(){
 }
 $('#sheetsave').onclick=saveSheet; $('#sheetsave2').onclick=saveSheet;
 
+/* The create screen renders the schema's create-stage sections, so a merchant
+   enters what they already know in one pass instead of creating a shell and
+   hunting for where the rest goes. Post-research fields are deliberately absent:
+   the spec is explicit that nobody should be asked to guess a buyer, a pain or a
+   position before research exists. */
+let NEWDOC=null;
+function renderNewProduct(){
+  const box=$('#np_form'); if(!box||!PSCHEMA) return;
+  if(box.dataset.built) return;
+  NEWDOC=blankProductDoc();
+  box.innerHTML='';
+  const keys=new Set(PSCHEMA.create_sections||[]);
+  (PSCHEMA.product||[]).filter(sec=>keys.has(sec.key)).forEach(sec=>{
+    box.appendChild(sectionEl(sec, NEWDOC[sec.key], sec.key==='identity'));
+  });
+  box.dataset.built='1';
+}
+function blankProductDoc(){
+  const d={};
+  (PSCHEMA.product||[]).forEach(sec=>{ d[sec.key]={};
+    sec.fields.forEach(f=>d[sec.key][f.key]=
+      {value:(f.kind==='list'||f.kind==='table')?[]:'',state:'empty',
+       source:'',ref:'',confidence:''});});
+  return d;
+}
+
 $('#np_go').onclick=async()=>{
-  const key=$('#np_key').value.trim(), name=$('#np_name').value.trim();
+  const key=$('#np_key').value.trim();
   if(!key){ $('#np_msg').textContent='Give it a project key.'; return; }
-  $('#np_go').disabled=true;
+  const name=NEWDOC?cv(NEWDOC.identity.name).trim():'';
+  if(!name){ $('#np_msg').textContent='Give the product a name.'; return; }
+  $('#np_go').disabled=true; $('#np_msg').textContent='creating…';
   try{
     const j=await (await fetch('/project',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:key,product:name,market:$('#np_market').value.trim()})})).json();
-    if(j.error){ $('#np_msg').textContent='⚠ '+j.error; }
-    else{ $('#np_msg').textContent=`created ${j.project}`;
-      $('#np_key').value=$('#np_name').value=$('#np_market').value='';
-      await loadProducts(); }
+      body:JSON.stringify({name:key,product:name,market:''})})).json();
+    if(j.error){ $('#np_msg').textContent='⚠ '+j.error; $('#np_go').disabled=false; return; }
+    /* Everything typed above is merchant truth, so it is saved as entered
+       rather than left in the browser. */
+    const sv=await (await fetch('/product/save',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project:j.project,doc:NEWDOC})})).json();
+    if(sv.error){ $('#np_msg').textContent='created, but saving the details failed: '+sv.error; }
+    else $('#np_msg').textContent=`created ${j.project} — opening its sheet`;
+    $('#np_key').value=''; $('#np_form').dataset.built=''; renderNewProduct();
+    await loadProducts();
+    openSheet(j.project,'');
   }catch(e){ $('#np_msg').textContent='⚠ '+e; }
   $('#np_go').disabled=false;
 };
