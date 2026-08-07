@@ -172,11 +172,15 @@ def create_project(name, product, market):
     json.dump(facts, open(os.path.join(dest, "facts.json"), "w", encoding="utf-8"),
               indent=2)
 
-    # Seed the sheet with the two things we already know, so the Product tab
-    # opens on a form that is started rather than untouched.
-    doc = products.blank()
-    doc["identity"]["name"] = product or name
-    products.save(name, doc)
+    # Seed only what we were actually told. The market line is a pre-research
+    # guess about buyers, so it is stored as a hypothesis rather than as fact —
+    # it must not read as Customer Truth until research validates it.
+    doc = products.blank_product()
+    doc["identity"]["name"] = products.cell(product or name, "user_approved", "merchant")
+    if market:
+        doc["hypothesis"]["guess"] = products.cell(
+            market, "unvalidated_hypothesis", "user")
+    products.save(name, products.slugify(product or name)[:40], doc)
     return cfg
 
 
@@ -972,18 +976,50 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
   <div class=card id=sheetcard hidden>
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px">
       <div>
-        <h2 style="margin:0" id=sheettitle>Product sheet</h2>
+        <h2 style="margin:0" id=sheettitle>Product</h2>
         <p class=hint style="margin:4px 0 0" id=sheetstate></p>
       </div>
       <div style="display:flex;gap:9px;white-space:nowrap">
         <button class="btn ghost" id=sheetclose>Close</button>
-        <button class=btn id=sheetsave>Save sheet</button>
+        <button class=btn id=sheetsave>Save</button>
       </div>
     </div>
-    <div id=sheetmissing style="margin-top:12px"></div>
-    <div id=sheetform style="margin-top:14px"></div>
+
+    <div class=tabs style="margin:14px 0 0;gap:6px">
+      <button class="tab on" data-pt=truth>Product truth</button>
+      <button class=tab data-pt=segments>Segments</button>
+      <button class=tab data-pt=ready>Readiness</button>
+    </div>
+
+    <div id=pt-truth>
+      <p class=hint>Layer 1 — true regardless of who it is sold to. Nothing
+        customer-related belongs here; that lives on each segment.</p>
+      <div id=sheetmissing></div>
+      <div id=sheetform style="margin-top:12px"></div>
+    </div>
+
+    <div id=pt-segments class=hide>
+      <p class=hint>Layers 2 and 3 — each segment carries its own research and its
+        own strategy. A product legitimately has several, with different problems
+        and different positioning.</p>
+      <div style="display:flex;gap:9px;align-items:center;margin:10px 0">
+        <input id=segnew placeholder="new segment name" style="flex:1">
+        <button class="btn ghost" id=segadd style=white-space:nowrap>Add segment</button>
+        <button class="btn ghost" id=segimport style=white-space:nowrap>Import from pipeline</button>
+      </div>
+      <p class=hint id=segmsg style="margin:0 0 10px"></p>
+      <div id=seglist></div>
+    </div>
+
+    <div id=pt-ready class=hide>
+      <p class=hint>What each stage can actually run on. Readiness differs per
+        segment on purpose — a barely-researched segment must not inherit a
+        well-researched one's green light.</p>
+      <div id=readybox></div>
+    </div>
+
     <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
-      <button class=btn id=sheetsave2>Save sheet</button>
+      <button class=btn id=sheetsave2>Save</button>
       <span class=hint id=sheetmsg style="margin:0"></span>
     </div>
   </div>
@@ -1644,9 +1680,17 @@ $('#pmgo').onclick=async()=>{
 };
 
 // ---------- product ----------
-let PSCHEMA=[], PDOC=null, PPROJ='';
+/* Three layers, three editors: Product Truth is global to the product, each
+   Segment carries its own customer truth and strategy, and readiness is derived
+   from both. Field values are cells {value,state,source,...} so provenance
+   survives a round-trip through the form. */
+let PSCHEMA=null, PDOC=null, PSEGS=[], PPROJ='', PPRODUCT='', PPIPESEGS=[];
 
-fetch('/product/schema').then(r=>r.json()).then(j=>{PSCHEMA=j.sections||[];});
+fetch('/product/schema').then(r=>r.json()).then(j=>{PSCHEMA=j;});
+
+const cv=c=>(c&&typeof c==='object'&&'value' in c)?c.value:(c===undefined?'':c);
+function setcv(c,v){ if(c&&typeof c==='object'&&'value' in c){ c.value=v;
+  if(c.state==='empty'||!c.state) c.state='user_approved'; } return c; }
 
 async function loadProducts(){
   const box=$('#prodlist');
@@ -1660,112 +1704,211 @@ async function loadProducts(){
       const pct=p.total?Math.round(100*p.answered/p.total):0;
       const verdict=p.verdict?`<span class=costs>${esc(p.verdict)}</span>`:'';
       const score=(p.score!==null&&p.score!==undefined)?` · score ${p.score}/10`:'';
-      el.innerHTML=`<b>${esc(p.name||p.project)} ${verdict}</b>
-        <small>${esc(p.project)} · ${p.answered}/${p.total} fields (${pct}%)${score}
+      el.innerHTML=`<b>${esc(p.name||p.product)} ${verdict}</b>
+        <small>${esc(p.project)} / ${esc(p.product)} · truth ${p.answered}/${p.total} (${pct}%)${score}
+        · <b>${p.segments}</b> segment(s), ${p.active_segments} active
         ${p.missing_required?` · <b style=color:var(--signal)>${p.missing_required} required blank</b>`:''}</small>
         ${p.definition?`<small style="display:block;margin-top:4px">${esc(p.definition)}</small>`:''}`;
-      el.onclick=()=>openSheet(p.project);
+      el.onclick=()=>openSheet(p.project,p.product);
       box.appendChild(el);
     });
   }catch(e){ box.innerHTML=`<p class=hint>⚠ ${e}</p>`; }
 }
 
-async function openSheet(proj){
-  const j=await (await fetch('/product?project='+encodeURIComponent(proj))).json();
+async function openSheet(proj,prod){
+  const j=await (await fetch(`/product?project=${encodeURIComponent(proj)}&product=${encodeURIComponent(prod||'')}`)).json();
   if(j.error){ alert(j.error); return; }
-  PPROJ=proj; PDOC=j.doc;
+  PPROJ=proj; PPRODUCT=j.product; PDOC=j.doc; PSEGS=j.segments||[];
+  PPIPESEGS=j.pipeline_segments||[];
   $('#sheetcard').hidden=false;
-  $('#sheettitle').textContent=(PDOC.identity&&PDOC.identity.name)||proj;
-  renderSheet(); updateSheetState(j.answered,j.total,j.missing_required);
+  $('#sheettitle').textContent=cv(PDOC.identity.name)||j.product;
+  renderTruth(); renderSegments(); renderReady(j.readiness);
+  updateSheetState(j.answered,j.total,j.missing_required);
   $('#sheetcard').scrollIntoView({behavior:'smooth',block:'start'});
 }
-$('#sheetclose').onclick=()=>{ $('#sheetcard').hidden=true; PDOC=null; PPROJ=''; };
+$('#sheetclose').onclick=()=>{ $('#sheetcard').hidden=true; PDOC=null; PSEGS=[]; };
+
+$$('[data-pt]').forEach(b=>b.onclick=()=>{
+  $$('[data-pt]').forEach(x=>x.classList.toggle('on',x===b));
+  ['truth','segments','ready'].forEach(k=>
+    $('#pt-'+k).classList.toggle('hide',k!==b.dataset.pt));
+});
 
 function updateSheetState(a,t,missing){
-  $('#sheetstate').textContent=`${PPROJ} · ${a}/${t} fields answered`;
+  $('#sheetstate').textContent=`${PPROJ} / ${PPRODUCT} · product truth ${a}/${t} · ${PSEGS.length} segment(s)`;
   const m=$('#sheetmissing');
   if(!missing||!missing.length){ m.innerHTML=''; return; }
   m.innerHTML=`<div style="background:#FFF8F1;border:1px solid #E0A87A;border-radius:11px;
-    padding:12px 14px"><b style=font-size:13.5px>${missing.length} required field(s) still blank</b>
-    <div style="font-size:13px;margin-top:6px;line-height:1.6">${
-      missing.map(x=>esc(x)).join('<br>')}</div>
-    <div class=hint style="margin:8px 0 0">These are listed in the rendered sheet as
-      unanswered, so the model treats them as unknown rather than guessing.</div></div>`;
+    padding:12px 14px"><b style=font-size:13.5px>${missing.length} required product fact(s) still blank</b>
+    <div style="font-size:13px;margin-top:6px;line-height:1.6">${missing.map(esc).join('<br>')}</div>
+    <div class=hint style="margin:8px 0 0">These are Product Truth. Until they are
+      answered the pipeline treats them as unknown — and an unanswered fact cannot
+      license a claim.</div></div>`;
 }
 
-/* The form is rendered from the schema, so a new field appears here by being
-   added to products.py — there is no second copy of the field list to keep. */
-function renderSheet(){
+function renderTruth(){
   const box=$('#sheetform'); box.innerHTML='';
-  PSCHEMA.forEach(sec=>{
-    const d=document.createElement('details'); d.className='lvg';
-    const vals=PDOC[sec.key]||{};
-    const done=sec.fields.filter(f=>{const v=vals[f.key];
-      return Array.isArray(v)?v.length:String(v||'').trim();}).length;
-    d.innerHTML=`<summary>${esc(sec.title)}
-      <span class=lvn>${done}/${sec.fields.length}</span></summary>`;
-    const body=document.createElement('div'); body.className='body';
-    if(sec.help) body.innerHTML=`<p class=hint style="margin:0 0 12px">${esc(sec.help)}</p>`;
-    sec.fields.forEach(f=>body.appendChild(fieldRow(sec,f,vals[f.key])));
-    d.appendChild(body); box.appendChild(d);
+  (PSCHEMA.product||[]).forEach(sec=>{
+    box.appendChild(sectionEl(sec, PDOC[sec.key], sec.stage==='create'));
   });
 }
 
-function fieldRow(sec,f,val){
+/* One collapsible section, generic over the schema. */
+function sectionEl(sec, vals, openByDefault){
+  const d=document.createElement('details'); d.className='lvg';
+  const done=sec.fields.filter(f=>{const v=cv(vals[f.key]);
+    return Array.isArray(v)?v.length:String(v||'').trim();}).length;
+  d.innerHTML=`<summary>${esc(sec.title)}
+    <span class=lvn>${done}/${sec.fields.length}</span></summary>`;
+  const body=document.createElement('div'); body.className='body';
+  if(sec.help) body.innerHTML=`<p class=hint style="margin:0 0 12px">${esc(sec.help)}</p>`;
+  sec.fields.forEach(f=>body.appendChild(cellRow(vals,f)));
+  d.appendChild(body);
+  if(openByDefault&&done<sec.fields.length) d.open=true;
+  return d;
+}
+
+function cellRow(vals,f){
   const row=document.createElement('div'); row.className='lev';
+  const c=vals[f.key], val=cv(c);
   const req=f.required?' <span class=req>*</span>':'';
-  const lab=`<label>${esc(f.label)}${req}</label>`;
-  const path=`${sec.key}.${f.key}`;
+  const state=(c&&c.state)||'empty';
+  const chip=state!=='empty'&&state!=='user_approved'
+    ? ` <span class=lvn>${esc(state.replace(/_/g,' '))}</span>`:'';
+  row.innerHTML=`<label>${esc(f.label)}${req}${chip}</label>`;
+  let ctl;
   if(f.kind==='table'){
-    row.innerHTML=lab;
-    const t=document.createElement('div'); t.dataset.table=path;
-    const cols=f.columns;
+    const t=document.createElement('div'); const cols=f.columns;
+    if(!Array.isArray(cv(c))||!cv(c).length)
+      setcv(c,(f.rows_hint||[]).map(h=>[h,...cols.slice(1).map(()=>'')]));
     const draw=()=>{
-      const rows=(PDOC[sec.key][f.key]||[]);
+      const rows=cv(c)||[];
       t.innerHTML=`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">
-        <thead><tr>${cols.map(c=>`<th style="text-align:left;padding:4px 6px;border-bottom:1.5px solid var(--line)">${esc(c)}</th>`).join('')}<th></th></tr></thead>
-        <tbody>${rows.map((r,i)=>`<tr>${cols.map((c,ci)=>
+        <thead><tr>${cols.map(x=>`<th style="text-align:left;padding:4px 6px;border-bottom:1.5px solid var(--line)">${esc(x)}</th>`).join('')}<th></th></tr></thead>
+        <tbody>${rows.map((r,i)=>`<tr>${cols.map((x,ci)=>
           `<td style="padding:3px 4px"><input data-tr="${i}" data-tc="${ci}" value="${esc(r[ci]||'')}"></td>`).join('')}
-          <td style="padding:3px 4px"><a href=# data-del="${i}" style="color:var(--soft)">×</a></td></tr>`).join('')}</tbody></table></div>
+          <td><a href=# data-del="${i}" style="color:var(--soft)">×</a></td></tr>`).join('')}</tbody></table></div>
         <a href=# data-add style="font-size:13px;color:var(--accent)">+ add row</a>`;
       t.querySelectorAll('input[data-tr]').forEach(inp=>inp.oninput=()=>{
-        PDOC[sec.key][f.key][+inp.dataset.tr][+inp.dataset.tc]=inp.value;});
+        cv(c)[+inp.dataset.tr][+inp.dataset.tc]=inp.value; if(c.state==='empty')c.state='user_approved';});
       t.querySelectorAll('[data-del]').forEach(a=>a.onclick=e=>{e.preventDefault();
-        PDOC[sec.key][f.key].splice(+a.dataset.del,1); draw();});
+        cv(c).splice(+a.dataset.del,1); draw();});
       t.querySelector('[data-add]').onclick=e=>{e.preventDefault();
-        PDOC[sec.key][f.key]=PDOC[sec.key][f.key]||[];
-        PDOC[sec.key][f.key].push(cols.map(()=>'')); draw();};
+        cv(c).push(cols.map(()=>'')); draw();};
     };
-    if(!PDOC[sec.key][f.key]||!PDOC[sec.key][f.key].length){
-      // Seed the rows the schema suggests, so the shape of the answer is visible.
-      PDOC[sec.key][f.key]=(f.rows_hint||[]).map(h=>[h,...cols.slice(1).map(()=>'')]);
-    }
-    draw(); row.appendChild(t);
-    return row;
+    draw(); row.appendChild(t); return row;
   }
-  let ctl;
   if(f.kind==='choice'){
-    ctl=`<select data-p="${path}"><option value="">—</option>`+
-        f.options.map(o=>`<option${val===o?' selected':''}>${esc(o)}</option>`).join('')+'</select>';
+    ctl=`<select><option value="">—</option>`+
+      f.options.map(o=>`<option${val===o?' selected':''}>${esc(o)}</option>`).join('')+`</select>`;
   }else if(f.kind==='score'){
-    ctl=`<input type=number min=0 max=10 data-p="${path}" value="${esc(val||'')}">`;
+    ctl=`<input type=number min=0 max=10 value="${esc(val||'')}">`;
   }else if(f.kind==='list'){
-    ctl=`<textarea data-p="${path}" data-list=1 rows=4 placeholder="${esc(f.placeholder||'one per line')}">${
-      esc((val||[]).join('\n'))}</textarea>`;
+    ctl=`<textarea data-list=1 rows=3 placeholder="${esc(f.placeholder||'one per line')}">${esc((val||[]).join('\n'))}</textarea>`;
   }else if(f.kind==='long'){
-    ctl=`<textarea data-p="${path}" rows=3 placeholder="${esc(f.placeholder||'')}">${esc(val||'')}</textarea>`;
+    ctl=`<textarea rows=3 placeholder="${esc(f.placeholder||'')}">${esc(val||'')}</textarea>`;
   }else{
-    ctl=`<input data-p="${path}" value="${esc(val||'')}" placeholder="${esc(f.placeholder||'')}">`;
+    ctl=`<input value="${esc(val||'')}" placeholder="${esc(f.placeholder||'')}">`;
   }
-  row.innerHTML=lab+ctl;
-  const el=row.querySelector('[data-p]');
-  const sync=()=>{
-    const [sk,fk]=path.split('.');
-    PDOC[sk][fk]=el.dataset.list?el.value.split('\n').map(s=>s.trim()).filter(Boolean):el.value;
-    row.classList.toggle('set',!!(el.dataset.list?PDOC[sk][fk].length:el.value.trim()));
+  row.insertAdjacentHTML('beforeend',ctl);
+  const el=row.querySelector('input,textarea,select');
+  el.oninput=el.onchange=()=>{
+    setcv(c, el.dataset.list?el.value.split('\n').map(x=>x.trim()).filter(Boolean):el.value);
+    row.classList.toggle('set',!!(el.dataset.list?cv(c).length:el.value.trim()));
   };
-  el.oninput=el.onchange=sync; sync();
+  row.classList.toggle('set',!!(Array.isArray(val)?val.length:String(val||'').trim()));
   return row;
+}
+
+/* ---- segments ---- */
+function blankSegDoc(){
+  const d={};
+  (PSCHEMA.segment||[]).forEach(sec=>{ d[sec.key]={};
+    sec.fields.forEach(f=>d[sec.key][f.key]=
+      {value:(f.kind==='list'||f.kind==='table')?[]:'',state:'empty',source:'',ref:'',confidence:''});});
+  return d;
+}
+function renderSegments(){
+  const box=$('#seglist'); box.innerHTML='';
+  if(!PSEGS.length){ box.innerHTML='<p class=hint>No segments yet. Research discovers '+
+    'these — add one, or import a validated segment from the pipeline.</p>'; return; }
+  PSEGS.forEach((seg,i)=>{
+    const name=cv(seg.doc.identity.name)||seg.slug;
+    const status=cv(seg.doc.identity.status)||'Discovered';
+    const compat=cv(seg.doc.compatibility.status)||'';
+    const d=document.createElement('details'); d.className='lvg';
+    d.innerHTML=`<summary>${esc(name)}
+      <span class=lvn>${esc(status)}${compat?' · '+esc(compat):''}</span></summary>`;
+    const body=document.createElement('div'); body.className='body';
+    if(compat==='Incompatible') body.innerHTML=
+      `<p class=hint style="color:var(--signal);margin:0 0 10px"><b>Marked incompatible</b>
+       — PICC and concepts are blocked for this pair.</p>`;
+    (PSCHEMA.segment||[]).forEach(sec=>
+      body.appendChild(sectionEl(sec, seg.doc[sec.key], sec.key==='identity')));
+    const rm=document.createElement('a'); rm.href='#'; rm.textContent='remove this segment';
+    rm.style.cssText='color:var(--soft);font-size:13px';
+    rm.onclick=e=>{e.preventDefault();
+      if(confirm(`Remove segment "${name}"? Its research files are not deleted.`)){
+        PSEGS.splice(i,1); renderSegments(); }};
+    body.appendChild(rm);
+    d.appendChild(body); box.appendChild(d);
+  });
+}
+$('#segadd').onclick=()=>{
+  const n=$('#segnew').value.trim();
+  if(!n){ $('#segmsg').textContent='Give the segment a name.'; return; }
+  const doc=blankSegDoc();
+  doc.identity.name={value:n,state:'user_approved',source:'user',ref:'',confidence:''};
+  doc.identity.status={value:'Discovered',state:'user_approved',source:'user',ref:'',confidence:''};
+  PSEGS.push({slug:'',doc}); $('#segnew').value='';
+  $('#segmsg').textContent=`added "${n}" — save to persist`; renderSegments();
+};
+/* The pipeline already discovers segments; importing one links the Product
+   segment to the evidence and extractions that already exist for it. */
+$('#segimport').onclick=()=>{
+  const have=new Set(PSEGS.map(s=>cv(s.doc.identity.evidence_slug)).filter(Boolean));
+  const avail=PPIPESEGS.filter(s=>!have.has(s));
+  if(!avail.length){ $('#segmsg').textContent=
+    PPIPESEGS.length?'Every pipeline segment is already linked.'
+                    :'No pipeline segments yet — run the segment stage first.'; return; }
+  avail.forEach(slug=>{
+    const doc=blankSegDoc();
+    doc.identity.name={value:slug.replace(/_/g,' '),state:'research_derived',source:'research',ref:'',confidence:''};
+    doc.identity.evidence_slug={value:slug,state:'research_derived',source:'research',ref:'',confidence:''};
+    doc.identity.status={value:'Discovered',state:'research_derived',source:'research',ref:'',confidence:''};
+    PSEGS.push({slug:'',doc});
+  });
+  $('#segmsg').textContent=`imported ${avail.length} pipeline segment(s) — review and save`;
+  renderSegments();
+};
+
+function renderReady(r){
+  const box=$('#readybox');
+  if(!r){ box.innerHTML=''; return; }
+  const bar=v=>`<div style="background:var(--surface);border-radius:5px;height:7px;width:110px;
+     display:inline-block;vertical-align:middle;overflow:hidden">
+     <div style="background:${v>=80?'var(--accent)':v>=40?'#E0A87A':'var(--signal)'};
+     height:100%;width:${v}%"></div></div> ${v}%`;
+  let h=`<p style="font-size:13.5px;margin:0 0 10px"><b>Product facts</b> ${bar(r.product_facts)}</p>`;
+  if(!r.segments.length){ h+='<p class=hint>No segments — nothing to be ready for yet.</p>'; }
+  else{
+    h+=`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr>${['Segment','Status','Compatibility','Research','Strategy','PICC','Concepts','Briefs']
+        .map(c=>`<th style="text-align:left;padding:5px 7px;border-bottom:1.5px solid var(--line)">${c}</th>`).join('')}</tr></thead><tbody>`;
+    r.segments.forEach(s=>{
+      h+=`<tr${s.blocked?' style="opacity:.55"':''}>
+        <td style="padding:5px 7px">${esc(s.name||s.slug)}</td>
+        <td style="padding:5px 7px">${esc(s.status||'—')}</td>
+        <td style="padding:5px 7px">${esc(s.compatibility||'—')}</td>
+        <td style="padding:5px 7px">${bar(s.research)}</td>
+        <td style="padding:5px 7px">${bar(s.strategy)}</td>
+        <td style="padding:5px 7px">${s.blocked?'blocked':bar(s.picc)}</td>
+        <td style="padding:5px 7px">${s.blocked?'blocked':bar(s.concepts)}</td>
+        <td style="padding:5px 7px">${s.blocked?'blocked':bar(s.briefs)}</td></tr>`;
+    });
+    h+='</tbody></table></div>';
+  }
+  box.innerHTML=h;
 }
 
 async function saveSheet(){
@@ -1774,11 +1917,11 @@ async function saveSheet(){
   try{
     const j=await (await fetch('/product/save',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({project:PPROJ,doc:PDOC})})).json();
+      body:JSON.stringify({project:PPROJ,product:PPRODUCT,doc:PDOC,segments:PSEGS})})).json();
     if(j.error){ $('#sheetmsg').textContent='⚠ '+j.error; return; }
     $('#sheetmsg').textContent=`saved → ${j.sheet}`;
     updateSheetState(j.answered,j.total,j.missing_required);
-    renderSheet(); loadProducts();
+    renderReady(j.readiness); loadProducts();
   }catch(e){ $('#sheetmsg').textContent='⚠ '+e; }
 }
 $('#sheetsave').onclick=saveSheet; $('#sheetsave2').onclick=saveSheet;
@@ -1794,7 +1937,7 @@ $('#np_go').onclick=async()=>{
     if(j.error){ $('#np_msg').textContent='⚠ '+j.error; }
     else{ $('#np_msg').textContent=`created ${j.project}`;
       $('#np_key').value=$('#np_name').value=$('#np_market').value='';
-      await loadProducts(); openSheet(j.project); }
+      await loadProducts(); }
   }catch(e){ $('#np_msg').textContent='⚠ '+e; }
   $('#np_go').disabled=false;
 };
@@ -2337,22 +2480,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             rows = []
             for p in projects():
                 try:
-                    rows.append(products.summary(p))
+                    products.migrate_legacy(p)
+                    for prod in products.list_products(p):
+                        rows.append(products.summary(p, prod))
                 except products.ProductError:
                     continue
             return self._send(200, json.dumps({"products": rows}))
         if u.path == "/product":
-            n = urllib.parse.parse_qs(u.query).get("project", [""])[0]
+            q = urllib.parse.parse_qs(u.query)
+            n = q.get("project", [""])[0]
             try:
-                doc = products.load(n)
+                products.migrate_legacy(n)
+                prod = products.resolve_product(n, q.get("product", [""])[0])
+                doc = products.load(n, prod)
+                segs = products.load_segments(n, prod)
+                ready = products.readiness(n, prod)
             except products.ProductError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
-            a, t = products.completeness(doc)
+            a, t = products.completeness(doc, products.PRODUCT_SECTIONS)
             return self._send(200, json.dumps(
-                {"project": n, "doc": doc, "answered": a, "total": t,
-                 "missing_required": products.missing_required(doc)}))
+                {"project": n, "product": prod, "doc": doc, "segments": segs,
+                 "readiness": ready, "answered": a, "total": t,
+                 "pipeline_segments": segments(n),
+                 "missing_required": products.missing_required(
+                     doc, products.PRODUCT_SECTIONS)}))
         if u.path == "/product/schema":
-            return self._send(200, json.dumps({"sections": products.schema()}))
+            return self._send(200, json.dumps(products.schema()))
         if u.path == "/piccs":
             pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             return self._send(200, json.dumps(
@@ -2548,15 +2701,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"error": str(e)}))
         if path == "/product/save":
             req = self._json()
+            proj = req.get("project", "")
             try:
-                doc = products.save(req.get("project", ""), req.get("doc") or {})
+                prod = products.resolve_product(proj, req.get("product", ""))
+                doc = products.save(proj, prod, req.get("doc") or {})
+                if req.get("segments") is not None:
+                    products.save_segments(proj, prod, req["segments"])
+                ready = products.readiness(proj, prod)
             except products.ProductError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
-            a, t = products.completeness(doc)
+            a, t = products.completeness(doc, products.PRODUCT_SECTIONS)
             return self._send(200, json.dumps(
-                {"ok": True, "answered": a, "total": t,
-                 "missing_required": products.missing_required(doc),
-                 "sheet": os.path.relpath(products.sheet_path(req["project"]), ROOT)}))
+                {"ok": True, "answered": a, "total": t, "readiness": ready,
+                 "missing_required": products.missing_required(
+                     doc, products.PRODUCT_SECTIONS),
+                 "sheet": os.path.relpath(products.sheet_path(proj, prod), ROOT)}))
         if path == "/prompt":
             return self._prompt(self._json())
         if path == "/briefs":

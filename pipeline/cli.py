@@ -1102,11 +1102,13 @@ def cmd_picc(cfg, args):
     _, s27 = skill(27)
     prior = read_extractions(cfg, args.segment)
     cr = cfg["creative"]
+    seg_ctx = segment_context(cfg, args.segment, getattr(args, "product", None))
     prompt = f"""{s27}
 
-{product_context(cfg)}
+{product_context(cfg, product=getattr(args, "product", None))}
 
 ---
+{(seg_ctx + chr(10) + chr(10) + '---' + chr(10)) if seg_ctx else ''}
 
 Below are this segment's completed extraction outputs (skills 07-26).
 
@@ -1180,14 +1182,46 @@ def facts_path(cfg):
     return os.path.join(ROOT, p) if p else os.path.join(cfg["_dir"], "facts.json")
 
 
-def sheet_path(cfg):
-    """This project's product sheet, rendered from its product.json by the
-    Product tab. Same reasoning as facts: it belongs to one product."""
+def sheet_path(cfg, product=None):
+    """The active product's sheet, rendered from its product.json by the Product
+    tab. A project may hold several products, so this resolves which one: an
+    explicit --product wins, a project with exactly one needs no argument."""
     p = cfg.get("product_sheet")
-    return os.path.join(ROOT, p) if p else os.path.join(cfg["_dir"], "product_sheet.md")
+    if p:
+        return os.path.join(ROOT, p)
+    import products
+    try:
+        products.migrate_legacy(cfg["name"])
+        prod = products.resolve_product(cfg["name"], product)
+    except products.ProductError:
+        return os.path.join(cfg["_dir"], "product_sheet.md")   # legacy layout
+    return products.sheet_path(cfg["name"], prod)
 
 
-def product_context(cfg, sheet=True):
+def segment_context(cfg, segment, product=None):
+    """This segment's Customer Truth and strategy, if the Product tab has any.
+
+    Segment-scoped on purpose: one segment's research must not reach another's
+    ads. Returns "" when the segment has no sheet yet, so the pipeline still
+    runs on research alone rather than failing closed on an optional layer.
+    """
+    import products
+    p = os.path.join(cfg["_dir"], "segments", f"{segment}.md")   # legacy layout
+    try:
+        prod = products.resolve_product(cfg["name"], product)
+        cand = products.segment_sheet_path(cfg["name"], prod, segment)
+        if os.path.exists(cand):
+            p = cand
+    except products.ProductError:
+        pass
+    if not os.path.exists(p):
+        return ""
+    return ("SEGMENT STRATEGY — this segment's customer truth and the strategy "
+            "built from it. It applies to THIS segment only; do not carry it to "
+            "another.\n\n" + open(p, encoding="utf-8").read())
+
+
+def product_context(cfg, sheet=True, product=None):
     """What is being sold, for the stages that decide strategy and write copy.
 
     Until this existed, only the brief stage knew the product: picc and concepts
@@ -1213,7 +1247,7 @@ def product_context(cfg, sheet=True):
             + open(p, encoding="utf-8").read())
 
     if sheet:
-        p = sheet_path(cfg)
+        p = sheet_path(cfg, product)
         if os.path.exists(p):
             parts.append(
                 "PRODUCT SHEET — background for strategy: what the product is, how "
@@ -1270,10 +1304,11 @@ def cmd_concepts(cfg, args):
     n = getattr(args, "concepts", None) or cfg["creative"]["concepts_per_run"]
     hooks_n = getattr(args, "hooks", None) or 3
 
-    prompt = f"""{product_context(cfg, sheet=False)}
+    seg_ctx = segment_context(cfg, args.segment, getattr(args, "product", None))
+    prompt = f"""{product_context(cfg, sheet=False, product=getattr(args, "product", None))}
 
 ---
-
+{(seg_ctx + chr(10) + chr(10) + '---' + chr(10)) if seg_ctx else ''}
 Here is the completed PICC card and 5 angles for this segment:
 
 {card}
@@ -1368,7 +1403,7 @@ def cmd_brief(cfg, args):
 
 ---
 
-{product_context(cfg)}
+{product_context(cfg, product=getattr(args, "product", None))}
 
 ---
 
@@ -1485,6 +1520,9 @@ def main():
             s.add_argument("--preset", choices=sorted(PRESETS),
                            help="extraction depth: fast, standard, or deep (default: deep)")
             s.add_argument("--skills", help="explicit list, e.g. 7,8,14,18,24,25")
+        if name in ("picc", "concepts", "brief", "run"):
+            s.add_argument("--product", help="which product in this project to "
+                                             "build on (default: the only one)")
         if name in ("concepts", "run"):
             s.add_argument("--concepts", type=int, help="how many concepts")
             s.add_argument("--hooks", type=int, help="hooks per concept (default 3)")
