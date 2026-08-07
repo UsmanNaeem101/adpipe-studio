@@ -1145,6 +1145,7 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
     <div class=row style="margin-bottom:16px">
       <div><label>Project</label><select id=proj></select></div>
       <div><label>Segment</label><select id=seg></select></div>
+      <div id=prodwrap hidden><label>Product</label><select id=prod></select></div>
     </div>
     <div class=stagelist id=stages></div>
     <div id=ingestbox class="hide" style="margin-top:16px">
@@ -2380,6 +2381,8 @@ const STAGES=__STAGES__;
       const showSeg = s.name==='segment';
       $('#segvocbox').classList.toggle('hide',!showSeg);
       if(showSeg) loadVocFiles();
+      const wantsProduct = ['picc','concepts','brief','run'].includes(s.name);
+      $('#prodwrap').classList.toggle('hide',!wantsProduct);
       showOpts(s.name);
       $('#runbtn').disabled=false;
       $('#runhint').textContent=s.costs?'This stage calls the selected model API — tick the approval box.':'Free — pure code.';
@@ -2398,6 +2401,23 @@ async function loadSegs(){
   $('#seg').onchange=loadPiccs;
   if(stage&&stage.name==='segment')loadVocFiles();
   loadPiccs();
+  loadProds();
+}
+/* Stages that build on a product (PICC/concepts/briefs) need to know which
+   product this project's pipeline is running for, so the segment context and
+   product truth injected into the prompt are the right ones. */
+async function loadProds(){
+  const sel=$('#prod'); if(!sel) return;
+  const pr=$('#proj').value, was=sel.value;
+  sel.innerHTML='<option value="">— default product —</option>';
+  if(!pr) return;
+  try{
+    const j=await (await fetch('/products?project='+encodeURIComponent(pr))).json();
+    (j.products||[]).filter(x=>x.project===pr).forEach(x=>{
+      const o=document.createElement('option');
+      o.value=x.product; o.textContent=x.product; sel.appendChild(o);});
+    if(was&&[...sel.options].some(o=>o.value===was)) sel.value=was;
+  }catch(e){}
 }
 /* The concepts stage builds on exactly one PICC card. Default to the selected
    segment's own, but list every card in the project so a rewritten or set-aside
@@ -2457,6 +2477,7 @@ $('#runbtn').onclick=async()=>{
               rules_only:$('#rulesonly').checked,
               n_concepts:+$('#nconcepts').value||0, n_hooks:+$('#nhooks').value||0,
               picc:$('#piccsel')?$('#piccsel').value:'',
+              product:$('#prod')?$('#prod').value:'',
               n_briefs:+$('#nbriefs').value||0,
               provider:$('#provider')?$('#provider').value:'',
               model:$('#modelid')?$('#modelid').value.trim():''};
@@ -3409,6 +3430,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if stage in ("brief", "run"):
             if req.get("n_briefs"):
                 cmd += ["--briefs", str(int(req["n_briefs"]))]
+        # PICC/concepts/briefs build on a specific product in this project. Forward
+        # the one the operator picked; the CLI resolves the single product when "")
+        # is sent, so multi-product projects must make an explicit choice.
+        if stage in ("picc", "concepts", "brief", "run"):
+            if req.get("product"):
+                cmd += ["--product", str(req["product"])]
         if stage == "ingest":
             if req.get("rules_only"):
                 cmd.append("--rules-only")
