@@ -1104,6 +1104,10 @@ def cmd_picc(cfg, args):
     cr = cfg["creative"]
     prompt = f"""{s27}
 
+{product_context(cfg)}
+
+---
+
 Below are this segment's completed extraction outputs (skills 07-26).
 
 {prior}
@@ -1164,6 +1168,46 @@ CONCEPT_SCHEMA = {
 }
 
 
+def product_context(cfg, sheet=True):
+    """What is being sold, for the stages that decide strategy and write copy.
+
+    Until this existed, only the brief stage knew the product: picc and concepts
+    ranked barriers, chose angles and wrote headlines without ever being told
+    what the ad was for, which is how you get plausible copy for a product that
+    does not exist.
+
+    The two sources are kept apart on purpose. facts.json is the only thing that
+    licenses a number or a product claim — qa.py fails anything else — while the
+    product sheet is background for choosing an angle. Merging them would turn
+    240 lines of unconfirmed research into apparent permission to make claims,
+    so the prompt says which is which.
+    """
+    parts = [f"PRODUCT\n{cfg.get('product') or '(unspecified)'}",
+             f"MARKET\n{cfg.get('market') or '(unspecified)'}"]
+
+    if cfg.get("facts"):
+        p = os.path.join(ROOT, cfg["facts"])
+        if os.path.exists(p):
+            parts.append(
+                "APPROVED PRODUCT FACTS — the ONLY numbers and product claims that "
+                "may appear in an ad. Anything marked NEEDS INPUT is unconfirmed: "
+                "do not use it, and do not invent a value for it.\n\n"
+                + open(p, encoding="utf-8").read())
+
+    if sheet and cfg.get("product_sheet"):
+        p = os.path.join(ROOT, cfg["product_sheet"])
+        if os.path.exists(p):
+            parts.append(
+                "PRODUCT SHEET — background for strategy: what the product is, how "
+                "it actually works, who it suits, what it competes with, and where "
+                "the objections are. This is NOT a claims source. Any number or "
+                "claim here that is absent from the approved facts above is "
+                "unconfirmed and must not appear in an ad.\n\n"
+                + open(p, encoding="utf-8").read())
+
+    return "\n\n---\n\n".join(parts)
+
+
 def picc_path(cfg, segment, chosen=None):
     """Which PICC card the concepts stage should build on.
 
@@ -1208,7 +1252,11 @@ def cmd_concepts(cfg, args):
     n = getattr(args, "concepts", None) or cfg["creative"]["concepts_per_run"]
     hooks_n = getattr(args, "hooks", None) or 3
 
-    prompt = f"""Here is the completed PICC card and 5 angles for this segment:
+    prompt = f"""{product_context(cfg, sheet=False)}
+
+---
+
+Here is the completed PICC card and 5 angles for this segment:
 
 {card}
 
@@ -1294,17 +1342,15 @@ def cmd_brief(cfg, args):
     if not os.path.exists(cp):
         sys.exit(f"No concepts. Run: adpipe -p {cfg['name']} concepts {args.segment}")
     concepts = open(cp, encoding="utf-8").read()
-    facts = open(os.path.join(ROOT, cfg["facts"]), encoding="utf-8").read()
     n = getattr(args, "briefs", None) or cfg["creative"]["briefs_per_run"]
 
     prompt = f"""These are the approved concepts:
 
 {concepts}
 
-And the approved product facts (anything marked NEEDS INPUT is NOT yet usable in
-an ad — do not invent a value for it):
+---
 
-{facts}
+{product_context(cfg)}
 
 ---
 
