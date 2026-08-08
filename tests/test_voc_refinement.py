@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 
 import cli
 import llm
+import segmentation
 
 
 class VocRefinementTests(unittest.TestCase):
@@ -91,9 +92,9 @@ class VocRefinementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _voc, _rows, _groups, _summary, production, _audit = self.export(tmp)
         self.assertEqual(
-            list(production[0]), ["id", "text", "thread_id", "subreddit"])
+            list(production[0]), ["id", "text", "thread_id", "subreddit", "tier"])
         self.assertEqual(set(production[1]),
-                         {"id", "text", "subreddit", "thread_id"})
+                         {"id", "text", "subreddit", "thread_id", "tier"})
         for forbidden in ("evidence_id", "url", "title", "decision",
                           "retention_reasons", "rejection_reasons"):
             self.assertNotIn(forbidden, production[0])
@@ -106,6 +107,7 @@ class VocRefinementTests(unittest.TestCase):
             audit[0]["retention_reasons"],
             ["first_person_experience", "specific_problem"])
         self.assertEqual(audit[0]["dedup_groups"], groups)
+        self.assertEqual(audit[0]["tier"], "core")
         self.assertIn("duplicate_of", audit[1])
         self.assertNotIn("evidence_id", audit[0])
 
@@ -120,6 +122,8 @@ class VocRefinementTests(unittest.TestCase):
         self.assertEqual(
             (summary["input"], summary["production"], summary["audit"]),
             (2, 2, 2))
+        self.assertEqual(summary["tiers"],
+                         {"core": 1, "supporting": 1, "context": 0})
         self.assertEqual(production[0]["subreddit"], "ClusterHeadaches")
         self.assertEqual(production[0]["thread_id"], "1m1n7e5")
         self.assertIsNone(production[1]["subreddit"])
@@ -149,7 +153,8 @@ class VocRefinementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             voc, _rows, _groups = self.fixture(tmp)
             alternate = os.path.join(voc, "alternate.jsonl")
-            cli._write_jsonl(alternate, [{"id": "chosen", "text": "selected"}])
+            cli._write_jsonl(alternate, [{"id": "chosen", "text": "selected",
+                                          "tier": "context"}])
 
             cli.cmd_refine_voc({"_dir": tmp}, SimpleNamespace(source=alternate))
 
@@ -193,31 +198,67 @@ class VocRefinementTests(unittest.TestCase):
 
     def test_prompt_metrics_measure_the_actual_stage_formatters(self):
         rows = [{"id": 1, "text": "text", "thread_id": "abc",
-                 "subreddit": "Pain"}]
+                 "subreddit": "Pain", "tier": "core"}]
         metrics = cli.voc_prompt_view_metrics(rows)
         self.assertEqual(metrics["stage03_chars"],
-                         len(cli._stage03_corpus_text(rows)))
-        self.assertEqual(metrics["stage04_chars"],
+                         len(segmentation.evidence_text(rows, include_tier=True)))
+        self.assertEqual(metrics["stage04_raw_corpus_chars_avoided"],
                          len(cli._validation_corpus_text(rows)))
-        self.assertEqual(metrics["stage03_before_est_tokens"],
-                         metrics["stage03_est_tokens"])
-        self.assertEqual(metrics["stage03_reduction_pct"], 0.0)
-        self.assertLess(metrics["stage04_reduction_pct"], 0)
+        self.assertGreater(metrics["stage04_raw_corpus_est_tokens_avoided"], 0)
 
     def test_missing_source_metadata_does_not_break_refinement(self):
         with tempfile.TemporaryDirectory() as tmp:
             voc = os.path.join(tmp, "research", "voc")
             os.makedirs(voc)
             cli._write_jsonl(os.path.join(voc, "deduplicated_voc.jsonl"), [
-                {"id": 1, "text": "source is unavailable", "decision": "retain"}
+                {"id": 1, "text": "source is unavailable", "decision": "retain",
+                 "retention_reasons": ["customer_terminology"]}
             ])
             cli.refine_voc({"_dir": tmp}, announce=False)
             production = cli._read_jsonl(os.path.join(
                 voc, cli.PRODUCTION_VOC_FILE))
         self.assertEqual(production, [{
             "id": 1, "text": "source is unavailable",
-            "thread_id": None, "subreddit": None,
+            "thread_id": None, "subreddit": None, "tier": "context",
         }])
+
+    def test_generic_evidence_tier_mapping(self):
+        self.assertEqual(segmentation.evidence_tier({
+            "decision": "retain",
+            "retention_reasons": ["first_person_experience", "attempted_solution"],
+        }), "core")
+        self.assertEqual(segmentation.evidence_tier({
+            "decision": "retain",
+            "retention_reasons": ["third_person_observation", "belief"],
+        }), "supporting")
+        self.assertEqual(segmentation.evidence_tier({
+            "decision": "retain",
+            "retention_reasons": ["first_person_experience", "customer_terminology"],
+        }), "context")
+
+    def test_legacy_row_without_reasons_or_tier_fails_instead_of_guessing(self):
+        with self.assertRaisesRegex(ValueError, "neither Stage 01"):
+            segmentation.evidence_tier({"id": 1, "text": "legacy lean row"})
+
+    def test_rejected_record_never_enters_production_or_receives_tier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            voc = os.path.join(tmp, "research", "voc")
+            os.makedirs(voc)
+            cli._write_jsonl(os.path.join(voc, "deduplicated_voc.jsonl"), [
+                {"id": 1, "text": "same", "decision": "reject",
+                 "retention_reasons": [],
+                 "rejection_reasons": ["generic_acknowledgement"]},
+                {"id": 2, "text": "I tried a brace", "decision": "retain",
+                 "retention_reasons": ["first_person_experience",
+                                       "attempted_solution"],
+                 "rejection_reasons": []},
+            ])
+            cli.refine_voc({"_dir": tmp}, announce=False)
+            production = cli._read_jsonl(os.path.join(
+                voc, cli.PRODUCTION_VOC_FILE))
+            audit = cli._read_jsonl(os.path.join(voc, cli.AUDIT_VOC_FILE))
+        self.assertEqual([row["id"] for row in production], [2])
+        self.assertIsNone(audit[0]["tier"])
 
     def test_stage06_traceability_resolves_from_audit_without_prompt_leakage(self):
         production = [{"id": 1, "text": "exact", "thread_id": "abc",

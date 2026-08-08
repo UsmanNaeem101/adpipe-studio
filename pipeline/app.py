@@ -395,6 +395,15 @@ def project_outputs(project):
                    ("missing_evidence.jsonl", "06 missing")):
         entry("segment", lbl, os.path.join(voc, f))
 
+    discovery = paths.research(root, "segments", "discovery")
+    if os.path.isdir(discovery):
+        for base, _dirs, files in os.walk(discovery):
+            for f in sorted(files):
+                if f.endswith((".json", ".md")):
+                    path = os.path.join(base, f)
+                    rel = os.path.relpath(path, discovery)
+                    entry("segment", f"03 discovery · {rel}", path)
+
     ed = paths.evidence(root)
     if os.path.isdir(ed):
         for f in sorted(os.listdir(ed)):
@@ -632,6 +641,11 @@ def refine_voc_files(project):
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if not isinstance(first, dict) or not {"id", "text"} <= set(first):
+                continue
+            tierable = (first.get("decision") == "reject"
+                        or bool(first.get("retention_reasons"))
+                        or first.get("tier") in ("core", "supporting", "context"))
+            if not tierable:
                 continue
             stat = os.stat(path)
             rel = os.path.relpath(path, voc_dir)
@@ -1440,8 +1454,9 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
       <select id=refinevoc style="width:100%">
         <option value="">Loading refinable VOC files…</option>
       </select>
-      <p class=hint>Choose a project JSONL containing <code>id</code> and
-        <code>text</code>. The recommended input is the Stage 02 deduplicated file;
+      <p class=hint>Choose a project JSONL containing <code>id</code>,
+        <code>text</code>, and Stage 01 reasons or an existing tier. The recommended
+        input is the Stage 02 deduplicated file;
         refinement rewrites <code>production_voc.jsonl</code> and
         <code>audit_voc.jsonl</code>.</p>
     </div>

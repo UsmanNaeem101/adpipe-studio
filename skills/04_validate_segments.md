@@ -24,6 +24,11 @@ distinctiveness, messaging distinctiveness, and commercial actionability. Volume
 *one* input among nine — never the only one. Watch especially for a "segment" whose
 evidence all traces to a single thread; that's a conversation, not an audience.
 
+You receive compact candidate cards, deterministic Core/Supporting/Context counts,
+thread/subreddit counts, and bounded verbatim representative evidence. Treat the
+counts as code-computed facts; judge what they mean. Do not demand or reconstruct the
+entire raw corpus, and do not estimate prevalence from the sample excerpts.
+
 ## The five decisions
 
 ```

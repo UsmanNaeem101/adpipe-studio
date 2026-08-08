@@ -64,6 +64,7 @@ Then each evidence item, verbatim, with:
 
 ```
 evidence ID · source type · title · URL · original text (unaltered)
+· evidence tier (core / supporting / context)
 · assignment score · winning margin · primary cues · assignment rationale
 · thread ID / author ID / created date (where available)
 ```
@@ -103,6 +104,11 @@ research/segments/desk_workers/
 ```
 
 ## The downstream contract
+
+Preserve all three evidence tiers in each segment file. Core drives default frequency
+counts; Supporting corroborates or enriches; Context remains traceable but must not
+drive core frequency. Tier is evidence strength, not segment membership, so never drop
+an assigned item merely because it is Supporting or Context.
 
 Every extraction skill must: receive one segment evidence file, read it in full
 independently, extract only its one dimension, preserve traceability to evidence IDs,

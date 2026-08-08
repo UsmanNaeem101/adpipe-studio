@@ -17,20 +17,37 @@ record schema.
 exactly:
 
 ```json
-{"id": 272, "text": "I've had subsequent pain…", "thread_id": "1m1n7e5", "subreddit": "ClusterHeadaches"}
+{"id": 272, "text": "I've had subsequent pain…", "thread_id": "1m1n7e5", "subreddit": "ClusterHeadaches", "tier": "core"}
 ```
 
 Missing or non-standard Reddit URLs produce JSON `null` for both derived fields.
 No URL, title, filter decision, reason code, or deduplication metadata is sent in
-the production record.
+the production record. `tier` is the deterministic evidence-strength mapping from
+Stage 01's closed retention-reason vocabulary: `core`, `supporting`, or `context`.
 
 `audit_voc.jsonl` keeps `id`, `text`, URL/title provenance, the derived source
-fields, Stage 01 decision metadata, and any other upstream audit fields. When a
+fields, Stage 01 decision metadata, the canonical tier, and any other upstream audit
+fields. Rejected source rows remain auditable with a null tier but never enter
+production. When a
 surviving canonical record owns Stage 02 duplicate groups, the exact group objects
 are attached under `dedup_groups`.
 
-Both files contain the same number of records in the same order as the deduplicated
-input. Re-running against identical inputs produces identical bytes.
+For the normal retained/deduplicated input both files contain the same records in the
+same order. Re-running against identical inputs produces identical bytes.
+
+## Evidence tiers
+
+- `core`: first-person lived experience plus a concrete problem, context, solution,
+  product/competitor experience, outcome, decision signal, workaround, comparison,
+  or emotional signal.
+- `supporting`: substantive evidence without that direct-lived combination, including
+  third-person observations, beliefs, explanations, comparisons, and specific
+  problem/solution context.
+- `context`: remaining retained signal whose reason codes do not establish enough
+  specificity to drive discovery, such as terminology or a weakly specified personal
+  remark.
+
+The mapping is pure code in `pipeline/segmentation.py`; it makes no model call.
 
 ## URL derivation
 
@@ -50,14 +67,19 @@ without filtering, deduplication, provider setup, or model calls:
 ```
 
 Studio exposes the same choice on the Pipeline page and recommends
-`deduplicated_voc.jsonl`. Only project JSONL files containing `id` and `text` are
-listed. The command deterministically overwrites the two derived exports.
+`deduplicated_voc.jsonl`. Only project JSONL files containing `id`, `text`, and
+Stage 01 retention reasons or an existing canonical tier are listed. A legacy lean
+file without either cannot be tiered reliably and fails clearly instead of silently
+being labelled Context. The command deterministically overwrites the two derived
+exports.
 
 ## Downstream consumers
 
-- Stage 03 receives only production `id` and `text`.
-- Stage 04 receives the same text with compact `[t:thread] [r:subreddit]` tags so
-  its source/thread diversity test has the metadata it requires.
+- Stage 03A receives deterministic chunks of Core `id`, tier, and text only.
+- Stage 03 evidence expansion classifies Core, Supporting, and Context in bounded
+  chunks against the compact canonical catalogue.
+- Stage 04 receives compact candidate cards, deterministic metrics, and bounded
+  representative evidence rather than the raw corpus.
 - Stage 05 receives only production `id` and `text`.
 - Stage 06 joins `audit_voc.jsonl` locally for URL/title provenance and never sends
   those audit-only fields through the model stages.
@@ -73,18 +95,7 @@ planning estimate used by the OpenRouter client for the exact Stage 03 and Stage
 formatted strings. This is explicitly an estimate because tokenization is model and
 route specific; the request audit remains the source of actual provider token usage.
 
-Stage 03 already formatted the old rich records as `[id] text`, so its formatted
-input is byte-for-byte identical after this migration. For the live corpus reported
-at 408,552 provider-counted tokens:
-
-```
-before:    408,552 tokens
-after:     408,552 tokens
-reduction: 0.0%
-```
-
-The refinement materially reduces persisted size and prevents future metadata
-leakage, but it does not solve Stage 03's 408k-context architecture. Stage 04 now
-adds compact thread/subreddit tags because its existing skill explicitly evaluates
-thread and source diversity; replacing those per-record tags with aggregates would
-be a separate semantic redesign.
+The exporter reports the old monolithic Stage 03 view, the total Core evidence view
+that will be divided into token-sized 03A chunks, and the Stage 04 raw corpus now
+avoided. Candidate-dependent Stage 04 packet size is measured during `segment`, not
+guessed during refinement.

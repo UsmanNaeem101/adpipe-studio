@@ -1,9 +1,8 @@
 # Where every skill file runs
 
-All 27 prompts from
-`Business/Dropshipping/Documents/SDK v3 manual/markdown/` are copied to `skills/`
-in this project and wired to a stage. Verified against the code, not from memory —
-re-run the audit any time:
+The original 27 numbered skills are in `skills/` and wired to stages. Stage 03 is
+now an orchestration contract with 03A/03B/03E/03C production subskills for scalable
+discovery. Verified against the code, not from memory — re-run the audit any time:
 
 ```bash
 .venv/bin/python -c "
@@ -12,8 +11,8 @@ n=set(int(m) for m in re.findall(r'skill\((\d+)\)',src)) | set(range(7,27))
 print(sorted(set(range(1,28))-n) or 'all 27 wired')"
 ```
 
-The copies are byte-identical to your originals. If you edit a prompt in the SDK
-folder, re-copy it — nothing syncs automatically.
+The segmentation contracts intentionally differ from the old monolithic Skill 03.
+Nothing syncs automatically with an external SDK folder.
 
 ---
 
@@ -24,8 +23,11 @@ folder, re-copy it — nothing syncs automatically.
 | **01** filter_voc | `ingest` | `cmd_ingest()` | raw dump | `voc/retained_voc.jsonl` · `rejected_voc.jsonl` |
 | **02** deduplicate_voc | `ingest` | `cmd_ingest()` | retained | `voc/deduplicated_voc.jsonl` · `duplicate_groups.jsonl` |
 | deterministic refinement | `ingest` / `refine-voc` | `refine_voc()` | deduplicated + duplicate groups | `voc/production_voc.jsonl` · `audit_voc.jsonl` |
-| **03** discover_segments | `segment` | `cmd_segment()` | production corpus | `voc/candidate_segments.json` |
-| **04** validate_segments | `segment` | `cmd_segment()` | candidates | `voc/validated_segments.json` |
+| **03A** harvest candidates | `segment` | `cmd_segment()` | token-sized Core chunks | `research/segments/discovery/03a_chunk_candidates/` |
+| **03B** consolidate candidates | `segment` | `cmd_segment()` | compact 03A catalogue | `03b_consolidated_candidates.json` |
+| **03E** expand evidence | `segment` | `cmd_segment()` | candidate cards + evidence chunks | `03_candidate_evidence.json` |
+| **03C** novelty audit | `segment` | `cmd_segment()` | unexplained Core chunks | `03c_novelty_results.json` · `discovered_segments.json` |
+| **04** validate_segments | `segment` | `cmd_segment()` | compact cards + metrics + representatives | `voc/validated_segments.json` |
 | **05** assign_primary_segment | `segment` | `cmd_segment()` | validated + corpus | `voc/segment_assignments.jsonl` |
 | **06** build_segment_evidence_files | `segment` | `build_evidence_files()` | assignments | `evidence/<slug>.txt` + audit set |
 | **07–26** the 20 extractors | `extract` | `cmd_extract()` via `EXTRACTORS` | one evidence file | `extractions/<segment>/<skill>.md` |
@@ -39,7 +41,8 @@ dimension.
 
 ## Which run on the model, and why
 
-**25 of 27 are sent to the model.** Two are not, and here's the honest reasoning:
+Skills 01–05 and 07–27 contain model judgement; Stage 03 now invokes four bounded
+model subskills. Stage 06 remains code. Two special cases do not call a model:
 
 - **06 build_segment_evidence_files** is wholly mechanical — join by evidence ID,
   group, sort deterministically, emit, audit. It has no judgement in it, and its own
@@ -86,7 +89,8 @@ raw dump
   → voc/deduplicated_voc.jsonl      (02)   legacy copy: filtered_voc.jsonl
   → voc/production_voc.jsonl               deterministic lean export
   → voc/audit_voc.jsonl                    deterministic rich audit
-  → voc/candidate_segments.json     (03)
+  → research/segments/discovery/    (03A/03B/03E/03C intermediates)
+  → voc/candidate_segments.json     (03 compatibility copy of discovered_segments)
   → voc/validated_segments.json     (04)
   → voc/segment_assignments.jsonl   (05)
   → evidence/<slug>.txt             (06)   + unassigned_evidence.md,
@@ -97,8 +101,10 @@ raw dump
   → output/<segment>/01_picc_card.md (27)
 ```
 
-Each stage skips work already on disk, so a re-run resumes rather than repeating.
-`--rediscover` redoes 03/04, `--reassign` redoes 05, `--force` redoes extractions.
+Each segmentation chunk has an input fingerprint and skips completed work on rerun.
+Use `segment --from 03a|03b|03c|04|05|06` to rerun that substep and its downstream
+steps; `--rediscover` remains an alias for restarting at 03A and `--reassign` redoes
+05. `--force` redoes extractions.
 
 ---
 

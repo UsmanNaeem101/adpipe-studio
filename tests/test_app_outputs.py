@@ -26,7 +26,8 @@ class AppOutputTests(unittest.TestCase):
                 "duplicate_groups.jsonl", "candidate_segments.json"):
             with open(os.path.join(voc, name), "w", encoding="utf-8") as fh:
                 if name.endswith(".jsonl") and name != "duplicate_groups.jsonl":
-                    fh.write('{"id":"e1","text":"customer voice"}\n')
+                    fh.write('{"id":"e1","text":"customer voice",'
+                             '"tier":"core"}\n')
                 else:
                     fh.write("{}\n")
         stamp = 1_700_000_000
@@ -46,7 +47,10 @@ class AppOutputTests(unittest.TestCase):
 
     def test_refine_picker_lists_record_jsonl_and_recommends_deduplicated(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.make_project(tmp)
+            voc, _stamp = self.make_project(tmp)
+            with open(os.path.join(voc, "legacy_lean.jsonl"), "w",
+                      encoding="utf-8") as fh:
+                fh.write('{"id":"old","text":"no judgement metadata"}\n')
             with mock.patch.object(app, "ROOT", tmp):
                 files = app.refine_voc_files("shoulder")
 
@@ -54,6 +58,7 @@ class AppOutputTests(unittest.TestCase):
         self.assertTrue(files[0]["recommended"])
         self.assertIn("Recommended", files[0]["label"])
         self.assertNotIn("duplicate_groups.jsonl", [row["name"] for row in files])
+        self.assertNotIn("legacy_lean.jsonl", [row["name"] for row in files])
 
     def test_outputs_classify_ingest_final_and_additional_files(self):
         with tempfile.TemporaryDirectory() as tmp:
