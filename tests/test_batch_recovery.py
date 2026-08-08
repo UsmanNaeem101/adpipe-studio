@@ -703,6 +703,67 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(client.calls, [])
 
 
+class FailureModeReportingTests(unittest.TestCase):
+    """Truncated-mid-answer and nothing-written-at-all must not read the same.
+
+    The 77/83 run is the case: one reply stopped before writing anything (the
+    only shape that printed), and the rest stopped partway through the JSON,
+    which printed nothing at all. Both landed in one undifferentiated count, so
+    the run looked silent and then collapsed.
+    """
+
+    def test_truncated_and_empty_budget_stops_are_different_modes(self):
+        self.assertEqual(cli._failure_mode(llm.BatchResult("", "length")),
+                         "hit the output budget before writing anything")
+        self.assertEqual(
+            cli._failure_mode(llm.BatchResult('{"records":[{"evi', "length")),
+            "hit the output budget partway through the answer")
+
+    def test_other_modes_keep_their_own_names(self):
+        for result, mode in (
+                (llm.BatchResult("", "refusal"), "blocked by the provider"),
+                (llm.BatchResult("", "request_error:URLError"),
+                 "the request never completed"),
+                (llm.BatchResult("", "stop"), "returned an empty reply"),
+                (llm.BatchResult('{"nope":1}', "stop"), "returned the wrong shape")):
+            self.assertEqual(cli._failure_mode(result), mode)
+
+    def report(self, failures, total=83):
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            cli._report_failure_modes(failures, total, "records")
+        return buf.getvalue()
+
+    def test_report_counts_each_mode_separately(self):
+        j = llm.Job("f0000", "p", max_tokens=5060, reasoning_max_tokens=2000)
+        failures = ([(j, llm.BatchResult("", "length", 5060, 5060), "x")]
+                    + [(j, llm.BatchResult('{"records":[{"e', "length", 3000, 5060),
+                        "x") for _ in range(76)])
+        out = self.report(failures)
+        self.assertIn("77/83", out)
+        self.assertIn("76  hit the output budget partway through the answer", out)
+        self.assertIn("1  hit the output budget before writing anything", out)
+
+    def test_report_flags_reasoning_that_overran_the_ceiling_it_asked_for(self):
+        """The question the last run could not answer about itself."""
+        j = llm.Job("f0000", "p", max_tokens=5060, reasoning_max_tokens=2000)
+        out = self.report(
+            [(j, llm.BatchResult('{"rec', "length", 3400, 5060), "x")] * 5)
+        self.assertIn("median 3,400 reasoning tokens", out)
+        self.assertIn("OVER the ceiling", out)
+
+    def test_report_does_not_cry_overrun_when_reasoning_obeyed_the_ceiling(self):
+        j = llm.Job("f0000", "p", max_tokens=5060, reasoning_max_tokens=2000)
+        out = self.report(
+            [(j, llm.BatchResult('{"rec', "length", 1200, 5060), "x")] * 5)
+        self.assertNotIn("OVER the ceiling", out)
+
+    def test_report_omits_token_detail_when_usage_is_unreported(self):
+        j = llm.Job("f0000", "p", max_tokens=5060)
+        out = self.report([(j, llm.BatchResult("", "length"), "x")])
+        self.assertNotIn("reasoning tokens", out)
+
+
 class BudgetVisibilityTests(unittest.TestCase):
     """You cannot fix a budget you cannot see being spent.
 

@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -718,6 +719,49 @@ def _decode_into(decoded, job, result, key):
         return _failure_reason(result, str(e))
 
 
+def _failure_mode(result):
+    """The shortest true name for how one reply failed.
+
+    "Truncated mid-output" and "nothing written at all" are the same
+    `finish_reason` and different problems: the first says the answer did not
+    fit beside the reasoning, the second says the reasoning consumed the budget
+    outright. Only the first was ever announced, and only in the empty case — so
+    a run where 76 replies were cut off mid-JSON printed nothing until the totals
+    arrived, and then reported all of them as one undifferentiated number.
+    """
+    if result.stop_reason in NO_RETRY_STOP_REASONS:
+        return "blocked by the provider"
+    if (result.stop_reason or "").startswith("request_error"):
+        return "the request never completed"
+    if result.out_of_budget:
+        return ("hit the output budget before writing anything"
+                if not (result.text or "").strip()
+                else "hit the output budget partway through the answer")
+    if not (result.text or "").strip():
+        return "returned an empty reply"
+    return "returned the wrong shape"
+
+
+def _report_failure_modes(failures, total, key):
+    """Name the first-pass failure modes, with counts and what they cost."""
+    modes = Counter(_failure_mode(r) for _j, r, _x in failures)
+    print(f"  ! {len(failures)}/{total} {key} response(s) failed on the first pass:")
+    for mode, n in modes.most_common():
+        spent = [r for _j, r, _x in failures
+                 if _failure_mode(r) == mode and r.completion_tokens]
+        detail = ""
+        if spent:
+            # The median, not the mean: one outlier should not decide what the
+            # operator thinks the budget is being spent on.
+            reasoning = statistics.median(r.reasoning_tokens for r in spent)
+            asked = [j.reasoning_max_tokens for j, r, _x in failures
+                     if _failure_mode(r) == mode and j.reasoning_max_tokens]
+            over = (" — OVER the ceiling these requests asked for"
+                    if asked and reasoning > min(asked) else "")
+            detail = f" · median {reasoning:,.0f} reasoning tokens{over}"
+        print(f"      {n:>4}  {mode}{detail}")
+
+
 def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None):
     """Decode all jobs, recovering failed responses before failing the stage.
 
@@ -757,6 +801,8 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None):
     unexpected = sorted(set(results) - set(by_id))
     for job, result, reason in failures:
         _save_failure(diagnostics_dir, job, result, reason, "original")
+    if failures:
+        _report_failure_modes(failures, len(jobs), key)
 
     # ---- unfinished replies: re-run the original request with more room ------
     if failures and rerun is not None:
