@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 
 import auditlog
+import credentials
 from llm import BatchResult
 
 API = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -82,7 +83,13 @@ class Client:
         self.model = model or DEFAULT_MODEL
         self.effort = effort
         self.verbose = verbose
-        self.key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        try:
+            # An explicit constructor value is useful to callers that already
+            # resolved a key. Otherwise use the same env -> private-store
+            # precedence as the Studio backend and every other CLI provider.
+            self.key = api_key or credentials.resolve("openrouter")
+        except credentials.CredentialStoreError as error:
+            sys.exit(str(error))
         if not self.key:
             sys.exit(
                 "No OpenRouter key. Add one on the Settings tab of the studio, or:\n"

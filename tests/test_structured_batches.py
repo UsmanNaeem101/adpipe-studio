@@ -89,6 +89,7 @@ class StructuredBatchTests(unittest.TestCase):
         self.assertEqual(logged["response.json"]["text"], '{"records":[]}')
         self.assertEqual(
             logged["response.json"]["provider_response"]["usage"]["prompt_tokens"], 1)
+        self.assertNotIn("test-key", json.dumps(logged))
 
     def test_openrouter_batch_passes_each_job_schema(self):
         client = object.__new__(openrouter.Client)

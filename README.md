@@ -74,9 +74,15 @@ fires on everything gets ignored.
 
 ## Keys
 
-Paste them on the **Settings** tab. They're held in memory while the app runs and
-are never written into this folder. `ingest`, segment assignment, `qa` and `render`
-need no key at all.
+Paste a key once on the **Settings** tab and both Studio and the standalone CLI can
+use it. AdPipe saves credentials in a user-only local store outside every project
+and Git repository (`~/Library/Application Support/AdPipe/credentials.json` on
+macOS, or the platform config directory elsewhere); saved values are never sent
+back to the browser. `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and
+`OPENROUTER_API_KEY` environment variables override the corresponding saved
+value. Older browser-only Settings keys migrate automatically the next time the
+Studio loads, and are removed from browser storage only after the backend confirms
+the save. `ingest`, segment assignment, `qa` and `render` need no key at all.
 
 ## The stages
 

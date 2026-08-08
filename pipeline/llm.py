@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 
 import auditlog
+import credentials
 
 MODEL = "claude-opus-5"
 
@@ -187,9 +188,15 @@ class Client:
                 "…or run the CLI via ./.venv/bin/python."
             )
         self._sdk = anthropic
-        # Zero-arg constructor resolves ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN,
-        # or an `ant auth login` profile — don't demand an env var here.
-        self.client = anthropic.Anthropic()
+        try:
+            key = credentials.resolve("anthropic")
+        except credentials.CredentialStoreError as error:
+            sys.exit(str(error))
+        # Supplying the shared resolver's result enables the private AdPipe
+        # store. With no API key, retain the SDK's existing auth-token/profile
+        # support rather than narrowing accepted Anthropic credentials.
+        self.client = (anthropic.Anthropic(api_key=key) if key
+                       else anthropic.Anthropic())
         # The SDK doesn't fail on construction — it raises deep inside the first
         # request. Check here so a missing key is one clear line, not a traceback.
         if not (getattr(self.client, "api_key", None) or

@@ -7,9 +7,9 @@ Three tabs:
   Pipeline run any stage (ingest -> ... -> render) and watch the output live
   Settings paste your API keys
 
-Keys are typed into the UI and held in memory for the session. They are NEVER
-written into this project folder (which syncs to OneDrive). Optionally the browser
-can remember them in localStorage so you don't retype — that's opt-in and local.
+Keys saved in Settings go to AdPipe's private user-level credential store, outside
+every project and repository. The browser never receives a saved key; older
+localStorage credentials are migrated once and removed after a successful save.
 
 Start it by double-clicking `Ad Studio.command`, or:
     ./adpipe studio
@@ -47,6 +47,7 @@ import paths  # noqa: E402
 import enrich  # noqa: E402
 import synth  # noqa: E402
 import auditlog  # noqa: E402
+import credentials  # noqa: E402
 
 REFS = os.path.join(ROOT, "references")
 PORT = int(os.environ.get("STUDIO_PORT", "8765"))
@@ -66,11 +67,14 @@ INGEST_ADDITIONAL_FILES = (
     ("duplicate_groups.jsonl", "duplicate_groups.jsonl · 02 duplicate audit"),
 )
 
-# In-memory only. Never persisted server-side, never logged.
-KEYS = {"openai": os.environ.get("OPENAI_API_KEY", ""),
-        "anthropic": os.environ.get("ANTHROPIC_API_KEY", ""),
-        "openrouter": os.environ.get("OPENROUTER_API_KEY", "")}
 _lock = threading.Lock()
+
+
+def _credential_snapshot():
+    """Resolve current credentials without exposing them to browser responses."""
+    with _lock:
+        return credentials.resolve_all()
+
 
 STAGES = [
     ("ingest",   "Skills 01-02: filter + deduplicate",         True,  True),
@@ -1599,8 +1603,9 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
   </div>
   <div class=card style="max-width:760px">
     <h2>API keys</h2>
-    <p class=hint style="margin:0 0 16px">Held in memory while the app runs. Never written
-      into this project folder. Tick “remember” to keep them in this browser only.</p>
+    <p class=hint style="margin:0 0 16px">Saved in AdPipe's private user-level credential
+      store, outside projects and Git. Environment variables override saved values. Saved
+      keys are never returned to the browser.</p>
 
     <label>OpenAI — image generation (Remix tab)</label>
     <div class=keyrow>
@@ -1630,9 +1635,6 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 
     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
       <button class=btn id=savekeys>Save keys</button>
-      <label style="font-weight:500;font-size:14px;display:flex;gap:8px;align-items:center;margin:0">
-        <input type=checkbox id=remember style="width:auto"> Remember in this browser
-      </label>
       <button class="btn ghost" id=clearkeys>Clear</button>
     </div>
     <p class=hint id=keymsg></p>
@@ -1699,24 +1701,46 @@ async function pushKeys(){
   const r=await fetch('/keys',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)});
   const j=await r.json();
+  if(!r.ok||j.error){ $('#keymsg').textContent='Could not save keys: '+(j.error||r.status); return false; }
   setPill('openai',j.openai); setPill('anthropic',j.anthropic);
   setPill('openrouter',j.openrouter);
-  if($('#remember').checked) localStorage.setItem('adpipe_keys',JSON.stringify(body));
-  else localStorage.removeItem('adpipe_keys');
-  $('#keymsg').textContent='Saved '+new Date().toLocaleTimeString()+
-    ($('#remember').checked?' · remembered in this browser':' · this session only');
+  $('#k_openai').value=''; $('#k_anthropic').value=''; $('#k_openrouter').value='';
+  $('#keymsg').textContent='Saved privately for Studio and CLI · '+new Date().toLocaleTimeString();
+  return true;
 }
 $('#savekeys').onclick=pushKeys;
 $('#clearkeys').onclick=async()=>{ $('#k_openai').value=''; $('#k_anthropic').value='';
   $('#k_openrouter').value='';
-  localStorage.removeItem('adpipe_keys'); $('#remember').checked=false; await pushKeys();
-  $('#keymsg').textContent='Cleared.'; };
-(function(){ const s=localStorage.getItem('adpipe_keys');
-  if(s){ try{ const k=JSON.parse(s); $('#k_openai').value=k.openai||'';
-    $('#k_anthropic').value=k.anthropic||''; $('#k_openrouter').value=k.openrouter||'';
-    $('#remember').checked=true; pushKeys(); }catch(e){} }
-  fetch('/keys').then(r=>r.json()).then(j=>{setPill('openai',j.openai);
-    setPill('anthropic',j.anthropic);setPill('openrouter',j.openrouter);});
+  const r=await fetch('/keys',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({clear:['openai','anthropic','openrouter']})});
+  const j=await r.json();
+  if(!r.ok||j.error){ $('#keymsg').textContent='Could not clear keys: '+(j.error||r.status); return; }
+  localStorage.removeItem('adpipe_keys');
+  setPill('openai',j.openai);setPill('anthropic',j.anthropic);setPill('openrouter',j.openrouter);
+  $('#keymsg').textContent='Saved AdPipe keys cleared. Environment variables, if set, still override.'; };
+(async function(){
+  // Older Studio versions kept opt-in credentials in localStorage. Move them
+  // to the backend once, and retain the old copy if persistence fails so an
+  // existing user is never silently logged out.
+  const legacy=localStorage.getItem('adpipe_keys');
+  if(legacy){
+    try{
+      const k=JSON.parse(legacy);
+      const r=await fetch('/keys',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({openai:k.openai||'',anthropic:k.anthropic||'',
+          openrouter:k.openrouter||''})});
+      const j=await r.json();
+      if(!r.ok||j.error) throw new Error(j.error||String(r.status));
+      localStorage.removeItem('adpipe_keys');
+      $('#keymsg').textContent='Migrated your browser-saved keys to the private AdPipe store.';
+    }catch(e){
+      $('#keymsg').textContent='Could not migrate browser-saved keys. They remain in this browser; click Save keys to retry.';
+    }
+  }
+  fetch('/keys').then(r=>r.json()).then(j=>{
+    if(j.error){ $('#keymsg').textContent='Could not read saved keys: '+j.error; return; }
+    setPill('openai',j.openai);setPill('anthropic',j.anthropic);
+    setPill('openrouter',j.openrouter);});
 })();
 
 // ---------- remix ----------
@@ -3545,9 +3569,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                for n in cli.EXTRACTORS],
                 "presets": {k: v for k, v in cli.PRESETS.items()}}))
         if u.path == "/keys":
-            with _lock:
-                return self._send(200, json.dumps(
-                    {k: bool(v) for k, v in KEYS.items()}))
+            try:
+                state = credentials.status()
+            except credentials.CredentialStoreError as error:
+                return self._send(500, json.dumps({"error": str(error)}))
+            return self._send(200, json.dumps(state))
         if u.path == "/ref":
             q = urllib.parse.parse_qs(u.query)
             rel = q.get("path", [""])[0]
@@ -3567,11 +3593,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/keys":
             req = self._json()
-            with _lock:
-                for k in ("openai", "anthropic", "openrouter"):
-                    if k in req:
-                        KEYS[k] = (req[k] or "").strip()
-                return self._send(200, json.dumps({k: bool(v) for k, v in KEYS.items()}))
+            values = {key: req[key] for key in credentials.PROVIDER_ENV if key in req}
+            clear = req.get("clear") or ()
+            try:
+                with _lock:
+                    state = credentials.update(values, clear=clear)
+            except credentials.CredentialStoreError as error:
+                return self._send(500, json.dumps({"error": str(error)}))
+            return self._send(200, json.dumps(state))
         if path == "/project":
             req = self._json()
             try:
@@ -3669,8 +3698,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 {"preset": {"id": p["id"], "name": p["name"]}, "conflicts": out}))
         if path == "/presets/pick":
             req = self._json()
-            with _lock:
-                keys = dict(KEYS)
+            try:
+                keys = _credential_snapshot()
+            except credentials.CredentialStoreError as error:
+                return self._send(200, json.dumps({"error": str(error)}))
             try:
                 with auditlog.scope(project=req.get("project"),
                                     segment=req.get("segment"),
@@ -3697,8 +3728,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"ok": True, **out}))
         if path == "/product/enrich":
             req = self._json()
-            with _lock:
-                keys = dict(KEYS)
+            try:
+                keys = _credential_snapshot()
+            except credentials.CredentialStoreError as error:
+                return self._send(200, json.dumps({"error": str(error)}))
             proj = req.get("project", "")
             try:
                 prod = products.resolve_product(proj, req.get("product", ""))
@@ -3727,8 +3760,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(out))
         if path == "/product/synth":
             req = self._json()
-            with _lock:
-                keys = dict(KEYS)
+            try:
+                keys = _credential_snapshot()
+            except credentials.CredentialStoreError as error:
+                return self._send(200, json.dumps({"error": str(error)}))
             proj = req.get("project", "")
             try:
                 prod = products.resolve_product(proj, req.get("product", ""))
@@ -3822,8 +3857,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         }))
 
     def _briefs(self, req):
-        with _lock:
-            keys = dict(KEYS)
+        try:
+            keys = _credential_snapshot()
+        except credentials.CredentialStoreError as error:
+            return self._send(200, json.dumps({"error": str(error)}))
         project = req.get("project") or ""
         segment = req.get("segment") or ""
         try:
@@ -3880,8 +3917,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._send(200, json.dumps(out))
 
     def _generate(self, req):
-        with _lock:
-            key = KEYS.get("openai", "")
+        try:
+            key = credentials.resolve("openai")
+        except credentials.CredentialStoreError as error:
+            return self._send(200, json.dumps({"error": str(error)}))
         if not key:
             return self._send(200, json.dumps(
                 {"error": "No OpenAI key — add one on the Settings tab."}))
@@ -4005,21 +4044,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                       "text/plain; charset=utf-8")
                 cmd += ["--source", vsrc]
 
-        env = dict(os.environ)
-        with _lock:
-            if KEYS.get("anthropic"):
-                env["ANTHROPIC_API_KEY"] = KEYS["anthropic"]
-            if KEYS.get("openai"):
-                env["OPENAI_API_KEY"] = KEYS["openai"]
-            if KEYS.get("openrouter"):
-                env["OPENROUTER_API_KEY"] = KEYS["openrouter"]
-
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         try:
-            proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE,
+            # The child CLI resolves env -> private store itself. Do not copy a
+            # secret through Studio process state or construct a second policy.
+            proc = subprocess.Popen(cmd, cwd=ROOT, env=dict(os.environ), stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, bufsize=1, text=True)
             for line in proc.stdout:
                 self.wfile.write(line.encode("utf-8", "replace"))

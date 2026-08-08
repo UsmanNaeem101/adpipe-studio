@@ -28,6 +28,8 @@ import time
 import urllib.error
 import urllib.request
 
+import credentials
+
 import auditlog
 
 API_URL = os.environ.get("IMAGE_API_URL", "https://api.openai.com/v1/images/generations")
@@ -149,10 +151,13 @@ def main():
             print(f"    {j['concept']}.{j['slot']:12} -> {j['file']}")
         return
 
-    key = os.environ.get("OPENAI_API_KEY")
+    try:
+        key = credentials.resolve("openai")
+    except credentials.CredentialStoreError as error:
+        sys.exit(str(error))
     if not key:
         sys.exit(
-            "OPENAI_API_KEY is not set.\n"
+            "No OpenAI key. Add one on the Settings tab of the studio, or:\n"
             "  export OPENAI_API_KEY=sk-...\n"
             "See docs/IMAGE_SETUP.md for where to put it permanently."
         )

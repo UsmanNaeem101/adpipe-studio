@@ -32,6 +32,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+import credentials
 import uuid
 
 import auditlog
@@ -196,9 +198,13 @@ def main():
     if not os.path.exists(prod_path):
         sys.exit(f"\n  product image not found: {prod_path}")
 
-    key = os.environ.get("OPENAI_API_KEY")
+    try:
+        key = credentials.resolve("openai")
+    except credentials.CredentialStoreError as error:
+        sys.exit(str(error))
     if not key:
-        sys.exit("\n  OPENAI_API_KEY is not set — see docs/IMAGE_SETUP.md.")
+        sys.exit("\n  No OpenAI key. Add one on the Settings tab of the studio, "
+                 "or export OPENAI_API_KEY — see docs/IMAGE_SETUP.md.")
 
     for i, (j, ref, dest) in enumerate(todo, 1):
         print(f"  [{i}/{len(todo)}] {j['id']}: {os.path.basename(ref)} + product …",

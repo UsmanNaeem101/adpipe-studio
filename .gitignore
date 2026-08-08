@@ -3,10 +3,12 @@
 __pycache__/
 *.pyc
 
-# Secrets — keys are typed into the studio UI and held in memory, never written
-# here. Belt-and-braces in case anyone adds a dotenv later.
+# Secrets — the canonical private store is outside the repository. These
+# patterns are belt-and-braces for local overrides or accidental copies.
 .env
 *.key
+/.adpipe/
+/credentials.local.json
 
 # Derived / regenerable: reference thumbnails + the dimension cache.
 # NB: git has no inline comments in .gitignore — a trailing "# ..." becomes part
