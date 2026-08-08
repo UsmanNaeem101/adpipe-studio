@@ -67,7 +67,7 @@ def build_jobs(records, chunk, effort, cap, schema, prompt_of):
     from llm import Job
     chunks = [records[i:i + chunk] for i in range(0, len(records), chunk)]
     return [Job(id=f"a{n:04d}", prompt=prompt_of(ch),
-                max_tokens=cli._record_max_tokens(len(ch), 40),
+                max_tokens=cli.FILTER_TOKEN_TIERS[0],
                 schema=schema, expected_ids=tuple(r["id"] for r in ch),
                 effort=effort,
                 # `none` disables reasoning outright, so a ceiling is moot; the

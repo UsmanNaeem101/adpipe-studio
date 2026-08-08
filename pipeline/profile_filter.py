@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Profile stage 01 (VOC filter) before spending money on it.
+Profile the static shape of stage 01 (VOC filter) before spending money on it.
 
 Stage 01 aborted on a 4,977-record corpus with 82/83 batches returning empty.
-The instinct is "the output budget is too small". It isn't: this tool measures
-what the stage actually needs and shows that the ANSWER fits comfortably inside
-`max_tokens` — the budget is being consumed by reasoning before a single JSON
-byte is written.
+This tool measures what the JSON answer itself needs. It deliberately does not
+recommend the runtime ceiling: Stage 01 now starts at 12k and promotes through
+12k/16k/24k/32k from live finish reasons and token usage.
 
     ./.venv/bin/python pipeline/profile_filter.py                    # bundled corpus
     ./.venv/bin/python pipeline/profile_filter.py --records 4977     # project to a size
@@ -21,10 +20,8 @@ your corpus and the stage's own schema — no model required.
 
 NOT deterministic: how many tokens a given model spends REASONING before it
 starts writing. That is the term that broke the run, and nothing offline can
-measure it. This tool prints the reasoning HEADROOM each configuration leaves,
-which is the number that decides whether the stage completes; `--exact` bills a
-real count_tokens call for input, and `--calibrate` spends one real batch to
-measure the reasoning term against your model.
+measure it. This tool prints the reasoning headroom each configuration leaves;
+the pipeline itself learns the safe ceiling from the live model during the run.
 
 Standard library only (count_tokens needs the anthropic SDK and a key).
 """
@@ -104,19 +101,9 @@ def content_budget(chunk, worst_case=False):
     return chunk * verdict_tokens(worst_case) + 8
 
 
-def recommended_max_tokens(chunk, reasoning_cap):
-    """A budget derived from the schema instead of picked round.
-
-    content + reasoning + 15% margin. Sizing this way is what makes the failure
-    structural rather than probabilistic: the answer's room is reserved before
-    reasoning is allowed to spend anything.
-    """
-    return int((content_budget(chunk, worst_case=True) + reasoning_cap) * 1.15)
-
-
 # ------------------------------------------------------------------ report
 
-def sweep(texts, chunks, prefix_tokens, reasoning_cap, current_max_tokens):
+def sweep(texts, chunks, prefix_tokens, current_max_tokens):
     per_record = rendered_tokens(texts)
     corpus_tokens = sum(per_record)
     n = len(texts)
@@ -136,7 +123,6 @@ def sweep(texts, chunks, prefix_tokens, reasoning_cap, current_max_tokens):
             "content_total": content * batches,
             "headroom": headroom,
             "headroom_pct": 100.0 * headroom / current_max_tokens,
-            "recommended": recommended_max_tokens(chunk, reasoning_cap),
         })
     return corpus_tokens, rows
 
@@ -165,10 +151,8 @@ def main():
                     help="project onto a corpus of this size (e.g. 4977)")
     ap.add_argument("--chunks", default="20,30,40,60,80,120",
                     help="batch sizes to sweep")
-    ap.add_argument("--max-tokens", type=int, default=8000,
-                    help="the budget currently configured (default: stage 01's 8000)")
-    ap.add_argument("--reasoning-cap", type=int, default=2000,
-                    help="tokens to reserve for reasoning when sizing (default 2000)")
+    ap.add_argument("--max-tokens", type=int, default=cli.FILTER_TOKEN_TIERS[0],
+                    help="ceiling to inspect (default: stage 01's 12k initial tier)")
     ap.add_argument("--model", default="claude-opus-5")
     ap.add_argument("--exact", action="store_true",
                     help="bill a real count_tokens call instead of the 4:1 estimate")
@@ -196,8 +180,7 @@ def main():
             print(f"  ! --exact unavailable ({e}); falling back to the estimate\n")
 
     chunks = [int(x) for x in args.chunks.split(",") if x.strip()]
-    corpus_tokens, rows = sweep(texts, chunks, prefix_tokens,
-                                args.reasoning_cap, args.max_tokens)
+    corpus_tokens, rows = sweep(texts, chunks, prefix_tokens, args.max_tokens)
 
     print(f"\nSTAGE 01 PROFILE   {len(texts):,} records "
           f"({'measured' if len(texts) == measured else f'projected from {measured:,}'})")
@@ -209,12 +192,10 @@ def main():
           f"{verdict_tokens(worst_case=True)} tok worst case")
 
     print(f"\n  Output budget analysis at the configured max_tokens={args.max_tokens:,}")
-    print(f"  {'batch':>6} {'reqs':>6} {'answer needs':>13} {'left for reasoning':>19} "
-          f"{'sized budget':>13}")
+    print(f"  {'batch':>6} {'reqs':>6} {'answer needs':>13} {'left for reasoning':>19}")
     for r in rows:
         print(f"  {r['chunk']:>6} {r['batches']:>6} {r['content_out']:>10,} tok "
-              f"{r['headroom']:>13,} tok ({r['headroom_pct']:>4.1f}%) "
-              f"{r['recommended']:>9,} tok")
+              f"{r['headroom']:>13,} tok ({r['headroom_pct']:>4.1f}%)")
 
     print(f"\n  Cost (output priced at the answer only — reasoning bills on top)")
     print(f"  {'batch':>6} {'reqs':>6} {'anthropic (batched+cached)':>28} {'openrouter':>14}")
@@ -232,9 +213,9 @@ def main():
     print(f"  Even the tightest ({worst['chunk']}/batch) leaves "
           f"{worst['headroom']:,} tok — {worst['headroom_pct']:.0f}% of the budget — unused by content.")
     print( "  A run that returns EMPTY content therefore did not run out of room to answer;")
-    print( "  it spent that headroom reasoning. Bound the reasoning (effort / reasoning cap)")
-    print( "  and size max_tokens off the schema; raising max_tokens alone only buys")
-    print( "  the reasoning more room to expand into.")
+    print( "  it spent that headroom reasoning. The runtime therefore does not infer a")
+    print( "  ceiling from this arithmetic: it learns from output-budget stops and live")
+    print( "  utilisation, promoting through 12k/16k/24k/32k when needed.")
     print( "\n  Batch size barely moves cost — records are sent once either way. Choose it")
     print( "  for blast radius: one unrecoverable batch loses that many records' verdicts.\n")
 

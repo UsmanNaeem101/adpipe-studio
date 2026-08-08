@@ -373,6 +373,13 @@ FILTER_CHUNK = 60
 FILTER_EFFORT = "low"
 DEDUP_EFFORT = None   # None = leave skill 02 exactly as it was
 
+# Stage 01 learns one persistent output floor while it runs.  These deliberately
+# coarse tiers avoid paying to rediscover that a nearby ceiling is also too low.
+# A ceiling is not spend: providers charge generated tokens, not tokens allowed.
+FILTER_TOKEN_TIERS = (12000, 16000, 24000, 32000)
+FILTER_HEADROOM_THRESHOLD = 0.85
+FILTER_OPENROUTER_WAVE_SIZE = 4
+
 
 def filter_chunk(cfg, args):
     return int(getattr(args, "chunk", None)
@@ -405,83 +412,170 @@ def filter_effort(cfg, args):
             or cfg.get("filter", {}).get("effort") or FILTER_EFFORT)
 
 
-def _record_max_tokens(chunk, per_record_tokens, reserve=REASONING_RESERVE):
-    """Size a per-record batch's output budget from its schema, not by eye.
+def filter_headroom_threshold(cfg, args):
+    """Configured fraction at which a successful Stage 01 call promotes.
 
-    answer + reasoning reserve + 15% margin. Reserving the answer's room FIRST is
-    what makes the failure structural rather than probabilistic: whatever the
-    model spends thinking, the tokens needed to write one verdict per record were
-    never the model's to spend. `pipeline/profile_filter.py` prints the same
-    arithmetic against a real corpus.
+    This is deliberately a Stage 01 project setting rather than a global model
+    option: different stages have different output shapes and economics.
     """
-    return int((chunk * per_record_tokens + reserve) * 1.15)
+    raw = getattr(args, "filter_headroom_threshold", None)
+    if raw is None:
+        raw = cfg.get("filter", {}).get("headroom_threshold")
+    if raw is None:
+        raw = FILTER_HEADROOM_THRESHOLD
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        sys.exit(f"filter.headroom_threshold must be a fraction, got {raw!r}")
+    if not 0 < value < 1:
+        sys.exit("filter.headroom_threshold must be greater than 0 and less than 1")
+    return value
 
 
-# The probe's ceiling, as a multiple of the computed budget, and the margin held
-# over the spend it measures. A ceiling is not a purchase — providers bill tokens
-# generated, not tokens allowed — so a generous probe ceiling costs nothing and a
-# tight one costs the stage.
-CALIBRATION_CEILING = 4
-CALIBRATION_MARGIN = 1.4
+def _token_tier_label(tokens):
+    return f"{tokens // 1000}k"
 
 
-def _calibrate_budget(client_, corpus, preamble, jobs, label):
-    """Measure one real request, then size the rest of the stage from it.
+def _stage01_wave_size(client_):
+    """OpenRouter can safely keep four calls in flight; Anthropic stays serial.
 
-    `max_tokens` caps reasoning and answer together, so a batch's budget is only
-    safe if you know what the route spends reasoning — and you cannot know that
-    from the request. `reasoning.max_tokens` is a request, not a guarantee: this
-    pipeline sized 83 chunks at 5,060 tokens on the assumption a 2,000-token
-    ceiling would be honoured, and 77 of them came back unfinished.
+    Anthropic's client method submits its whole argument as one remote Batch API
+    job and only yields after the batch ends. One request per wave is the simple
+    safe choice there: a learned floor can then govern every request not started.
+    OpenRouter's `batch` already owns a four-thread pool, so four is both its
+    existing concurrency and the natural rolling-wave boundary.
+    """
+    try:
+        import openrouter
+        return (FILTER_OPENROUTER_WAVE_SIZE
+                if isinstance(client_, openrouter.Client) else 1)
+    except ImportError:
+        return 1
 
-    So measure instead of assuming. One chunk goes out with a deliberately
-    generous ceiling, and every remaining chunk is sized from what it actually
-    spent. The probe is a chunk that had to be judged anyway, an unused ceiling is
-    free, and the cost of being wrong drops from 77 re-runs to one request.
 
-    Returns (results, jobs) with the probe's reply already in `results` and every
-    other job resized, so nothing is paid for twice.
+def _stage01_validation_error(job, result):
+    """Return why a completed filter reply is not a first-pass success."""
+    stop = result.stop_reason or ""
+    if stop in NO_RETRY_STOP_REASONS or stop.startswith(("request_error", "batch_")):
+        return _failure_reason(result, "provider did not complete the request")
+    try:
+        _decode_job_rows(job, result.text, "records")
+    except (ValueError, TypeError) as e:
+        return _failure_reason(result, str(e))
+    return None
+
+
+def _run_stage01_adaptive(client_, corpus, preamble, jobs, diagnostics_dir,
+                          headroom_threshold=FILTER_HEADROOM_THRESHOLD,
+                          wave_size=1):
+    """Run Stage 01 with a live, persistent output-token floor.
+
+    New work is launched in rolling waves. A wave is wholly in flight before any
+    result is inspected, so every member may finish at the old ceiling. At the
+    boundary, an output-budget stop or a valid response above the utilisation
+    threshold promotes the global floor. Budget-exhausted jobs are retried before
+    any never-started job, which lets their next result promote again before more
+    work is launched. Only `length`/`max_tokens` can cause a reactive promotion.
+
+    Returns raw results plus the exact Job variant used for each final first-pass
+    response. Shape/provider failures deliberately remain raw so Stage 01's call
+    to `_batch_rows` can use the existing recovery paths without teaching the
+    generic recovery code about this state machine.
     """
     if not jobs:
-        return {}, jobs
-    probe = jobs[0]
-    ceiling = probe.max_tokens * CALIBRATION_CEILING
-    print(f"  calibrating {label} on 1 of {len(jobs)} chunks "
-          f"(ceiling {ceiling:,} tokens — you are billed for what is generated, "
-          f"not for what is allowed)")
-    first = dataclasses.replace(probe, max_tokens=ceiling)
-    results = client_.batch(corpus, preamble, [first])
-    measured = _as_result(results.get(probe.id, ""))
+        return {}, []
+    if wave_size < 1:
+        raise ValueError("Stage 01 wave_size must be at least 1")
+    if not 0 < headroom_threshold < 1:
+        raise ValueError("Stage 01 headroom_threshold must be between 0 and 1")
 
-    if not measured.completion_tokens:
-        # No usage reported. Keep the generous ceiling rather than falling back to
-        # the budget that has already failed: without a measurement, headroom is
-        # the only defence left.
-        print(f"  ! {label}: the route reported no token usage — keeping the "
-              f"{ceiling:,}-token ceiling instead of the computed budget")
-        sized = ceiling
-    else:
-        sized = max(int(measured.completion_tokens * CALIBRATION_MARGIN),
-                    probe.max_tokens)
-        asked = probe.reasoning_max_tokens
-        note = ""
-        if asked and measured.reasoning_tokens > asked:
-            # The exact assumption that broke the last run, now stated out loud
-            # the moment it is observed instead of inferred from the wreckage.
-            note = (f" — the route IGNORED the {asked:,}-token reasoning ceiling "
-                    f"it was sent")
-        print(f"  {label}: measured {measured.budget_note or 'nothing'}"
-              f"{note}; sizing the remaining {len(jobs) - 1} chunks at "
-              f"{sized:,} tokens")
-        if measured.out_of_budget:
-            print(f"  ! {label}: even the calibration ceiling was exhausted — "
-                  f"reduce the chunk size or set \"filter\": {{\"effort\": \"none\"}} "
-                  f"in project.json")
+    tier_index = 0
+    pending = list(jobs)
+    retrying = []
+    results = {}
+    final_jobs = {}
+    attempts = defaultdict(list)
+    start = _token_tier_label(FILTER_TOKEN_TIERS[0])
+    print(f"  Stage 01 starting ceiling: {start} "
+          f"({wave_size}-request rolling waves; proactive promotion above "
+          f"{headroom_threshold:.0%})")
 
-    jobs = [first] + [dataclasses.replace(j, max_tokens=sized) for j in jobs[1:]]
-    if len(jobs) > 1:
-        results.update(client_.batch(corpus, preamble, jobs[1:]))
-    return results, jobs
+    while retrying or pending:
+        queue = retrying if retrying else pending
+        originals = queue[:wave_size]
+        del queue[:wave_size]
+        ceiling = FILTER_TOKEN_TIERS[tier_index]
+        wave = [dataclasses.replace(job, max_tokens=ceiling) for job in originals]
+        ids = ", ".join(job.id for job in wave)
+        print(f"  Stage 01 wave at {_token_tier_label(ceiling)}: {ids}")
+        replies = client_.batch(corpus, preamble, wave)
+
+        exhausted = []
+        proactive = []
+        for job in wave:
+            result = _as_result(replies.get(job.id, ""))
+            attempts[job.id].append((job, result))
+            label = _token_tier_label(job.max_tokens)
+            if result.out_of_budget:
+                reason = _failure_reason(result, "output budget exhausted")
+                _save_failure(diagnostics_dir, job, result, reason,
+                              f"budget_{job.max_tokens}")
+                detail = f" ({result.budget_note})" if result.budget_note else ""
+                print(f"    Batch {job.id}: {label} -> output budget exhausted{detail}")
+                exhausted.append(job)
+                continue
+
+            validation_error = _stage01_validation_error(job, result)
+            results[job.id] = result
+            final_jobs[job.id] = job
+            if validation_error:
+                print(f"    Batch {job.id}: {label} -> existing recovery path "
+                      f"({validation_error})")
+                continue
+
+            usage = result.completion_tokens
+            utilisation = usage / job.max_tokens if usage else 0
+            usage_note = (f" ({usage:,}/{job.max_tokens:,}, {utilisation:.2%})"
+                          if usage else "")
+            print(f"    Batch {job.id}: {label} -> success{usage_note}")
+            if (utilisation > headroom_threshold
+                    and tier_index < len(FILTER_TOKEN_TIERS) - 1):
+                proactive.append((job, utilisation))
+
+        if exhausted and tier_index == len(FILTER_TOKEN_TIERS) - 1:
+            failed = ", ".join(job.id for job in exhausted)
+            detail = "; ".join(
+                f"{job.id}: {attempts[job.id][-1][1].budget_note or 'usage not reported'}"
+                for job in exhausted)
+            raise BatchOutputError(
+                f"Stage 01 hard ceiling exhausted: {failed} reached "
+                f"{_token_tier_label(ceiling)} and still ended for output budget "
+                f"({detail}). Attempts and truncated replies were saved to "
+                f"{diagnostics_dir}. No stage output was written.")
+
+        if exhausted or proactive:
+            old = ceiling
+            tier_index += 1
+            new = FILTER_TOKEN_TIERS[tier_index]
+            if exhausted:
+                print(f"    Retrying budget-exhausted batches at "
+                      f"{_token_tier_label(new)} before starting new work")
+            if proactive:
+                examples = ", ".join(
+                    f"{job.id} {utilisation:.2%}" for job, utilisation in proactive)
+                print(f"    Proactive promotion: {examples} exceeded "
+                      f"{headroom_threshold:.0%}")
+            print(f"    Promoting remaining batches from {_token_tier_label(old)} "
+                  f"to {_token_tier_label(new)}")
+
+        # An exhausted request is always resolved before never-started work. Put
+        # the just-failed jobs at the front even if a larger retry wave was
+        # waiting, so another insufficiency can promote the shared floor first.
+        if exhausted:
+            retrying[:0] = exhausted
+
+    ordered_jobs = [final_jobs[job.id] for job in jobs]
+    return results, ordered_jobs
 
 
 def _json_object(text):
@@ -762,7 +856,8 @@ def _report_failure_modes(failures, total, key):
         print(f"      {n:>4}  {mode}{detail}")
 
 
-def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None):
+def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
+                rerun_factor=BUDGET_RETRY_FACTOR):
     """Decode all jobs, recovering failed responses before failing the stage.
 
     Two failure modes need two different recoveries, and conflating them is what
@@ -808,10 +903,12 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None):
     if failures and rerun is not None:
         starved = [f for f in failures if f[1].retryable]
         if starved:
+            retry_budget = ("the same token budget" if rerun_factor == 1 else
+                            f"{rerun_factor}x the token budget")
             print(f"  ! {len(starved)}/{len(jobs)} {key} response(s) never finished "
                   f"(output budget, empty or failed request) — re-running those "
-                  f"requests at {BUDGET_RETRY_FACTOR}x the token budget")
-            replies = rerun(starved, BUDGET_RETRY_FACTOR)
+                  f"requests at {retry_budget}")
+            replies = rerun(starved, rerun_factor)
             recovered, still_bad = set(), []
             for job, result, original_reason in starved:
                 retried = _as_result(replies.get(job.id, ""))
@@ -967,9 +1064,9 @@ def cmd_ingest(cfg, args):
                 prompt=("Classify each record below: retain or reject, with "
                         "reason codes.\n\nRECORDS:\n\n"
                         + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
-                # ~40 tokens covers a worst-case verdict: an id, a decision and
-                # two of the longest reason codes skill 01 defines.
-                max_tokens=_record_max_tokens(len(ch), 40), schema=FILTER_SCHEMA,
+                # Stage 01 starts generously and learns a persistent floor from
+                # live route behaviour. Only max_tokens changes on promotion.
+                max_tokens=FILTER_TOKEN_TIERS[0], schema=FILTER_SCHEMA,
                 expected_ids=tuple(r["id"] for r in ch),
                 # Skill 01 is the bouncer at the door: retain or reject, with
                 # reasons drawn from a closed list. It is judgement, but it is
@@ -986,15 +1083,22 @@ def cmd_ingest(cfg, args):
     if not confirm(c.estimate(prefix, FILTER_PREAMBLE, jobs, batched=True), args.yes):
         return
     c.prewarm(prefix, FILTER_PREAMBLE)
-    filter_results, jobs = _calibrate_budget(c, prefix, FILTER_PREAMBLE, jobs,
-                                             "01 filter")
+    filter_failures = os.path.join(voc, "_model_failures", "01_filter")
+    filter_results, jobs = _run_stage01_adaptive(
+        c, prefix, FILTER_PREAMBLE, jobs, filter_failures,
+        headroom_threshold=filter_headroom_threshold(cfg, args),
+        wave_size=_stage01_wave_size(c))
     records = _batch_rows(
         filter_results, jobs, "records",
-        os.path.join(voc, "_model_failures", "01_filter"),
+        filter_failures,
         repair=lambda failed: _repair_batch(
             c, prefix, FILTER_PREAMBLE, failed, "records"),
         rerun=lambda failed, factor: _rerun_batch(
-            c, prefix, FILTER_PREAMBLE, failed, factor))
+            c, prefix, FILTER_PREAMBLE, failed, factor),
+        # The adaptive executor has already resolved every output-budget stop.
+        # Empty/provider failures retain the existing recovery path but must not
+        # promote or widen the ceiling.
+        rerun_factor=1)
     _require_exact_ids(records, {r["id"] for r in pre}, "skill 01 filter")
     verdicts = {r["evidence_id"]: r for r in records}
 
@@ -1983,6 +2087,9 @@ def main():
     s = common(sub.add_parser("ingest")); s.add_argument("source")
     s.add_argument("--rules-only", action="store_true",
                    help="deterministic pre-pass only; skip skills 01/02 (free)")
+    s.add_argument("--filter-headroom-threshold", type=float,
+                   help="promote Stage 01 after valid usage exceeds this fraction "
+                        "of max_tokens (default: 0.85)")
     s.set_defaults(fn=cmd_ingest)
     s = common(sub.add_parser("segment")); s.add_argument("--rediscover", action="store_true")
     s.add_argument("--reassign", action="store_true")

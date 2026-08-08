@@ -1,4 +1,4 @@
-"""Tests for stage 01's output-budget sizing, reasoning control, and vocabulary.
+"""Tests for Stage 01 configuration, reasoning control, and vocabulary.
 
 The stage failed because `max_tokens` caps reasoning AND the answer together,
 and nothing bounded the reasoning half: the budget was picked round (8000), the
@@ -23,32 +23,15 @@ import openrouter
 import profile_filter
 
 
-class BudgetSizingTests(unittest.TestCase):
-    """The budget must come from the schema, not from a round number."""
+class Stage01ConfigurationTests(unittest.TestCase):
+    """Stage 01 starts at the first live-behaviour tier."""
 
-    def test_budget_reserves_the_answer_before_reasoning(self):
-        # 60 records x 40 tokens = 2400 of answer, plus the reasoning reserve.
-        sized = cli._record_max_tokens(60, 40)
-        self.assertGreaterEqual(sized, 60 * 40 + cli.REASONING_RESERVE)
-
-    def test_budget_scales_with_batch_size(self):
-        self.assertLess(cli._record_max_tokens(20, 40),
-                        cli._record_max_tokens(60, 40))
-
-    def test_budget_leaves_a_margin_above_the_bare_requirement(self):
-        bare = 60 * 40 + cli.REASONING_RESERVE
-        self.assertGreater(cli._record_max_tokens(60, 40), bare)
-
-    def test_stage_01_asks_for_a_sized_budget_and_low_effort(self):
-        """The failing run's config, end to end through job construction."""
+    def test_stage_01_starts_at_12k_and_keeps_low_effort(self):
         jobs = self.build_filter_jobs(records=120, chunk=60)
         self.assertEqual(len(jobs), 2)
         for j in jobs:
             self.assertEqual(j.effort, "low")
-            self.assertEqual(j.max_tokens, cli._record_max_tokens(60, 40))
-            # The whole point: smaller than the budget that failed, because the
-            # fix is bounding reasoning rather than buying it more room.
-            self.assertLess(j.max_tokens, 8000)
+            self.assertEqual(j.max_tokens, 12000)
 
     @staticmethod
     def build_filter_jobs(records, chunk):
@@ -63,12 +46,9 @@ class BudgetSizingTests(unittest.TestCase):
                 pass
 
             def batch(self, _corpus, _preamble, jobs):
-                raise AssertionError("calibration should intercept before this")
+                raise AssertionError("adaptive executor should intercept first")
 
-        def capture(_client, _corpus, _preamble, jobs, _label):
-            # Intercept at calibration rather than at the first batch call: the
-            # first call is now the calibration probe, which carries a
-            # deliberately widened ceiling and so is not the job as constructed.
+        def capture(_client, _corpus, _preamble, jobs, *_a, **_k):
             captured["jobs"] = jobs
             raise SystemExit("stop after capture")
 
@@ -84,7 +64,7 @@ class BudgetSizingTests(unittest.TestCase):
                    "product": "pillow", "market": "shoulders"}
             args = SimpleNamespace(source=src, rules_only=False, yes=True)
             with mock.patch.object(cli, "client", return_value=Client()), \
-                    mock.patch.object(cli, "_calibrate_budget", capture), \
+                    mock.patch.object(cli, "_run_stage01_adaptive", capture), \
                     mock.patch.object(llm, "confirm", return_value=True):
                 try:
                     cli.cmd_ingest(cfg, args)
@@ -210,7 +190,7 @@ class ReasoningControlTests(unittest.TestCase):
 
     def test_route_that_rejects_reasoning_is_retried_without_it(self):
         """Not every route accepts the parameter; losing it must not lose the
-        stage — the sized budget and the audited re-run still cover us."""
+        stage — the adaptive budget and audited recovery still cover us."""
         import io
         import urllib.error
         rejected = urllib.error.HTTPError(
@@ -235,7 +215,7 @@ class ReasoningControlTests(unittest.TestCase):
 
 
 class ProfilerTests(unittest.TestCase):
-    """The profiler's arithmetic is the argument for the sizing — pin it."""
+    """The standalone profiler can still describe the response shape."""
 
     def test_content_budget_is_one_verdict_per_record(self):
         one = profile_filter.verdict_tokens()
@@ -244,33 +224,6 @@ class ProfilerTests(unittest.TestCase):
     def test_worst_case_verdict_exceeds_typical(self):
         self.assertGreater(profile_filter.verdict_tokens(worst_case=True),
                            profile_filter.verdict_tokens())
-
-    def test_the_answer_fits_the_old_budget_at_every_swept_batch_size(self):
-        """The finding that redirected the fix: 8000 was never too small for the
-        ANSWER, so raising it would not have helped."""
-        for chunk in (20, 40, 60, 80, 120):
-            self.assertLess(profile_filter.content_budget(chunk), 8000, chunk)
-
-    def test_failing_config_left_most_of_the_budget_to_reasoning(self):
-        used = profile_filter.content_budget(60)
-        self.assertLess(used / 8000, 0.35)
-
-    def test_profiler_and_cli_agree_on_the_sized_budget(self):
-        """Same formula in both places, so the tool's advice matches what the
-        stage actually asks for. They differ only by the `{"records":[...]}`
-        wrapper the profiler counts and the CLI absorbs into its margin."""
-        tool = profile_filter.recommended_max_tokens(60, cli.REASONING_RESERVE)
-        stage = cli._record_max_tokens(
-            60, profile_filter.verdict_tokens(worst_case=True))
-        self.assertLess(abs(tool - stage) / stage, 0.01)
-
-    def test_the_stage_rounds_its_per_record_estimate_up(self):
-        """cli uses a round 40 tok/verdict; the measured worst case must not
-        exceed it, or the sizing under-reserves."""
-        self.assertLessEqual(profile_filter.verdict_tokens(worst_case=True), 40)
-
-
-
 
 class PromptCompositionTests(unittest.TestCase):
     """One canonical output contract — the real failure was two competing ones.
@@ -331,7 +284,7 @@ class PromptCompositionTests(unittest.TestCase):
 
     def test_batch_instruction_does_not_restate_the_contract(self):
         """The contract is stated once, in the preamble and the schema."""
-        jobs = BudgetSizingTests.build_filter_jobs(records=60, chunk=60)
+        jobs = Stage01ConfigurationTests.build_filter_jobs(records=60, chunk=60)
         instruction = jobs[0].prompt.split("RECORDS:")[0]
         for restated in ("evidence_id", "records\":[", "empty"):
             self.assertNotIn(restated, instruction, restated)
@@ -382,7 +335,7 @@ class StagePreambleWiringTests(unittest.TestCase):
 
             def batch(self, _corpus, preamble, jobs):
                 seen.append(("batch", preamble))
-                # Force one re-run and one repair, then let the stage abort.
+                # Exhaust every adaptive tier, then let the stage abort.
                 return {j.id: llm.BatchResult("", "length") for j in jobs}
 
         from types import SimpleNamespace
@@ -400,7 +353,7 @@ class StagePreambleWiringTests(unittest.TestCase):
                 with self.assertRaises(cli.BatchOutputError):
                     cli.cmd_ingest(cfg, args)
 
-        self.assertGreaterEqual(len(seen), 3)  # prewarm + batch + rerun + repair
+        self.assertEqual(len(seen), 5)  # prewarm + the four adaptive tiers
         for where, preamble in seen:
             self.assertIs(preamble, cli.FILTER_PREAMBLE, where)
 
@@ -421,9 +374,23 @@ class StageConfigTests(unittest.TestCase):
         self.assertEqual(cli.filter_effort({"filter": {"effort": "none"}}, args),
                          "none")
 
+    def test_headroom_defaults_to_85_percent_and_is_overridable(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace()
+        self.assertEqual(cli.filter_headroom_threshold({}, args), 0.85)
+        self.assertEqual(cli.filter_headroom_threshold(
+            {"filter": {"headroom_threshold": 0.9}}, args), 0.9)
+        self.assertEqual(cli.filter_headroom_threshold(
+            {}, SimpleNamespace(filter_headroom_threshold=0.8)), 0.8)
+
+    def test_openrouter_uses_four_request_waves(self):
+        self.assertEqual(
+            cli._stage01_wave_size(object.__new__(openrouter.Client)), 4)
+        self.assertEqual(cli._stage01_wave_size(object()), 1)
+
     def test_synthesis_stages_do_not_inherit_stage_01_reasoning(self):
         """skill 02's jobs must carry no effort override — only 01 is tuned."""
-        jobs = BudgetSizingTests.build_filter_jobs(records=60, chunk=60)
+        jobs = Stage01ConfigurationTests.build_filter_jobs(records=60, chunk=60)
         self.assertEqual(jobs[0].effort, "low")
         self.assertIsNone(llm.Job("d0000", "dedup").effort)
 
@@ -459,15 +426,11 @@ class ReasoningCapTests(ReasoningControlTests):
         self.assertCountEqual(seen, [("a", 2000), ("b", None)])
 
     def test_stage_01_jobs_carry_the_cap(self):
-        jobs = BudgetSizingTests.build_filter_jobs(records=60, chunk=60)
+        jobs = Stage01ConfigurationTests.build_filter_jobs(records=60, chunk=60)
         self.assertEqual(jobs[0].reasoning_max_tokens, cli.REASONING_RESERVE)
 
-    def test_capped_reasoning_plus_answer_fits_the_sized_budget(self):
-        """The structural guarantee: if the cap is honoured, the answer always
-        has room. This is the invariant the 8,083-token run violated."""
-        for chunk in (20, 40, 60, 80, 120):
-            budget = cli._record_max_tokens(chunk, 40)
-            self.assertGreater(budget, cli.REASONING_RESERVE + chunk * 40 - 1, chunk)
+    def test_initial_tier_exceeds_the_requested_reasoning_cap(self):
+        self.assertGreater(cli.FILTER_TOKEN_TIERS[0], cli.REASONING_RESERVE)
 
     def test_anthropic_effort_none_disables_thinking_legally(self):
         """Opus 5 rejects disabled thinking above `high` effort."""

@@ -427,7 +427,7 @@ class IngestStage01Tests(unittest.TestCase):
             return out, saved
 
     def test_stage_completes_when_every_first_response_is_budget_starved(self):
-        """82/83 empty on the first pass, all recovered by the wider re-run."""
+        """A 12k exhaustion retries at 16k and then completes the stage."""
 
         class BudgetStarvedClient:
             """Returns nothing until the request has room to think AND answer."""
@@ -445,12 +445,7 @@ class IngestStage01Tests(unittest.TestCase):
                 result = {}
                 for j in jobs:
                     self.seen.append((j.id, j.max_tokens))
-                    # Starve anything at the stage's own sized budget; only the
-                    # widened re-run gets through. Keyed off the first budget
-                    # seen so the test tracks _record_max_tokens rather than
-                    # re-hardcoding whatever number it currently produces.
-                    self.floor = getattr(self, "floor", None) or j.max_tokens
-                    if j.max_tokens <= self.floor:
+                    if j.max_tokens == 12000:
                         result[j.id] = llm.BatchResult("", "length")
                     elif j.schema is cli.FILTER_SCHEMA:
                         ids = [int(x) for x in __import__("re").findall(
@@ -468,25 +463,13 @@ class IngestStage01Tests(unittest.TestCase):
 
         self.assertEqual(len(rows_out), 2)
         self.assertTrue(all(r["decision"] == "retain" for r in rows_out))
-        # Skill 01's budget is now derived from its schema, and the re-run is 3x
-        # whatever that came to — assert the relationship, not the constants.
         filter_budgets = [mt for jid, mt in client.seen if jid.startswith("f")]
-        self.assertEqual(len(filter_budgets), 2)
-        first, rerun = filter_budgets
-        self.assertEqual(rerun, first * cli.BUDGET_RETRY_FACTOR)
-        # The first request out is the calibration probe, so its ceiling is the
-        # sized budget widened deliberately — an unused ceiling is not billed,
-        # and sizing 83 chunks from an unmeasured guess is what failed before.
-        self.assertEqual(first,
-                         cli._record_max_tokens(2, 40) * cli.CALIBRATION_CEILING)
-        # The budget the stage computes is still schema-derived and modest; only
-        # the probe is widened.
-        self.assertLess(cli._record_max_tokens(2, 40), 8000)
-        # The starved original is still on disk, with its cause spelled out, and
-        # no repair pass was ever needed.
-        self.assertEqual(sorted(saved), ["f0000.original.txt", "f0000.rerun.txt"])
-        self.assertIn("STOP REASON: length", saved["f0000.original.txt"])
-        self.assertIn("output token budget", saved["f0000.original.txt"])
+        self.assertEqual(filter_budgets, [12000, 16000])
+        # The exhausted attempt is saved with its exact tier; the successful
+        # retry proceeds directly to validation and is not mislabeled a repair.
+        self.assertEqual(sorted(saved), ["f0000.budget_12000.txt"])
+        self.assertIn("STOP REASON: length", saved["f0000.budget_12000.txt"])
+        self.assertIn("output token budget", saved["f0000.budget_12000.txt"])
 
     def test_stage_still_aborts_when_recovery_cannot_fix_it(self):
         """No silent partial corpus — a stage that cannot recover must fail."""
@@ -504,7 +487,8 @@ class IngestStage01Tests(unittest.TestCase):
         with self.assertRaises(cli.BatchOutputError) as ctx:
             self.ingest(DeadClient())
         message = str(ctx.exception)
-        self.assertIn("output budget exhausted", message)
+        self.assertIn("hard ceiling exhausted", message)
+        self.assertIn("32k", message)
         self.assertIn("No stage output was written", message)
 
 
@@ -608,99 +592,12 @@ class RecoveryCarriesReasoningSettingsTests(unittest.TestCase):
         self.assertEqual(sent[0].effort, "low")
         self.assertEqual(sent[0].reasoning_max_tokens, 2000)
 
-
-class CalibrationTests(unittest.TestCase):
-    """Size the stage from one measured request, not from an assumption.
-
-    `reasoning.max_tokens` is a request, not a guarantee. The failing run sent
-    a 2,000-token ceiling on every chunk, sized all 83 budgets on the assumption
-    it would be honoured, and had no way to notice that it wasn't.
-    """
-
-    def jobs(self, n, max_tokens=5060):
-        return [llm.Job(id=f"f{i:04d}", prompt=f"chunk {i}", max_tokens=max_tokens,
-                        schema=cli.FILTER_SCHEMA, expected_ids=(i,),
-                        effort="low", reasoning_max_tokens=2000)
-                for i in range(n)]
-
-    class Client:
-        def __init__(self, reply):
-            self.reply, self.calls = reply, []
-
-        def batch(self, _corpus, _preamble, jobs):
-            self.calls.append(jobs)
-            return {j.id: self.reply(j) for j in jobs}
-
-    def calibrate(self, jobs, reply):
-        client = self.Client(reply)
-        results, sized = cli._calibrate_budget(client, "corpus", "pre", jobs, "01")
-        return client, results, sized
-
-    def test_probe_goes_out_with_a_widened_ceiling(self):
-        client, _r, _j = self.calibrate(
-            self.jobs(3),
-            lambda j: llm.BatchResult('{"records":[]}', "stop", 1500, 3000))
-        self.assertEqual(len(client.calls[0]), 1)
-        self.assertEqual(client.calls[0][0].max_tokens,
-                         5060 * cli.CALIBRATION_CEILING)
-
-    def test_probe_keeps_the_stage_reasoning_settings(self):
-        client, _r, _j = self.calibrate(
-            self.jobs(2),
-            lambda j: llm.BatchResult('{"records":[]}', "stop", 1500, 3000))
-        self.assertEqual(client.calls[0][0].effort, "low")
-        self.assertEqual(client.calls[0][0].reasoning_max_tokens, 2000)
-
-    def test_remaining_chunks_are_sized_from_the_measurement(self):
-        client, _r, _j = self.calibrate(
-            self.jobs(3),
-            lambda j: llm.BatchResult('{"records":[]}', "stop", 1500, 4000))
-        rest = client.calls[1]
-        self.assertEqual(len(rest), 2)
-        self.assertEqual(rest[0].max_tokens,
-                         int(4000 * cli.CALIBRATION_MARGIN))
-
-    def test_a_measured_overrun_raises_the_budget_above_the_computed_one(self):
-        """The failing run in miniature: the route ignores the 2,000-token
-        ceiling and spends 9,000. The remaining chunks must be sized for what
-        the route does, not for what it was asked to do."""
-        client, _r, _j = self.calibrate(
-            self.jobs(3),
-            lambda j: llm.BatchResult('{"records":[]}', "stop", 9000, 11000))
-        self.assertGreater(client.calls[1][0].max_tokens, 5060)
-
-    def test_measurement_never_shrinks_the_computed_budget(self):
-        client, _r, _j = self.calibrate(
-            self.jobs(3),
-            lambda j: llm.BatchResult('{"records":[]}', "stop", 10, 20))
-        self.assertEqual(client.calls[1][0].max_tokens, 5060)
-
-    def test_probe_result_is_reused_rather_than_paid_for_twice(self):
-        client, results, _j = self.calibrate(
-            self.jobs(3),
-            lambda j: llm.BatchResult('{"records":[]}', "stop", 100, 200))
-        self.assertIn("f0000", results)
-        self.assertEqual(len(client.calls), 2)
-        self.assertNotIn("f0000", [j.id for j in client.calls[1]])
-
-    def test_missing_usage_keeps_the_headroom_rather_than_the_guess(self):
-        """No measurement means no grounds for a tight budget."""
-        client, _r, _j = self.calibrate(
-            self.jobs(3), lambda j: llm.BatchResult('{"records":[]}', "stop"))
-        self.assertEqual(client.calls[1][0].max_tokens,
-                         5060 * cli.CALIBRATION_CEILING)
-
-    def test_single_chunk_stage_still_returns_its_result(self):
-        _c, results, jobs = self.calibrate(
-            self.jobs(1), lambda j: llm.BatchResult('{"records":[]}', "stop", 1, 2))
-        self.assertEqual(list(results), ["f0000"])
-        self.assertEqual(len(jobs), 1)
-
-    def test_empty_stage_is_a_no_op(self):
-        client = self.Client(lambda j: llm.BatchResult())
-        results, jobs = cli._calibrate_budget(client, "c", "p", [], "01")
-        self.assertEqual((results, jobs), ({}, []))
-        self.assertEqual(client.calls, [])
+    def test_json_repair_does_not_increase_the_output_ceiling(self):
+        job = self.failing_job(max_tokens=12000)
+        sent = self.capture(lambda c: cli._repair_batch(
+            c, "corpus", "preamble", [(job, "half a json", "malformed")],
+            "records"))
+        self.assertEqual(sent[0].max_tokens, 12000)
 
 
 class FailureModeReportingTests(unittest.TestCase):
