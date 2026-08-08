@@ -72,9 +72,9 @@ class Job:
 # have to recognise the same condition.
 BUDGET_STOP_REASONS = ("max_tokens", "length")
 
-# A refusal is a decision, not a shortfall. Re-running it spends money to be
-# refused again, so it must never be classified as retryable.
-NO_RETRY_STOP_REASONS = ("refusal",)
+# A refusal or a content-filter block is a decision, not a shortfall. Re-running
+# it spends money to be blocked again, so neither is ever retryable.
+NO_RETRY_STOP_REASONS = ("refusal", "content_filter")
 
 
 @dataclass
@@ -105,6 +105,21 @@ class BatchResult:
         if self.stop_reason in NO_RETRY_STOP_REASONS:
             return False
         return self.out_of_budget or not (self.text or "").strip()
+
+    @property
+    def repairable(self) -> bool:
+        """True when a shape-repair pass has something to work with.
+
+        Repair shows the model its own output and asks for the shape to be
+        fixed. An empty reply has no shape to fix — handing "" to that prompt
+        is the original bug in a different costume, and it burns a paid request
+        to re-derive an answer the model never wrote. A blocked reply is not
+        repairable either: the block was the provider's decision, not a
+        formatting slip.
+        """
+        if self.stop_reason in NO_RETRY_STOP_REASONS:
+            return False
+        return bool((self.text or "").strip())
 
 
 @dataclass

@@ -65,7 +65,7 @@ class StructuredBatchTests(unittest.TestCase):
         client.model = "test/model"
         client.key = "test-key"
         client.effort = "high"
-        client.spent = {"in": 0, "out": 0, "cache_write": 0, "cache_read": 0}
+        client.spent = {"in": 0, "out": 0, "reasoning": 0, "cache_write": 0, "cache_read": 0}
         with mock.patch("urllib.request.urlopen", return_value=FakeResponse()) as call:
             client._post([{"role": "user", "content": "x"}], 100, SCHEMA)
         request = call.call_args.args[0]
@@ -107,7 +107,7 @@ class StructuredBatchTests(unittest.TestCase):
         client.key = "test-key"
         client.verbose = False
         client.effort = "high"
-        client.spent = {"in": 0, "out": 0, "cache_write": 0, "cache_read": 0}
+        client.spent = {"in": 0, "out": 0, "reasoning": 0, "cache_write": 0, "cache_read": 0}
         unsupported = urllib.error.HTTPError(
             "https://example.test", 404, "not found", {},
             io.BytesIO(b'{"error":"No endpoints support requested parameters: '

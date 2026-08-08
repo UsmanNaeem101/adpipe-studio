@@ -275,7 +275,10 @@ class BatchRecoveryTests(unittest.TestCase):
             with open(os.path.join(tmp, "a.original.txt"), encoding="utf-8") as fh:
                 original = fh.read()
 
-        self.assertEqual(saved, ["a.original.txt", "a.repaired.txt", "a.rerun.txt"])
+        # No .repaired.txt: the re-run also came back empty, and an empty reply
+        # has no shape to repair — spending a repair request on "" is the
+        # original bug wearing a different hat.
+        self.assertEqual(saved, ["a.original.txt", "a.rerun.txt"])
         # The metadata whose absence made this failure unreadable on disk.
         self.assertIn("STOP REASON: length", original)
         self.assertIn("MAX TOKENS: 8000", original)
@@ -311,7 +314,7 @@ class ProviderStopReasonTests(unittest.TestCase):
         self.client.key = "test-key"
         self.client.verbose = False
         self.client.effort = "low"
-        self.client.spent = {"in": 0, "out": 0, "cache_write": 0, "cache_read": 0}
+        self.client.spent = {"in": 0, "out": 0, "reasoning": 0, "cache_write": 0, "cache_read": 0}
 
     def tearDown(self):
         self.env.stop()

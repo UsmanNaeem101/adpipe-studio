@@ -89,7 +89,8 @@ class Client:
                 "  export OPENROUTER_API_KEY=sk-or-...\n"
                 "Get one at https://openrouter.ai/keys"
             )
-        self.spent = {"in": 0, "out": 0, "cache_write": 0, "cache_read": 0}
+        self.spent = {"in": 0, "out": 0, "reasoning": 0,
+                      "cache_write": 0, "cache_read": 0}
 
     # ------------------------------------------------------------- internals
 
@@ -144,6 +145,13 @@ class Client:
                 u = payload.get("usage") or {}
                 self.spent["in"] += u.get("prompt_tokens", 0)
                 self.spent["out"] += u.get("completion_tokens", 0)
+                # Reasoning is billed out of the same completion allowance as the
+                # answer, so it is the number that decides whether a budget is
+                # survivable — and it was invisible here. Providers report it as
+                # completion_tokens_details.reasoning_tokens; some flatten it.
+                self.spent["reasoning"] += (
+                    (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
+                    or u.get("reasoning_tokens") or 0)
                 # Tolerate a reply with no choices at all rather than raising an
                 # IndexError: an empty response is a failure mode the caller can
                 # classify and re-run, a traceback is one it can only abort on.

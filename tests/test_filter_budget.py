@@ -141,7 +141,7 @@ class ReasoningControlTests(unittest.TestCase):
         self.client.key = "k"
         self.client.verbose = False
         self.client.effort = "high"
-        self.client.spent = {"in": 0, "out": 0, "cache_write": 0, "cache_read": 0}
+        self.client.spent = {"in": 0, "out": 0, "reasoning": 0, "cache_write": 0, "cache_read": 0}
 
     def tearDown(self):
         self.env.stop()
@@ -478,6 +478,146 @@ class ReasoningCapTests(ReasoningControlTests):
         p = client._params([], "prompt", 100, effort="low")
         self.assertEqual(p["thinking"], {"type": "adaptive"})
         self.assertEqual(p["output_config"]["effort"], "low")
+
+
+class EmptyResponseTaxonomyTests(unittest.TestCase):
+    """Ported from 33b9468: an empty reply is never a JSON problem.
+
+    That branch's modeloutput.py split empty replies by finish reason. Our
+    classification covered budget exhaustion and refusals but treated a
+    content-filter block as retryable, and let an empty reply that survived the
+    re-run fall through to the JSON repair pass — which is the original bug's
+    shape: there is nothing in "" to repair.
+    """
+
+    def test_budget_exhaustion_reruns(self):
+        for stop in ("length", "max_tokens"):
+            r = llm.BatchResult("", stop)
+            self.assertTrue(r.retryable, stop)
+            self.assertFalse(r.repairable, stop)
+
+    def test_content_filter_is_neither_rerun_nor_repaired(self):
+        r = llm.BatchResult("", "content_filter")
+        self.assertFalse(r.retryable)
+        self.assertFalse(r.repairable)
+
+    def test_refusal_is_neither_rerun_nor_repaired(self):
+        r = llm.BatchResult("", "refusal")
+        self.assertFalse(r.retryable)
+        self.assertFalse(r.repairable)
+
+    def test_transient_provider_error_reruns_but_never_repairs(self):
+        """A provider error may be transient, so re-running is fair. Repairing
+        an empty body never is."""
+        r = llm.BatchResult("", "error")
+        self.assertTrue(r.retryable)
+        self.assertFalse(r.repairable)
+
+    def test_empty_with_unknown_finish_reruns_but_never_repairs(self):
+        r = llm.BatchResult("", "stop")
+        self.assertTrue(r.retryable)
+        self.assertFalse(r.repairable)
+
+    def test_non_empty_malformed_json_still_repairs(self):
+        r = llm.BatchResult("I judged them but wrote no JSON.", "stop")
+        self.assertFalse(r.retryable)
+        self.assertTrue(r.repairable)
+
+    def test_truncated_reply_reruns_first_then_can_repair(self):
+        r = llm.BatchResult('{"records":[{"evidence_id', "length")
+        self.assertTrue(r.retryable)
+        self.assertTrue(r.repairable)
+
+    def test_no_empty_reply_reaches_the_repair_pass(self):
+        """End to end through _batch_rows, for every empty-reply flavour."""
+        for stop in ("content_filter", "error", "stop", "length", "refusal"):
+            calls = {"repair": 0}
+
+            def repair(failures):
+                calls["repair"] += 1
+                return {}
+
+            def rerun(failures, factor):
+                return {j.id: llm.BatchResult("", stop) for j, _r, _x in failures}
+
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(cli.BatchOutputError):
+                    cli._batch_rows({"a": llm.BatchResult("", stop)},
+                                    [llm.Job("a", "p")], "records", tmp,
+                                    repair=repair, rerun=rerun)
+            self.assertEqual(calls["repair"], 0, stop)
+
+    def test_blocked_reply_is_named_as_blocked_in_the_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(cli.BatchOutputError) as ctx:
+                cli._batch_rows({"a": llm.BatchResult("", "content_filter")},
+                                [llm.Job("a", "p")], "records", tmp)
+        self.assertIn("blocked by the provider", str(ctx.exception))
+
+
+class PortedRegressionGuardTests(unittest.TestCase):
+    """What we deliberately did NOT port from 33b9468."""
+
+    def test_one_returns_empty_text_rather_than_raising(self):
+        """33b9468 made _post raise EmptyResponse on a non-budget empty reply.
+        cmd_extract calls c.one() with no exception guard, so that turns its
+        EMPTY_EXTRACTION_RETRIES loop into a crash. Verified against that
+        branch's code; we keep returning text so the loop still runs."""
+        client = object.__new__(openrouter.Client)
+        client.model, client.key, client.verbose = "m", "k", False
+        client.effort = "low"
+        client.spent = {"in": 0, "out": 0, "reasoning": 0,
+                        "cache_write": 0, "cache_read": 0}
+        payload = {"choices": [{"message": {"content": ""},
+                                "finish_reason": "stop"}], "usage": {}}
+
+        class Fake:
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *_a):
+                return False
+
+            def read(s):
+                return json.dumps(payload).encode()
+
+        with mock.patch.dict(os.environ, {"ADPIPE_LOG_DIR": tempfile.mkdtemp()}), \
+                mock.patch("urllib.request.urlopen", return_value=Fake()):
+            self.assertEqual(client.one("c", "p", "prompt", 100), "")
+
+    def test_stage_02_reasoning_is_unchanged_by_default(self):
+        from types import SimpleNamespace
+        self.assertIsNone(cli.dedup_effort({}, SimpleNamespace()))
+        self.assertEqual(
+            cli.dedup_effort({"dedup": {"effort": "none"}}, SimpleNamespace()),
+            "none")
+
+    def test_reasoning_tokens_are_recorded_for_comparison(self):
+        client = object.__new__(openrouter.Client)
+        client.model, client.key, client.verbose = "m", "k", False
+        client.effort = "low"
+        client.spent = {"in": 0, "out": 0, "reasoning": 0,
+                        "cache_write": 0, "cache_read": 0}
+        payload = {"choices": [{"message": {"content": "{}"},
+                                "finish_reason": "stop"}],
+                   "usage": {"prompt_tokens": 10, "completion_tokens": 90,
+                             "completion_tokens_details": {"reasoning_tokens": 80}}}
+
+        class Fake:
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *_a):
+                return False
+
+            def read(s):
+                return json.dumps(payload).encode()
+
+        with mock.patch.dict(os.environ, {"ADPIPE_LOG_DIR": tempfile.mkdtemp()}), \
+                mock.patch("urllib.request.urlopen", return_value=Fake()):
+            client._post([{"role": "user", "content": "x"}], 100)
+        self.assertEqual(client.spent["reasoning"], 80)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -369,11 +369,25 @@ REASONING_RESERVE = 2000
 # and must not inherit this.
 FILTER_CHUNK = 60
 FILTER_EFFORT = "low"
+DEDUP_EFFORT = None   # None = leave skill 02 exactly as it was
 
 
 def filter_chunk(cfg, args):
     return int(getattr(args, "chunk", None)
                or cfg.get("filter", {}).get("chunk") or FILTER_CHUNK)
+
+
+def dedup_effort(cfg, args):
+    """Reasoning depth for skill 02 only.
+
+    Defaults to None — the client's own setting, i.e. unchanged. Skill 02 is
+    semantic duplicate detection: deciding that two differently-worded comments
+    are the same person's same experience is exactly the judgement reasoning
+    helps with, and its own skill file warns that the cardinal sin is the false
+    merge. It gets a knob so the question can be measured, not a new default.
+    """
+    return (getattr(args, "dedup_effort", None)
+            or cfg.get("dedup", {}).get("effort") or DEDUP_EFFORT)
 
 
 def filter_effort(cfg, args):
@@ -690,8 +704,10 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None):
 
     # ---- wrong-shape replies: ask the model to fix the shape ----------------
     if failures and repair is not None:
-        fixable = [f for f in failures
-                   if f[1].stop_reason not in NO_RETRY_STOP_REASONS]
+        # Only replies that actually contain text. An empty one has no shape to
+        # repair — that was the original failure, and sending "" to the repair
+        # prompt just pays for a second helping of it.
+        fixable = [f for f in failures if f[1].repairable]
         if fixable:
             print(f"  ! repairing {len(fixable)} malformed {key} response(s) "
                   "in one additional structured batch")
@@ -711,8 +727,7 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None):
                 if reason:
                     still_bad.append((job, result,
                                       f"original: {original_reason}; repair: {reason}"))
-            failures = [f for f in failures
-                        if f[1].stop_reason in NO_RETRY_STOP_REASONS] + still_bad
+            failures = [f for f in failures if not f[1].repairable] + still_bad
 
     if unexpected:
         os.makedirs(diagnostics_dir, exist_ok=True)
@@ -730,7 +745,7 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None):
         # budget" tells the operator to raise max_tokens or pick another model.
         modes = Counter(
             "output budget exhausted" if first.out_of_budget else
-            "refused" if first.stop_reason in NO_RETRY_STOP_REASONS else
+            "blocked by the provider" if first.stop_reason in NO_RETRY_STOP_REASONS else
             "empty response" if not first.text.strip() else "malformed JSON"
             for first in (first_result[job.id] for job, _r, _reason in failures))
         if unexpected:
@@ -873,7 +888,8 @@ def cmd_ingest(cfg, args):
                          "empty groups list is a valid answer.\n\n"
                          "RECORDS:\n\n"
                          + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
-                 max_tokens=6000, schema=DEDUP_SCHEMA)
+                 max_tokens=6000, schema=DEDUP_SCHEMA,
+                 effort=dedup_effort(cfg, args))
              for n, ch in enumerate(dchunks)]
 
     dprefix = f"{s02}\n\n---\n\n{ctx}"
