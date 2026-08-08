@@ -687,6 +687,7 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
         def __init__(self, fail_on_call=False):
             self.fail_on_call = fail_on_call
             self.calls = []
+            self.max_tokens_by_job = {}
 
         def estimate(self, *args, **kwargs):
             if self.fail_on_call:
@@ -704,6 +705,7 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
             replies = {}
             for job in jobs:
                 if job.id.startswith("03a_"):
+                    self.max_tokens_by_job[job.id] = job.max_tokens
                     payload = {"candidates": [{
                         "candidate_key": "desk_workers",
                         "provisional_name": "Desk workers",
@@ -735,6 +737,7 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
                 raise AssertionError("completed segmentation step was rerun")
             job_id = kwargs.get("job_id")
             self.calls.append(job_id)
+            self.max_tokens_by_job[job_id] = max_tokens
             if schema is segmentation.CONSOLIDATE_SCHEMA:
                 payload = {"candidates": [{
                     "candidate_id": "cand_desk", "slug": "desk_workers",
@@ -797,6 +800,10 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
             self.assertEqual(candidates[0]["supporting_evidence_count"], 1)
             self.assertEqual(candidates[0]["context_evidence_count"], 1)
             self.assertTrue(candidates[0]["representative_evidence_ids"])
+            self.assertEqual(first.max_tokens_by_job["03b_consolidate"], 64000)
+            self.assertTrue(all(
+                ceiling == 12000 for job_id, ceiling in
+                first.max_tokens_by_job.items() if job_id.startswith("03a_")))
 
             second = self.FakeClient(fail_on_call=True)
             with mock.patch.object(cli, "client", return_value=second), \

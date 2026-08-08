@@ -79,6 +79,41 @@ class SingleStructuredRecoveryTests(unittest.TestCase):
         self.assertEqual((first["max_tokens"], retry["max_tokens"]),
                          (16000, 24000))
 
+    def test_03b_uses_64k_then_128k_for_a_large_legitimate_answer(self):
+        client = ScriptedSingleClient([
+            llm.BatchResult("partial catalogue", "max_tokens", 1273, 64000),
+            llm.BatchResult('{"items":[1]}', "stop", 1400, 65000),
+        ])
+        stream = io.StringIO()
+        request = job(64000)
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(stream):
+            value = cli._run_single_structured(
+                client, "corpus", "preamble", request, tmp,
+                token_tiers=cli.STAGE03B_TOKEN_TIERS)
+        self.assertEqual(value, {"items": [1]})
+        self.assertEqual([call["max_tokens"] for call in client.calls],
+                         [64000, 128000])
+        self.assertIn("64k → 128k", stream.getvalue())
+        self.assertIn("62,727 answer", stream.getvalue())
+        for name in ("prompt", "schema", "effort", "reasoning_max_tokens"):
+            self.assertEqual(client.calls[0][name], client.calls[1][name], name)
+
+    def test_03b_128k_ceiling_is_terminal(self):
+        client = ScriptedSingleClient([
+            llm.BatchResult("partial", "length", 1000, 128000),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(cli.BatchOutputError):
+                cli._run_single_structured(
+                    client, "corpus", "preamble", job(128000), tmp,
+                    token_tiers=cli.STAGE03B_TOKEN_TIERS)
+        self.assertEqual([call["max_tokens"] for call in client.calls], [128000])
+
+    def test_single_call_tiers_are_stage_specific(self):
+        self.assertEqual(cli._single_call_tiers(64000, cli.STAGE03B_TOKEN_TIERS),
+                         (64000, 128000))
+        self.assertEqual(cli._single_call_tiers(16000), (16000, 24000, 32000))
+
     def test_empty_refusal_or_filter_fails_without_retry(self):
         for stop in llm.NO_RETRY_STOP_REASONS:
             with self.subTest(stop=stop):

@@ -397,6 +397,11 @@ DEDUP_EFFORT = None   # None = leave skill 02 exactly as it was
 # coarse tiers avoid paying to rediscover that a nearby ceiling is also too low.
 # A ceiling is not spend: providers charge generated tokens, not tokens allowed.
 ADAPTIVE_TOKEN_TIERS = (12000, 16000, 24000, 32000)
+# 03B emits the complete canonical catalogue in one response. Live telemetry
+# showed 22,727 answer tokens plus only 1,273 reasoning tokens at a 24k stop, so
+# its legitimate answer shape—not reasoning—is larger than the general recovery
+# tiers. Keep this policy local to 03B's two consolidation calls.
+STAGE03B_TOKEN_TIERS = (64000, 128000)
 ADAPTIVE_OPENROUTER_WAVE_SIZE = 4
 ADAPTIVE_PROGRESS_WIDTH = 20
 
@@ -773,13 +778,14 @@ def _single_call_result(client_, corpus, preamble, job, operation):
         corpus, preamble, job.prompt, job.max_tokens, job.schema))
 
 
-def _single_call_tiers(starting_ceiling):
-    """The current ceiling followed by the shared coarse tiers above it."""
+def _single_call_tiers(starting_ceiling, token_tiers=ADAPTIVE_TOKEN_TIERS):
+    """The current ceiling followed by this stage's coarse tiers above it."""
     return (starting_ceiling,) + tuple(
-        tier for tier in ADAPTIVE_TOKEN_TIERS if tier > starting_ceiling)
+        tier for tier in token_tiers if tier > starting_ceiling)
 
 
-def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir):
+def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
+                           token_tiers=ADAPTIVE_TOKEN_TIERS):
     """Run one structured Job with failure-aware, bounded recovery.
 
     Budget stops retry the identical Job at the next coarse ceiling. Refusals,
@@ -787,7 +793,7 @@ def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir):
     malformed/schema-invalid reply gets one shape-only repair. At no point does
     an empty budget-starved response reach the JSON parser.
     """
-    tiers = _single_call_tiers(job.max_tokens)
+    tiers = _single_call_tiers(job.max_tokens, token_tiers)
     tier_index = 0
     current = job
     repairing = False
@@ -2336,7 +2342,7 @@ def cmd_segment(cfg, args):
                     "Preserve merged_candidate_keys exactly and do not output a "
                     "validation status.\n\nCATALOGUE:\n" +
                     json.dumps(catalogue, ensure_ascii=False, indent=2)),
-            max_tokens=int(_segment_setting(cfg, "03b_max_tokens", 24000)),
+            max_tokens=int(_segment_setting(cfg, "03b_max_tokens", 64000)),
             schema=segmentation.CONSOLIDATE_SCHEMA,
             effort=_segment_setting(cfg, "03b_effort", None))
         if not confirm(c.estimate(s03b, SEGMENT_PREAMBLE, [job03b]),
@@ -2344,7 +2350,8 @@ def cmd_segment(cfg, args):
             return
         raw = _run_single_structured(
             c, s03b, SEGMENT_PREAMBLE, job03b,
-            os.path.join(diagnostics, "03b"))["candidates"]
+            os.path.join(diagnostics, "03b"),
+            token_tiers=STAGE03B_TOKEN_TIERS)["candidates"]
         initial = segmentation.finalize_consolidated(raw, catalogue)
         _json_atomic(initial_p, initial)
         _json_atomic(initial_meta, {"input_fingerprint": catalogue_fingerprint})
@@ -2434,7 +2441,7 @@ def cmd_segment(cfg, args):
                     "audiences where possible and incorporate only defensible recurring "
                     "novelty proposals.\n\nCATALOGUE:\n" +
                     json.dumps(combined, ensure_ascii=False, indent=2)),
-            max_tokens=int(_segment_setting(cfg, "03b_max_tokens", 24000)),
+            max_tokens=int(_segment_setting(cfg, "03b_max_tokens", 64000)),
             schema=segmentation.CONSOLIDATE_SCHEMA,
             effort=_segment_setting(cfg, "03b_effort", None))
         if not confirm(c.estimate(s03b, SEGMENT_PREAMBLE, [job03b2]),
@@ -2442,7 +2449,8 @@ def cmd_segment(cfg, args):
             return
         raw = _run_single_structured(
             c, s03b, SEGMENT_PREAMBLE, job03b2,
-            os.path.join(diagnostics, "03b_novelty"))["candidates"]
+            os.path.join(diagnostics, "03b_novelty"),
+            token_tiers=STAGE03B_TOKEN_TIERS)["candidates"]
         final = segmentation.finalize_consolidated(raw, combined)
         _json_atomic(final03b_p, final)
         _json_atomic(final03b_meta, {"input_fingerprint": final03b_fingerprint})

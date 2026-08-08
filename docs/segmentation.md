@@ -79,10 +79,10 @@ does not pin provider routing.
 
 The first persisted 03A contract has a narrow compatibility migration. Its exact
 legacy fingerprints are recognized and revalidated locally: valid chunks are migrated
-without a model call, legacy key casing is normalized deterministically, and only
-chunks with substantive contract violations enter structured repair. Repairs preserve
-the discovered candidates and all valid evidence IDs rather than silently deleting a
-hallucinated ID in code.
+without a model call, legacy key casing is normalized deterministically, and impossible
+out-of-chunk evidence IDs are removed locally when valid in-chunk support remains. Only
+substantive contract violations—or candidates left with no valid evidence—enter
+structured repair.
 
 ## Per-project settings
 
@@ -95,7 +95,7 @@ Optional `project.json` settings live under `segmentation`:
     "03a_max_tokens": 12000,
     "03a_effort": "high",
     "03a_include_supporting": false,
-    "03b_max_tokens": 24000,
+    "03b_max_tokens": 64000,
     "03b_effort": "high",
     "03e_chunk_tokens": 8000,
     "03e_max_tokens": 12000,
@@ -113,3 +113,8 @@ Optional `project.json` settings live under `segmentation`:
 
 Unset effort values inherit the selected client's reasoning policy. Stage-specific
 values override it without changing unrelated stages.
+
+Stage 03B uses a separate `64,000 → 128,000` output-ceiling ladder because it emits
+the complete canonical candidate catalogue in one response. The setting above controls
+its starting ceiling; only an actual `length`/`max_tokens` stop advances it. This does
+not change 03A's 12,000-token rolling-wave ceiling or any stage's reasoning policy.
