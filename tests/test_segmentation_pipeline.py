@@ -61,6 +61,39 @@ class SegmentationBookkeepingTests(unittest.TestCase):
             self.assertEqual(ctx.exception.invalid_evidence_ids,
                              sorted(set(bad_ids) - {3, 9, 17}))
 
+    def test_provenance_cleanup_removes_one_impossible_id_locally(self):
+        row = self.harvest_candidate(evidence_ids=[3, 99, 9])
+        events = segmentation.clean_harvest_provenance(
+            [row], [3, 9, 17], chunk_id="03a_0007")
+        self.assertEqual(row["evidence_ids"], [3, 9])
+        self.assertEqual(events, [{
+            "chunk_id": "03a_0007",
+            "candidate": "desk_workers",
+            "removed_evidence_ids": [99],
+            "remaining_evidence_count": 2,
+        }])
+
+    def test_provenance_cleanup_preserves_semantics_and_valid_id_order(self):
+        row = self.harvest_candidate(evidence_ids=[9, 98, 3, 99, 17])
+        semantic_fields = {key: value for key, value in row.items()
+                           if key != "evidence_ids"}
+        events = segmentation.clean_harvest_provenance(
+            [row], [3, 9, 17], chunk_id="03a_0008")
+        self.assertEqual(row["evidence_ids"], [9, 3, 17])
+        self.assertEqual(
+            {key: value for key, value in row.items() if key != "evidence_ids"},
+            semantic_fields)
+        self.assertEqual(events[0]["removed_evidence_ids"], [98, 99])
+
+    def test_provenance_cleanup_with_zero_valid_ids_requires_repair(self):
+        row = self.harvest_candidate(evidence_ids=[98, 99])
+        original = dict(row, evidence_ids=list(row["evidence_ids"]))
+        with self.assertRaises(segmentation.HarvestProvenanceFailure) as ctx:
+            segmentation.clean_harvest_provenance(
+                [row], [3, 9, 17], chunk_id="03a_0009")
+        self.assertEqual(row, original)
+        self.assertEqual(ctx.exception.invalid_evidence_ids, [98, 99])
+
     def test_harvest_contract_rejects_duplicate_ids(self):
         with self.assertRaises(segmentation.HarvestContractError):
             segmentation.validate_harvest_rows(
@@ -425,7 +458,118 @@ class SegmentationArtifactTests(unittest.TestCase):
         self.assertEqual(result[0]["candidates"], good["candidates"])
         self.assertEqual(saved["candidates"], good["candidates"])
 
-    def test_26_good_cached_chunks_and_one_bad_only_repairs_bad_chunk(self):
+    def test_fresh_provenance_only_violation_adds_no_repair_model_call(self):
+        chunk = {"chunk_id": "03a_0000", "evidence_ids": [1, 2],
+                 "estimated_tokens": 4, "records": [record(1), record(2)]}
+        job = Job(id=chunk["chunk_id"], prompt="search audiences", max_tokens=12000,
+                  schema=segmentation.harvest_schema(chunk["evidence_ids"]))
+        candidate = {
+            "candidate_key": "desk_workers", "provisional_name": "Desk workers",
+            "audience_cue": "desk work", "why_commercially_distinct": "workday",
+            "evidence_ids": [1, 999], "cue_terms": ["desk"],
+            "discovery_strength": "probable",
+        }
+
+        class Client:
+            def __init__(self):
+                self.calls = 0
+
+            def estimate(self, *_args, **_kwargs):
+                return mock.Mock()
+
+            def prewarm(self, *_args, **_kwargs):
+                pass
+
+            def batch(self, _corpus, _preamble, work):
+                self.calls += 1
+                return {work[0].id: BatchResult(
+                    json.dumps({"candidates": [candidate]}), "stop")}
+
+        def cleaner(current_job, rows):
+            return segmentation.clean_harvest_provenance(
+                rows, chunk["evidence_ids"], chunk_id=current_job.id)
+
+        def validator(current_job, rows):
+            segmentation.validate_harvest_rows(
+                rows, chunk["evidence_ids"], chunk_id=current_job.id)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(llm, "confirm", return_value=True):
+            client = Client()
+            result = cli._run_persisted_segment_jobs(
+                client, "skill", [job], [chunk], "candidates", tmp,
+                os.path.join(tmp, "failures"), SimpleNamespace(yes=True), "03A",
+                row_validator=validator, row_cleaner=cleaner,
+                repair_guidance="repair broader contract errors",
+                contract_version=segmentation.HARVEST_CONTRACT_VERSION)
+        self.assertEqual(client.calls, 1)  # discovery only; no repair request
+        self.assertEqual(result[0]["candidates"][0]["evidence_ids"], [1])
+
+    def test_cached_all_outside_ids_routes_to_structured_repair(self):
+        chunk = {"chunk_id": "03a_0000", "evidence_ids": [1, 2],
+                 "estimated_tokens": 4, "records": [record(1), record(2)]}
+        job = Job(id=chunk["chunk_id"], prompt="search audiences", max_tokens=12000,
+                  schema=segmentation.harvest_schema(chunk["evidence_ids"]))
+
+        def candidate(evidence_ids):
+            return {
+                "candidate_key": "desk_workers", "provisional_name": "Desk workers",
+                "audience_cue": "desk work",
+                "why_commercially_distinct": "workday",
+                "evidence_ids": evidence_ids, "cue_terms": ["desk"],
+                "discovery_strength": "probable",
+            }
+
+        class Client:
+            def __init__(self):
+                self.calls = 0
+
+            def estimate(self, *_args, **_kwargs):
+                return mock.Mock()
+
+            def prewarm(self, *_args, **_kwargs):
+                pass
+
+            def batch(self, _corpus, _preamble, work):
+                self.calls += 1
+                return {work[0].id: BatchResult(json.dumps(
+                    {"candidates": [candidate([1])]}), "stop")}
+
+        def cleaner(current_job, rows):
+            return segmentation.clean_harvest_provenance(
+                rows, chunk["evidence_ids"], chunk_id=current_job.id)
+
+        def validator(current_job, rows):
+            segmentation.validate_harvest_rows(
+                rows, chunk["evidence_ids"], chunk_id=current_job.id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = {
+                "chunk_id": job.id, "evidence_ids": chunk["evidence_ids"],
+                "estimated_input_tokens": 4,
+                "fingerprint": cli._job_fingerprint(
+                    job, chunk["evidence_ids"], "skill",
+                    segmentation.HARVEST_CONTRACT_VERSION),
+                "candidates": [candidate([999])],
+            }
+            cli._json_atomic(os.path.join(tmp, job.id + ".json"), saved)
+            output = io.StringIO()
+            client = Client()
+            with mock.patch.object(llm, "confirm", return_value=True), \
+                    mock.patch("sys.stdout", output):
+                result = cli._run_persisted_segment_jobs(
+                    client, "skill", [job], [chunk], "candidates", tmp,
+                    os.path.join(tmp, "failures"), SimpleNamespace(yes=True),
+                    "03A", row_validator=validator, row_cleaner=cleaner,
+                    repair_guidance="repair unsupported candidate",
+                    contract_version=segmentation.HARVEST_CONTRACT_VERSION)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(result[0]["candidates"], [candidate([1])])
+        self.assertIn("03A PROVENANCE FAILURE", output.getvalue())
+        self.assertIn("all cited evidence IDs were outside the chunk",
+                      output.getvalue())
+
+    def test_26_good_cached_chunks_and_one_provenance_cleanup_use_no_model(self):
         chunks = [{
             "chunk_id": f"03a_{n:04d}", "evidence_ids": [n + 1],
             "estimated_tokens": 4, "records": [record(n + 1)],
@@ -446,53 +590,41 @@ class SegmentationArtifactTests(unittest.TestCase):
             for job, chunk in zip(legacy_jobs, chunks)}
         allowed = {chunk["chunk_id"]: chunk["evidence_ids"] for chunk in chunks}
 
-        def candidate(evidence_id):
+        def candidate(evidence_ids):
             return {
                 "candidate_key": "desk_workers",
                 "provisional_name": "Desk workers",
                 "audience_cue": "desk work",
                 "why_commercially_distinct": "workday",
-                "evidence_ids": [evidence_id], "cue_terms": ["desk"],
+                "evidence_ids": list(evidence_ids), "cue_terms": ["desk"],
                 "discovery_strength": "probable",
             }
-
-        class Client:
-            def __init__(self):
-                self.batch_job_ids = []
-
-            def estimate(self, _corpus, _preamble, work, **_kwargs):
-                self.estimated_ids = [job.id for job in work]
-                return mock.Mock()
-
-            def prewarm(self, *args, **kwargs):
-                pass
-
-            def batch(self, _corpus, _preamble, work):
-                self.batch_job_ids.append([job.id for job in work])
-                job = work[0]
-                payload = {"candidates": [candidate(27)]}
-                return {job.id: BatchResult(json.dumps(payload), "stop")}
 
         def validator(job, rows):
             segmentation.validate_harvest_rows(
                 rows, allowed[job.id], chunk_id=job.id)
 
+        def cleaner(job, rows):
+            return segmentation.clean_harvest_provenance(
+                rows, allowed[job.id], chunk_id=job.id)
+
         with tempfile.TemporaryDirectory() as tmp:
             for job, chunk in zip(jobs, chunks):
-                evidence_id = (999 if job.id == "03a_0026"
-                               else chunk["evidence_ids"][0])
+                evidence_ids = ([chunk["evidence_ids"][0], 999]
+                                if job.id == "03a_0026"
+                                else chunk["evidence_ids"])
                 saved = {
                     "chunk_id": job.id,
                     "evidence_ids": chunk["evidence_ids"],
                     "estimated_input_tokens": 4,
                     "fingerprint": next(iter(compatible_fingerprints[job.id])),
-                    "candidates": [candidate(evidence_id)],
+                    "candidates": [candidate(evidence_ids)],
                 }
                 if job.id == "03a_0000":
                     saved["candidates"][0]["candidate_key"] = "DESK_WORKERS"
                 cli._json_atomic(os.path.join(tmp, job.id + ".json"), saved)
 
-            client = Client()
+            client = mock.Mock()
             output = io.StringIO()
             with mock.patch.object(llm, "confirm", return_value=True), \
                     mock.patch("sys.stdout", output):
@@ -500,24 +632,29 @@ class SegmentationArtifactTests(unittest.TestCase):
                     client, "skill", jobs, chunks, "candidates", tmp,
                     os.path.join(tmp, "failures"), SimpleNamespace(yes=True),
                     "03A", row_validator=validator,
+                    row_cleaner=cleaner,
                     repair_guidance="preserve candidates and valid IDs",
                     contract_version=segmentation.HARVEST_CONTRACT_VERSION,
                     compatible_fingerprints=compatible_fingerprints,
                     cached_migrator=lambda _job, rows, _fingerprint:
                         segmentation.migrate_legacy_harvest_rows(rows))
 
-            self.assertEqual(client.estimated_ids, ["03a_0026"])
-            self.assertEqual(client.batch_job_ids, [["03a_0026"]])
+            client.estimate.assert_not_called()
+            client.prewarm.assert_not_called()
+            client.batch.assert_not_called()
             self.assertEqual(results[26]["candidates"][0]["evidence_ids"], [27])
-            self.assertIn("03A CONTRACT ERROR", output.getvalue())
-            self.assertIn("chunk: 03a_0026", output.getvalue())
-            self.assertIn("invalid evidence IDs: [999]", output.getvalue())
+            self.assertNotIn("03A CONTRACT ERROR", output.getvalue())
             for n, job in enumerate(jobs[:26]):
                 with open(os.path.join(tmp, job.id + ".json"),
                           encoding="utf-8") as fh:
                     migrated = json.load(fh)
-                self.assertEqual(migrated["candidates"], [candidate(n + 1)])
+                self.assertEqual(migrated["candidates"], [candidate([n + 1])])
                 self.assertIn("migrated_from_fingerprint", migrated)
+            with open(os.path.join(tmp, "03a_0026.json"), encoding="utf-8") as fh:
+                cleaned = json.load(fh)
+            self.assertEqual(cleaned["candidates"], [candidate([27])])
+            self.assertEqual(
+                cleaned["provenance_cleanup"][0]["removed_evidence_ids"], [999])
 
     def test_stage06_preserves_evidence_tier_in_file_and_manifest(self):
         segment = {"slug": "desk", "name": "Desk", "definition": "desk context",

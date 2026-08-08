@@ -549,13 +549,15 @@ def _adaptive_wave_size(client_):
         return 1
 
 
-def _adaptive_validation_error(job, result, key, row_validator=None):
+def _adaptive_validation_error(job, result, key, row_validator=None,
+                               row_cleaner=None):
     """Return why a completed adaptive-stage reply is not a success."""
     stop = result.stop_reason or ""
     if stop in NO_RETRY_STOP_REASONS or stop.startswith(("request_error", "batch_")):
         return _failure_reason(result, "provider did not complete the request")
     try:
-        _decode_job_rows(job, result.text, key, row_validator=row_validator)
+        _decode_job_rows(job, result.text, key, row_validator=row_validator,
+                         row_cleaner=row_cleaner)
     except (ValueError, TypeError) as e:
         return _failure_reason(result, str(e))
     return None
@@ -563,7 +565,7 @@ def _adaptive_validation_error(job, result, key, row_validator=None):
 
 def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
                         stage, key, wave_size=1, stats=None, debug=False,
-                        row_validator=None):
+                        row_validator=None, row_cleaner=None):
     """Run one structured stage with a live, persistent output-token floor.
 
     New work is launched in rolling waves. A wave is wholly in flight before any
@@ -641,7 +643,8 @@ def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
                 continue
 
             validation_error = _adaptive_validation_error(
-                job, result, key, row_validator=row_validator)
+                job, result, key, row_validator=row_validator,
+                row_cleaner=row_cleaner)
             results[job.id] = result
             final_jobs[job.id] = job
             stats.completed += 1
@@ -941,17 +944,22 @@ def _coverage_issue(rows, expected_ids):
     return ", ".join(bits) if bits else None
 
 
-def _decode_job_rows(job, raw, key, row_validator=None):
+def _decode_job_rows(job, raw, key, row_validator=None, row_cleaner=None):
     payload = _json_object(raw)
-    issue = _schema_issue(payload, job.schema)
-    if issue:
-        raise ValueError(issue)
     try:
         rows = payload[key]
     except KeyError as e:
         raise ValueError(f"missing top-level {key!r}") from e
     if not isinstance(rows, list):
         raise ValueError(f"{key!r} is not a list")
+    # A stage may have a tiny, provably safe normalization that must precede
+    # schema validation (03A's per-chunk enum is the motivating case). It may
+    # change only its documented invariant; all remaining schema checks follow.
+    if row_cleaner is not None:
+        row_cleaner(job, rows)
+    issue = _schema_issue(payload, job.schema)
+    if issue:
+        raise ValueError(issue)
     if job.expected_ids is not None:
         issue = _coverage_issue(rows, job.expected_ids)
         if issue:
@@ -1100,7 +1108,7 @@ def _repair_batch(client_, corpus, preamble, failures, key, guidance=None):
     return client_.batch(corpus, preamble, jobs)
 
 
-def _decode_into(decoded, job, result, key, row_validator=None):
+def _decode_into(decoded, job, result, key, row_validator=None, row_cleaner=None):
     """Decode one reply into `decoded`, or return the reason it could not be.
 
     Returns None on success. The reason is derived from the provider's stop
@@ -1109,7 +1117,8 @@ def _decode_into(decoded, job, result, key, row_validator=None):
     """
     try:
         decoded[job.id] = _decode_job_rows(
-            job, result.text, key, row_validator=row_validator)
+            job, result.text, key, row_validator=row_validator,
+            row_cleaner=row_cleaner)
         return None
     except (ValueError, TypeError) as e:
         return _failure_reason(result, str(e))
@@ -1160,7 +1169,7 @@ def _report_failure_modes(failures, total, key):
 
 def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
                 rerun_factor=BUDGET_RETRY_FACTOR, adaptive_stats=None,
-                row_validator=None):
+                row_validator=None, row_cleaner=None):
     """Decode all jobs, recovering failed responses before failing the stage.
 
     Two failure modes need two different recoveries, and conflating them is what
@@ -1192,7 +1201,8 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
         result = _as_result(results.get(jid, ""))
         reason = ("no response returned" if jid not in results
                   else _decode_into(
-                      decoded, job, result, key, row_validator=row_validator))
+                      decoded, job, result, key, row_validator=row_validator,
+                      row_cleaner=row_cleaner))
         if reason:
             first_result[jid] = result
             failures.append((job, result, reason))
@@ -1223,7 +1233,8 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
                                       f"{original_reason}; re-run returned no response"))
                     continue
                 reason = _decode_into(
-                    decoded, job, retried, key, row_validator=row_validator)
+                    decoded, job, retried, key, row_validator=row_validator,
+                    row_cleaner=row_cleaner)
                 if reason:
                     # Carry the re-run's reply forward: it, not the empty
                     # original, is what a shape repair has to work from.
@@ -1258,7 +1269,8 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
                                       "repair: repair returned no response"))
                     continue
                 reason = _decode_into(
-                    decoded, job, fixed, key, row_validator=row_validator)
+                    decoded, job, fixed, key, row_validator=row_validator,
+                    row_cleaner=row_cleaner)
                 if reason:
                     still_bad.append((job, result,
                                       f"original: {original_reason}; repair: {reason}"))
@@ -1904,9 +1916,19 @@ def _legacy_job_fingerprint_v1(job, evidence_ids, corpus=""):
 
 def _print_03a_contract_error(error, fallback_chunk=None):
     """Render a model-contract failure as an actionable pipeline event."""
+    if getattr(error, "reported", False):
+        return
     chunk = getattr(error, "chunk_id", None) or fallback_chunk or "unknown"
     candidate = getattr(error, "candidate", None) or "unknown"
     invalid = getattr(error, "invalid_evidence_ids", None)
+    if isinstance(error, segmentation.HarvestProvenanceFailure):
+        print("\n  03A PROVENANCE FAILURE")
+        print(f"  chunk: {chunk}")
+        print(f"  candidate: {candidate}")
+        print("  all cited evidence IDs were outside the chunk")
+        if invalid:
+            print(f"  impossible evidence IDs: {invalid}")
+        return
     print("\n  03A CONTRACT ERROR")
     print(f"  chunk: {chunk}")
     print(f"  candidate: {candidate}")
@@ -1918,7 +1940,8 @@ def _print_03a_contract_error(error, fallback_chunk=None):
 
 def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                                 diagnostics_dir, args, stage, force=False,
-                                row_validator=None, repair_guidance=None,
+                                row_validator=None, row_cleaner=None,
+                                repair_guidance=None,
                                 contract_version="", compatible_jobs=None,
                                 compatible_fingerprints=None,
                                 cached_migrator=None):
@@ -1949,6 +1972,15 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                             and cached_migrator is not None):
                         saved[key] = cached_migrator(
                             job, saved.get(key, []), saved.get("fingerprint"))
+                    locally_cleaned = []
+                    if row_cleaner is not None:
+                        try:
+                            locally_cleaned = row_cleaner(job, saved.get(key, [])) or []
+                        except segmentation.HarvestContractError as error:
+                            if repair_guidance:
+                                cached_repairs.append((job, chunk, saved, error))
+                                continue
+                            raise
                     if row_validator is not None:
                         try:
                             row_validator(job, saved.get(key, []))
@@ -1957,8 +1989,11 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                                 cached_repairs.append((job, chunk, saved, error))
                                 continue
                             raise
-                    if saved.get("fingerprint") != fingerprint:
-                        saved["migrated_from_fingerprint"] = saved.get("fingerprint")
+                    if saved.get("fingerprint") != fingerprint or locally_cleaned:
+                        if locally_cleaned:
+                            saved["provenance_cleanup"] = locally_cleaned
+                        if saved.get("fingerprint") != fingerprint:
+                            saved["migrated_from_fingerprint"] = saved.get("fingerprint")
                         saved["fingerprint"] = fingerprint
                         _json_atomic(path, saved)
                     complete[job.id] = saved
@@ -1986,7 +2021,7 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                 c, corpus, SEGMENT_PREAMBLE, missing_jobs, diagnostics_dir,
                 stage=stage, key=key, wave_size=_adaptive_wave_size(c),
                 stats=stage_stats, debug=getattr(args, "segment_debug", False),
-                row_validator=row_validator)
+                row_validator=row_validator, row_cleaner=row_cleaner)
             if stage_stats.provider_routes:
                 routes = " · ".join(
                     f"{name}: {count}" for name, count in
@@ -2004,7 +2039,7 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                         guidance=repair_guidance),
                     rerun=lambda failed, factor: _rerun_batch(
                         c, corpus, SEGMENT_PREAMBLE, failed, factor),
-                    row_validator=row_validator)
+                    row_validator=row_validator, row_cleaner=row_cleaner)
                 chunk = chunks_by_id[job.id]
                 saved = {
                     "chunk_id": job.id,
@@ -2039,7 +2074,8 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                     {job.id: prior}, [job], key, diagnostics_dir,
                     repair=lambda failed: _repair_batch(
                         c, corpus, SEGMENT_PREAMBLE, failed, key,
-                        guidance=repair_guidance), row_validator=row_validator)
+                        guidance=repair_guidance), row_validator=row_validator,
+                    row_cleaner=row_cleaner)
             except BatchOutputError as error:
                 project = os.environ.get("ADPIPE_PROJECT", "PROJECT")
                 raise BatchOutputError(
@@ -2156,6 +2192,37 @@ def cmd_segment(cfg, args):
     s03a = skill_named("03a_discover_segment_candidates.md")
     chunk_ids03a = {chunk["chunk_id"]: tuple(chunk["evidence_ids"])
                     for chunk in chunks03a}
+    cleanup_events03a = {}
+    provenance_failures03a = set()
+
+    def clean03a(job, rows):
+        try:
+            events = segmentation.clean_harvest_provenance(
+                rows, chunk_ids03a[job.id], chunk_id=job.id)
+        except segmentation.HarvestProvenanceFailure as error:
+            signature = (job.id, error.candidate,
+                         tuple(error.invalid_evidence_ids))
+            if signature not in provenance_failures03a:
+                provenance_failures03a.add(signature)
+                _print_03a_contract_error(error, job.id)
+            error.reported = True
+            raise
+        for event in events:
+            signature = (
+                event["chunk_id"], event["candidate"],
+                tuple(event["removed_evidence_ids"]),
+                event["remaining_evidence_count"],
+            )
+            if signature in cleanup_events03a:
+                continue
+            cleanup_events03a[signature] = event
+            print("\n  03A PROVENANCE CLEANUP")
+            print(f"  chunk: {event['chunk_id']}")
+            print(f"  candidate: {event['candidate']}")
+            print(f"  removed impossible IDs: {event['removed_evidence_ids']}")
+            print("  remaining valid evidence IDs: "
+                  f"{event['remaining_evidence_count']}")
+        return events
 
     def validate03a(job, rows):
         segmentation.validate_harvest_rows(
@@ -2168,8 +2235,9 @@ def cmd_segment(cfg, args):
         schema=segmentation.harvest_schema(chunk["evidence_ids"]),
         effort=_segment_setting(cfg, "03a_effort", None)) for chunk in chunks03a]
     # Compatibility is intentionally narrow: these are the exact same jobs with
-    # the prior static schema.  A cached result from that contract is locally
-    # revalidated, migrated for free when valid, and repaired alone when invalid.
+    # the prior static schema. A cached result from that contract is locally
+    # revalidated and migrated; impossible provenance is cleaned deterministically,
+    # while genuinely structural/semantic failures alone enter model repair.
     legacy_jobs03a = [dataclasses.replace(
         job, schema=segmentation.HARVEST_SCHEMA) for job in jobs03a]
     legacy_v1_jobs03a = [dataclasses.replace(
@@ -2183,11 +2251,12 @@ def cmd_segment(cfg, args):
     }
     repair03a = (
         "Preserve every discovered candidate and every valid supporting evidence "
-        "ID from the previous response. Correct only contract violations: remove "
-        "or replace IDs not present in this chunk, deduplicate repeated IDs, and "
-        "repair invalid keys or empty required fields. Do not merge, delete, add, "
-        "or reinterpret candidates unless that is strictly required to satisfy "
-        "the contract. Input evidence may remain unassigned.")
+        "ID from the previous response. Correct only contract violations: "
+        "deduplicate repeated IDs and repair invalid keys, invalid enum values, "
+        "or empty required fields. If a candidate has no valid supporting ID, cite "
+        "only supplied IDs that genuinely support it, or omit that candidate when "
+        "none do. Do not merge, add, or reinterpret candidates. Input evidence may "
+        "remain unassigned.")
 
     def run03a():
         return _run_persisted_segment_jobs(
@@ -2195,6 +2264,7 @@ def cmd_segment(cfg, args):
             os.path.join(discovery, "03a_chunk_candidates"),
             os.path.join(diagnostics, "03a"), args, "03A",
             force=_segment_force(args, "03a"), row_validator=validate03a,
+            row_cleaner=clean03a,
             repair_guidance=repair03a,
             contract_version=segmentation.HARVEST_CONTRACT_VERSION,
             compatible_jobs=legacy_jobs03a,
@@ -2205,6 +2275,14 @@ def cmd_segment(cfg, args):
     results03a = run03a()
     if results03a is None:
         return
+    if cleanup_events03a:
+        events = list(cleanup_events03a.values())
+        print("\n  03A provenance cleanup:")
+        print(f"    {len({event['chunk_id'] for event in events})} chunks affected")
+        print(f"    {sum(len(event['removed_evidence_ids']) for event in events)} "
+              "impossible evidence IDs removed")
+        print("    0 candidates dropped")
+        print("    0 model calls made for cleanup")
     meter_03a = _model_meter(c)
     full_claims = segmentation.harvest_full_chunk_claims(results03a)
     if full_claims:

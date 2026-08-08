@@ -319,6 +319,58 @@ class HarvestContractError(ValueError):
         self.invalid_evidence_ids = list(invalid_evidence_ids or [])
 
 
+class HarvestProvenanceFailure(HarvestContractError):
+    """Every citation for one candidate is impossible for its source chunk."""
+
+
+def clean_harvest_provenance(rows, chunk_ids, chunk_id=None):
+    """Remove only impossible integer citations, in place, and report each edit.
+
+    This is deliberately narrower than validation. A non-list, non-integer, or
+    duplicate citation is a broader schema violation and is left untouched for
+    the structured repair path. If an otherwise provenance-only cleanup would
+    leave a candidate unsupported, nothing is changed and repair is required.
+    """
+    allowed = set(chunk_ids)
+    planned = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        evidence_ids = row.get("evidence_ids")
+        if not isinstance(evidence_ids, list):
+            continue
+        # Do not let provenance cleanup accidentally conceal type or uniqueness
+        # violations. Those are separate contracts with their existing recovery.
+        if (any(type(evidence_id) is not int for evidence_id in evidence_ids)
+                or len(evidence_ids) != len(set(evidence_ids))):
+            continue
+        removed = [evidence_id for evidence_id in evidence_ids
+                   if evidence_id not in allowed]
+        if not removed:
+            continue
+        valid = [evidence_id for evidence_id in evidence_ids
+                 if evidence_id in allowed]
+        candidate = str(row.get("candidate_key") or "").strip() or "unknown"
+        if not valid:
+            raise HarvestProvenanceFailure(
+                f"03A candidate {candidate!r} has no in-chunk supporting evidence; "
+                "all cited evidence IDs were outside the chunk",
+                chunk_id=chunk_id, candidate=candidate,
+                invalid_evidence_ids=removed)
+        planned.append((row, candidate, removed, valid))
+
+    events = []
+    for row, candidate, removed, valid in planned:
+        row["evidence_ids"] = valid
+        events.append({
+            "chunk_id": chunk_id,
+            "candidate": candidate,
+            "removed_evidence_ids": removed,
+            "remaining_evidence_count": len(valid),
+        })
+    return events
+
+
 def validate_harvest_rows(rows, chunk_ids, chunk_id=None):
     """Reject structurally valid but unusable 03A candidate claims.
 
