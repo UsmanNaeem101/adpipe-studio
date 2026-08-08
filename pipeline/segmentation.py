@@ -167,7 +167,10 @@ CONSOLIDATE_SCHEMA = {
             "commercial_distinction": {"type": "string"},
             "inclusion_criteria": {"type": "array", "items": {"type": "string"}},
             "exclusion_criteria": {"type": "array", "items": {"type": "string"}},
-            "merged_candidate_keys": {"type": "array", "items": {"type": "string"}},
+            "merged_candidate_keys": {
+                "type": "array", "minItems": 1, "uniqueItems": True,
+                "items": {"type": "string"},
+            },
             "merged_aliases": {"type": "array", "items": {"type": "string"}},
             "core_evidence_ids": {"type": "array", "items": {"type": "integer"}},
             "discovery_status": {"type": "string",
@@ -183,6 +186,21 @@ CONSOLIDATE_SCHEMA = {
     "required": ["candidates"],
     "additionalProperties": False,
 }
+
+
+def consolidate_schema(provisional_keys):
+    """Return the 03B schema constrained to exact source-catalogue keys.
+
+    Canonical IDs, slugs and names deliberately remain model-created. Only the
+    lineage field is closed: it identifies existing 03A records and therefore
+    must copy their keys verbatim rather than paraphrasing or canonicalizing
+    them.
+    """
+    schema = copy.deepcopy(CONSOLIDATE_SCHEMA)
+    lineage = schema["properties"]["candidates"]["items"][
+        "properties"]["merged_candidate_keys"]
+    lineage["items"]["enum"] = list(provisional_keys)
+    return schema
 
 EXPANSION_SCHEMA = {
     "type": "object",
@@ -490,17 +508,53 @@ def aggregate_harvest(chunk_results, minimum_evidence=2):
     return output
 
 
+class ConsolidationContractError(ValueError):
+    """A 03B result invented or rewrote one or more 03A lineage keys."""
+
+    def __init__(self, invalid_references):
+        self.invalid_references = invalid_references
+        count = sum(len(row["invalid_keys"]) for row in invalid_references)
+        super().__init__(
+            f"03B referenced {count} unknown provisional key(s) across "
+            f"{len(invalid_references)} canonical candidate(s)")
+
+
+def validate_consolidated_lineage(rows, provisional_catalogue):
+    """Require exact, nonempty, unique 03A keys in every 03B lineage list."""
+    allowed = {row["candidate_key"] for row in provisional_catalogue}
+    invalid_references = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue  # The JSON-schema validator reports the broader shape error.
+        keys = row.get("merged_candidate_keys")
+        if not isinstance(keys, list):
+            continue
+        if not keys:
+            raise ValueError("03B returned an empty merged_candidate_keys list")
+        if any(not isinstance(key, str) for key in keys):
+            raise ValueError("03B returned a non-string provisional key")
+        if len(keys) != len(set(keys)):
+            raise ValueError("03B returned duplicate merged provisional keys")
+        invalid = list(dict.fromkeys(key for key in keys if key not in allowed))
+        if invalid:
+            invalid_references.append({
+                "candidate_id": row.get("candidate_id"),
+                "slug": row.get("slug"),
+                "invalid_keys": invalid,
+            })
+    if invalid_references:
+        raise ConsolidationContractError(invalid_references)
+
+
 def finalize_consolidated(rows, provisional_catalogue):
     """Replace model-estimated evidence lineage with exact deterministic unions."""
+    validate_consolidated_lineage(rows, provisional_catalogue)
     provisional = {row["candidate_key"]: row for row in provisional_catalogue}
     seen_ids, seen_slugs, output = set(), set(), []
     for row in rows:
         if row["candidate_id"] in seen_ids or row["slug"] in seen_slugs:
             raise ValueError("03B returned duplicate candidate IDs or slugs")
-        keys = list(dict.fromkeys(_key(k) for k in row["merged_candidate_keys"]))
-        unknown = [key for key in keys if key not in provisional]
-        if unknown:
-            raise ValueError(f"03B referenced unknown provisional key {unknown[0]!r}")
+        keys = list(row["merged_candidate_keys"])
         evidence = sorted({eid for key in keys for eid in provisional[key]["evidence_ids"]})
         if not evidence:
             raise ValueError(f"03B candidate {row['candidate_id']!r} has no Core lineage")

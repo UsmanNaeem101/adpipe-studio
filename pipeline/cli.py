@@ -785,7 +785,9 @@ def _single_call_tiers(starting_ceiling, token_tiers=ADAPTIVE_TOKEN_TIERS):
 
 
 def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
-                           token_tiers=ADAPTIVE_TOKEN_TIERS):
+                           token_tiers=ADAPTIVE_TOKEN_TIERS,
+                           response_validator=None, repair_guidance=None,
+                           validation_error_handler=None, initial_result=None):
     """Run one structured Job with failure-aware, bounded recovery.
 
     Budget stops retry the identical Job at the next coarse ceiling. Refusals,
@@ -797,12 +799,18 @@ def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
     tier_index = 0
     current = job
     repairing = False
+    pending_result = (_as_result(initial_result)
+                      if initial_result is not None else None)
 
     while True:
         operation = ("single_structured_repair" if repairing
                      else "single_structured")
-        result = _single_call_result(
-            client_, corpus, preamble, current, operation)
+        if pending_result is not None:
+            result = pending_result
+            pending_result = None
+        else:
+            result = _single_call_result(
+                client_, corpus, preamble, current, operation)
 
         if result.out_of_budget:
             reason = _failure_reason(result, "output budget exhausted")
@@ -844,36 +852,63 @@ def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
                 f"{job.id} provider failure: {reason}. "
                 f"Diagnostics: {diagnostics_dir}")
 
+        recovery_error = None
         try:
             decoded = _json_object(result.text)
+            # Stage-specific semantic/provenance contracts run before the
+            # general schema check so they can report useful source identifiers
+            # instead of only an anonymous enum path. Validators must tolerate
+            # missing/wrong-shape fields and leave those to `_schema_issue`.
+            if response_validator is not None:
+                response_validator(decoded)
             issue = _schema_issue(decoded, current.schema) if current.schema else None
             if issue:
                 raise ValueError(f"schema validation failed: {issue}")
             return decoded
         except (ValueError, TypeError) as parse_error:
+            recovery_error = parse_error
             reason = _failure_reason(result, str(parse_error))
+            if validation_error_handler is not None:
+                validation_error_handler(
+                    parse_error, repairing=repairing,
+                    diagnostics_dir=diagnostics_dir)
             _save_failure(
                 diagnostics_dir, current, result, reason,
-                "repair" if repairing else "malformed")
+                "repair" if repairing else
+                ("contract" if isinstance(
+                    parse_error, segmentation.ConsolidationContractError)
+                 else "malformed"))
             if repairing:
+                if not isinstance(
+                        parse_error, segmentation.ConsolidationContractError):
+                    raise BatchOutputError(
+                        f"{job.id} returned malformed/schema-invalid JSON; its "
+                        f"shape-repair response also failed ({reason}). "
+                        f"Diagnostics: {diagnostics_dir}") from parse_error
                 raise BatchOutputError(
-                    f"{job.id} returned malformed/schema-invalid JSON; its "
-                    f"shape-repair response also failed ({reason}). "
+                    f"{job.id} returned a structured response that still "
+                    f"violated its contract after one repair ({reason}). "
                     f"Diagnostics: {diagnostics_dir}") from parse_error
 
+        repair_instruction = repair_guidance or (
+            "Preserve all substantive candidates, decisions, scores, rationales, "
+            "IDs and criteria already present. This is shape repair, not a chance "
+            "to reconsider the research.")
         repair_prompt = (
             "RECOVERY TASK: The previous response was complete but could not be "
             f"consumed because: {reason}.\n\n"
-            "Return JSON only and obey the supplied JSON schema exactly. Preserve "
-            "all substantive candidates, decisions, scores, rationales, IDs and "
-            "criteria already present. This is shape repair, not a chance to "
-            "reconsider the research. Do not add commentary or Markdown.\n\n"
+            "Return JSON only and obey the supplied JSON schema exactly. "
+            f"{repair_instruction} Do not add commentary or Markdown.\n\n"
             "ORIGINAL REQUEST:\n\n" + job.prompt +
             "\n\nPREVIOUS RESPONSE:\n\n" + result.text)
         current = dataclasses.replace(current, prompt=repair_prompt)
         repairing = True
-        print(f"  ! {job.id} returned malformed/schema-invalid JSON; "
-              "running one structured shape repair")
+        if isinstance(recovery_error, segmentation.ConsolidationContractError):
+            print(f"  ! {job.id} returned an unusable structured response; "
+                  "running one bounded contract repair")
+        else:
+            print(f"  ! {job.id} returned malformed/schema-invalid JSON; "
+                  "running one structured shape repair")
 
 
 def _schema_issue(value, schema, path="$"):
@@ -2130,6 +2165,104 @@ def _remap_expansion_matches(matches, initial, final):
     return output
 
 
+def _print_03b_contract_error(error, *, repairing=False, diagnostics_dir=None):
+    title = "03B CONTRACT REPAIR FAILED" if repairing else "03B CONTRACT ERROR"
+    print(f"\n  {title}")
+    for violation in error.invalid_references:
+        identity = violation.get("candidate_id") or violation.get("slug") or "unknown"
+        print(f"  candidate: {identity}")
+        if violation.get("slug") and violation.get("slug") != identity:
+            print(f"  canonical slug: {violation['slug']}")
+        print("  invalid provisional keys: " +
+              json.dumps(violation["invalid_keys"], ensure_ascii=False))
+    print("  Source lineage must use exact candidate_key values from Stage 03A.")
+    if diagnostics_dir:
+        print(f"  Diagnostics saved to: {diagnostics_dir}")
+    if not repairing:
+        print("  Repairing the completed 03B response; Stage 03A will not rerun...")
+
+
+def _run_03b_consolidation(client_, corpus, preamble, job, catalogue,
+                           diagnostics_dir, initial_result=None):
+    """Run and finalize 03B with exact, repairable source-lineage contracts."""
+    def validate(payload):
+        rows = payload.get("candidates") if isinstance(payload, dict) else None
+        if isinstance(rows, list):
+            segmentation.validate_consolidated_lineage(rows, catalogue)
+
+    payload = _run_single_structured(
+        client_, corpus, preamble, job, diagnostics_dir,
+        token_tiers=STAGE03B_TOKEN_TIERS,
+        response_validator=validate,
+        repair_guidance=(
+            "Preserve every canonical candidate and every already-valid field. "
+            "Correct only contract violations. In merged_candidate_keys, replace "
+            "invented or rewritten source keys with the exact candidate_key values "
+            "from the supplied 03A catalogue that the candidate genuinely merged. "
+            "Do not change a canonical candidate_id, slug, name, definition, or "
+            "other valid content merely to make it resemble a source key."),
+        validation_error_handler=lambda error, **context:
+            _print_03b_contract_error(error, **context)
+            if isinstance(error, segmentation.ConsolidationContractError) else None,
+        initial_result=initial_result)
+    try:
+        return segmentation.finalize_consolidated(payload["candidates"], catalogue)
+    except segmentation.ConsolidationContractError as error:
+        # Defence in depth if a provider/schema implementation mutates or skips
+        # the pre-return validator. Never leak a model-contract ValueError.
+        _print_03b_contract_error(
+            error, repairing=True, diagnostics_dir=diagnostics_dir)
+        raise BatchOutputError(
+            "Stage 03B lineage validation failed after structured recovery. "
+            f"Diagnostics: {diagnostics_dir}") from error
+
+
+def _03b_audit_recovery(project_dir, job_id, catalogue):
+    """Find a completed audited 03B response for this exact input catalogue.
+
+    Early 03B versions audited the provider response but crashed before writing
+    the resumable discovery artifact. Matching the embedded catalogue prevents a
+    response from another run/input being reused. Only a completed `stop`
+    response is eligible; truncated or failed calls remain diagnostics only.
+    """
+    log_root = os.path.join(project_dir, "logs", "model")
+    if not os.path.isdir(log_root):
+        return None
+    candidates = []
+    for root, _dirs, files in os.walk(log_root):
+        if "request.json" in files and "response.json" in files:
+            candidates.append(root)
+    expected = _value_fingerprint(catalogue)
+    for root in sorted(candidates, key=os.path.getmtime, reverse=True):
+        try:
+            request = _load_json(os.path.join(root, "request.json"))
+            response = _load_json(os.path.join(root, "response.json"))
+            if (request.get("job_id") != job_id
+                    or request.get("operation") != "single_structured"
+                    or response.get("metadata", {}).get("finish_reason") != "stop"):
+                continue
+            messages = request.get("request", {}).get("messages") or []
+            prompt = messages[-1].get("content") if messages else None
+            if not isinstance(prompt, str) or "\nCATALOGUE:\n" not in prompt:
+                continue
+            prior_catalogue = json.loads(prompt.split("\nCATALOGUE:\n", 1)[1])
+            if _value_fingerprint(prior_catalogue) != expected:
+                continue
+            text = response.get("text") or ""
+            _json_object(text)
+            usage = response.get("metadata", {}).get("usage") or {}
+            details = usage.get("completion_tokens_details") or {}
+            provider = (response.get("provider_response") or {}).get("provider")
+            return (BatchResult(
+                text=text, stop_reason="stop",
+                reasoning_tokens=int(details.get("reasoning_tokens") or 0),
+                completion_tokens=int(usage.get("completion_tokens") or 0),
+                provider=provider), root)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return None
+
+
 def cmd_segment(cfg, args):
     """Resumable 03A -> 03B -> expansion -> 03C -> 04 -> 05 -> 06."""
     from llm import Job, confirm
@@ -2336,23 +2469,36 @@ def cmd_segment(cfg, args):
         initial = _load_json(initial_p)
         print(f"  03B consolidate: reusing {len(initial)} candidates")
     else:
+        schema03b = segmentation.consolidate_schema(
+            row["candidate_key"] for row in catalogue)
         job03b = Job(
             id="03b_consolidate",
             prompt=("Consolidate this complete provisional catalogue globally. "
-                    "Preserve merged_candidate_keys exactly and do not output a "
-                    "validation status.\n\nCATALOGUE:\n" +
+                    "Canonical candidate IDs, slugs, and names may be new. Every "
+                    "merged_candidate_keys value is source lineage and must be "
+                    "copied exactly from a candidate_key in this catalogue; never "
+                    "invent or rewrite one. Do not output a validation status."
+                    "\n\nCATALOGUE:\n" +
                     json.dumps(catalogue, ensure_ascii=False, indent=2)),
             max_tokens=int(_segment_setting(cfg, "03b_max_tokens", 64000)),
-            schema=segmentation.CONSOLIDATE_SCHEMA,
+            schema=schema03b,
             effort=_segment_setting(cfg, "03b_effort", None))
+        audit_recovery = (None if _segment_force(args, "03b") else
+                          _03b_audit_recovery(
+                              cfg["_dir"], job03b.id, catalogue))
+        if audit_recovery:
+            print("  03B recovery: found a completed audited response for the "
+                  "current 03A catalogue")
+            print(f"  Audit source: {audit_recovery[1]}")
+            print("  It will be validated/repaired without rerunning full "
+                  "consolidation")
         if not confirm(c.estimate(s03b, SEGMENT_PREAMBLE, [job03b]),
                        getattr(args, "yes", False)):
             return
-        raw = _run_single_structured(
-            c, s03b, SEGMENT_PREAMBLE, job03b,
+        initial = _run_03b_consolidation(
+            c, s03b, SEGMENT_PREAMBLE, job03b, catalogue,
             os.path.join(diagnostics, "03b"),
-            token_tiers=STAGE03B_TOKEN_TIERS)["candidates"]
-        initial = segmentation.finalize_consolidated(raw, catalogue)
+            initial_result=audit_recovery[0] if audit_recovery else None)
         _json_atomic(initial_p, initial)
         _json_atomic(initial_meta, {"input_fingerprint": catalogue_fingerprint})
         print(f"  03B consolidate: {len(initial)} canonical candidates -> {initial_p}")
@@ -2435,23 +2581,35 @@ def cmd_segment(cfg, args):
         final = _load_json(final03b_p)
     elif novelty:
         combined = catalogue + novelty
+        schema03b = segmentation.consolidate_schema(
+            row["candidate_key"] for row in combined)
         job03b2 = Job(
             id="03b_novelty_consolidate",
             prompt=("Run one final consolidation cycle. Preserve existing canonical "
                     "audiences where possible and incorporate only defensible recurring "
-                    "novelty proposals.\n\nCATALOGUE:\n" +
+                    "novelty proposals. Canonical IDs, slugs, and names may be new, "
+                    "but every merged_candidate_keys value must be copied exactly "
+                    "from a candidate_key in this catalogue.\n\nCATALOGUE:\n" +
                     json.dumps(combined, ensure_ascii=False, indent=2)),
             max_tokens=int(_segment_setting(cfg, "03b_max_tokens", 64000)),
-            schema=segmentation.CONSOLIDATE_SCHEMA,
+            schema=schema03b,
             effort=_segment_setting(cfg, "03b_effort", None))
+        audit_recovery = (None if _segment_force(args, "03c") else
+                          _03b_audit_recovery(
+                              cfg["_dir"], job03b2.id, combined))
+        if audit_recovery:
+            print("  03B recovery: found a completed audited novelty response "
+                  "for the current catalogue")
+            print(f"  Audit source: {audit_recovery[1]}")
+            print("  It will be validated/repaired without rerunning full "
+                  "consolidation")
         if not confirm(c.estimate(s03b, SEGMENT_PREAMBLE, [job03b2]),
                        getattr(args, "yes", False)):
             return
-        raw = _run_single_structured(
-            c, s03b, SEGMENT_PREAMBLE, job03b2,
+        final = _run_03b_consolidation(
+            c, s03b, SEGMENT_PREAMBLE, job03b2, combined,
             os.path.join(diagnostics, "03b_novelty"),
-            token_tiers=STAGE03B_TOKEN_TIERS)["candidates"]
-        final = segmentation.finalize_consolidated(raw, combined)
+            initial_result=audit_recovery[0] if audit_recovery else None)
         _json_atomic(final03b_p, final)
         _json_atomic(final03b_meta, {"input_fingerprint": final03b_fingerprint})
     else:

@@ -34,6 +34,28 @@ class SegmentationBookkeepingTests(unittest.TestCase):
             "discovery_strength": "probable",
         }
 
+    @staticmethod
+    def provisional(key="desk", evidence_ids=None):
+        return {
+            "candidate_key": key,
+            "evidence_ids": list(evidence_ids or [1, 2]),
+            "chunk_ids": ["03a_0000"],
+            "aliases": [key.replace("_", " ").title()],
+        }
+
+    @staticmethod
+    def consolidated(keys=None, slug="new_canonical_segment"):
+        return {
+            "candidate_id": "cand_new", "slug": slug,
+            "name": "New canonical segment", "definition": "A merged audience",
+            "commercial_distinction": "Distinct messaging",
+            "inclusion_criteria": ["relevant context"],
+            "exclusion_criteria": ["incidental mention"],
+            "merged_candidate_keys": list(keys or ["desk"]),
+            "merged_aliases": [], "core_evidence_ids": [999],
+            "discovery_status": "strong_candidate",
+        }
+
     def test_dynamic_harvest_schema_enum_is_exactly_the_chunk_ids(self):
         schema = segmentation.harvest_schema([9, 3, 17])
         evidence = schema["properties"]["candidates"]["items"][
@@ -162,6 +184,54 @@ class SegmentationBookkeepingTests(unittest.TestCase):
             "items"]["properties"]["discovery_status"]["enum"]
         self.assertNotIn("Validated", statuses)
         self.assertNotIn("validated", statuses)
+
+    def test_dynamic_03b_schema_enum_is_exactly_the_provisional_keys(self):
+        schema = segmentation.consolidate_schema(["desk", "validation_gaslit"])
+        candidate = schema["properties"]["candidates"]["items"]["properties"]
+        lineage = candidate["merged_candidate_keys"]
+        self.assertEqual(lineage["items"]["enum"],
+                         ["desk", "validation_gaslit"])
+        self.assertEqual(lineage["minItems"], 1)
+        self.assertTrue(lineage["uniqueItems"])
+        self.assertNotIn("enum", candidate["slug"])
+        self.assertNotIn(
+            "enum", segmentation.CONSOLIDATE_SCHEMA["properties"]["candidates"]
+            ["items"]["properties"]["merged_candidate_keys"]["items"])
+
+    def test_03b_accepts_exact_lineage_while_canonical_slug_may_be_new(self):
+        provisional = [self.provisional("desk"), self.provisional("wfh", [3, 4])]
+        final = segmentation.finalize_consolidated(
+            [self.consolidated(["desk", "wfh"], "remote_desk_professionals")],
+            provisional)
+        self.assertEqual(final[0]["slug"], "remote_desk_professionals")
+        self.assertEqual(final[0]["merged_candidate_keys"], ["desk", "wfh"])
+        self.assertEqual(final[0]["core_evidence_ids"], [1, 2, 3, 4])
+
+    def test_03b_reports_one_or_several_invented_lineage_keys(self):
+        provisional = [self.provisional("desk"), self.provisional("wfh")]
+        for keys, expected in ((["desk", "renamed_desk"], ["renamed_desk"]),
+                               (["invented_one", "invented_two"],
+                                ["invented_one", "invented_two"])):
+            with self.subTest(keys=keys), self.assertRaises(
+                    segmentation.ConsolidationContractError) as ctx:
+                segmentation.finalize_consolidated(
+                    [self.consolidated(keys)], provisional)
+            self.assertEqual(ctx.exception.invalid_references[0]["invalid_keys"],
+                             expected)
+
+    def test_03b_does_not_silently_canonicalize_a_renamed_source_key(self):
+        provisional = [self.provisional("validation_gaslit")]
+        with self.assertRaises(segmentation.ConsolidationContractError):
+            segmentation.finalize_consolidated(
+                [self.consolidated(["Validation Gaslit"])], provisional)
+
+    def test_03b_post_validation_catches_provider_schema_drift(self):
+        # Even if a provider ignores the enum in response_format, the local
+        # deterministic validator remains authoritative.
+        with self.assertRaises(segmentation.ConsolidationContractError):
+            segmentation.validate_consolidated_lineage(
+                [self.consolidated(["provider_invented_key"])],
+                [self.provisional("desk")])
 
     def test_03c_keeps_recurring_novelty_and_ignores_isolated_proposal(self):
         audits = [
@@ -738,7 +808,7 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
             job_id = kwargs.get("job_id")
             self.calls.append(job_id)
             self.max_tokens_by_job[job_id] = max_tokens
-            if schema is segmentation.CONSOLIDATE_SCHEMA:
+            if job_id in ("03b_consolidate", "03b_novelty_consolidate"):
                 payload = {"candidates": [{
                     "candidate_id": "cand_desk", "slug": "desk_workers",
                     "name": "Desk workers", "definition": "Desk work is dominant",

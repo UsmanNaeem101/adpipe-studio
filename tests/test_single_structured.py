@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 
 import cli
 import llm
+import segmentation
 
 
 SCHEMA = {
@@ -41,6 +42,34 @@ def job(max_tokens=16000):
     return llm.Job(
         id="03_discover", prompt="discover segments", max_tokens=max_tokens,
         schema=SCHEMA, effort="high", reasoning_max_tokens=7000)
+
+
+def provisional_catalogue():
+    return [{
+        "candidate_key": "validation_gaslit", "evidence_ids": [1, 2],
+        "chunk_ids": ["03a_0000"], "aliases": ["Validation seekers"],
+    }]
+
+
+def consolidated_payload(lineage_key):
+    return {"candidates": [{
+        "candidate_id": "seg_001", "slug": "new_canonical_slug",
+        "name": "Validation-seeking patients",
+        "definition": "People dismissed by clinicians",
+        "commercial_distinction": "Recognition-led messaging",
+        "inclusion_criteria": ["dismissed symptoms"],
+        "exclusion_criteria": ["ordinary uncertainty"],
+        "merged_candidate_keys": [lineage_key], "merged_aliases": [],
+        "core_evidence_ids": [1], "discovery_status": "strong_candidate",
+    }]}
+
+
+def consolidation_job():
+    return llm.Job(
+        id="03b_consolidate", prompt="consolidate this catalogue",
+        max_tokens=64000,
+        schema=segmentation.consolidate_schema(["validation_gaslit"]),
+        effort="high")
 
 
 class SingleStructuredRecoveryTests(unittest.TestCase):
@@ -113,6 +142,80 @@ class SingleStructuredRecoveryTests(unittest.TestCase):
         self.assertEqual(cli._single_call_tiers(64000, cli.STAGE03B_TOKEN_TIERS),
                          (64000, 128000))
         self.assertEqual(cli._single_call_tiers(16000), (16000, 24000, 32000))
+
+    def test_03b_invalid_lineage_repairs_the_completed_response(self):
+        completed = llm.BatchResult(json.dumps(
+            consolidated_payload("validation_gaslighted")), "stop")
+        client = ScriptedSingleClient([
+            llm.BatchResult(json.dumps(
+                consolidated_payload("validation_gaslit")), "stop"),
+        ])
+        stream = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(stream):
+            final = cli._run_03b_consolidation(
+                client, "skill", "preamble", consolidation_job(),
+                provisional_catalogue(), tmp, initial_result=completed)
+            saved = sorted(os.listdir(tmp))
+        self.assertEqual(final[0]["slug"], "new_canonical_slug")
+        self.assertEqual(final[0]["merged_candidate_keys"],
+                         ["validation_gaslit"])
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["operation"], "single_structured_repair")
+        self.assertIn("PREVIOUS RESPONSE", client.calls[0]["prompt"])
+        self.assertIn("03B CONTRACT ERROR", stream.getvalue())
+        self.assertIn("Stage 03A will not rerun", stream.getvalue())
+        self.assertEqual(saved, ["03b_consolidate.contract.txt"])
+
+    def test_03b_invalid_lineage_fails_cleanly_after_one_repair(self):
+        bad = json.dumps(consolidated_payload("invented_source_key"))
+        client = ScriptedSingleClient([llm.BatchResult(bad, "stop")])
+        stream = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(stream):
+            with self.assertRaises(cli.BatchOutputError) as ctx:
+                cli._run_03b_consolidation(
+                    client, "skill", "preamble", consolidation_job(),
+                    provisional_catalogue(), tmp,
+                    initial_result=llm.BatchResult(bad, "stop"))
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("after one repair", str(ctx.exception))
+        self.assertIn("03B CONTRACT REPAIR FAILED", stream.getvalue())
+        self.assertNotIsInstance(ctx.exception, ValueError)
+
+    def test_03b_finds_only_completed_audit_for_the_exact_catalogue(self):
+        catalogue = provisional_catalogue()
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = os.path.join(tmp, "logs", "model", "2026-08-08", "request")
+            os.makedirs(audit)
+            request = {
+                "job_id": "03b_consolidate", "operation": "single_structured",
+                "request": {"messages": [{"content": "system"}, {"content":
+                    "Consolidate.\nCATALOGUE:\n" + json.dumps(catalogue)}]},
+            }
+            response = {
+                "text": json.dumps(consolidated_payload("validation_gaslighted")),
+                "metadata": {"finish_reason": "stop", "usage": {
+                    "completion_tokens": 54336,
+                    "completion_tokens_details": {"reasoning_tokens": 3629}}},
+                "provider_response": {"provider": "test-route"},
+            }
+            with open(os.path.join(audit, "request.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(request, fh)
+            with open(os.path.join(audit, "response.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(response, fh)
+
+            recovered = cli._03b_audit_recovery(
+                tmp, "03b_consolidate", catalogue)
+            mismatch = cli._03b_audit_recovery(
+                tmp, "03b_consolidate", provisional_catalogue() + [{
+                    "candidate_key": "other", "evidence_ids": [3],
+                    "chunk_ids": ["03a_0001"], "aliases": ["Other"]}])
+
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered[0].completion_tokens, 54336)
+        self.assertEqual(recovered[0].reasoning_tokens, 3629)
+        self.assertIsNone(mismatch)
 
     def test_empty_refusal_or_filter_fails_without_retry(self):
         for stop in llm.NO_RETRY_STOP_REASONS:

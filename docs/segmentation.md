@@ -118,3 +118,11 @@ Stage 03B uses a separate `64,000 → 128,000` output-ceiling ladder because it 
 the complete canonical candidate catalogue in one response. The setting above controls
 its starting ceiling; only an actual `length`/`max_tokens` stop advances it. This does
 not change 03A's 12,000-token rolling-wave ceiling or any stage's reasoning policy.
+
+Each 03B request also receives a dynamic schema whose `merged_candidate_keys` enum is
+the exact current 03A catalogue. Canonical IDs, slugs and names remain open for 03B to
+create; source-lineage keys do not. Local post-validation enforces the same contract if
+a provider ignores the schema. An otherwise complete response with invalid lineage is
+saved to diagnostics and gets one bounded repair using that response—03A is not rerun.
+If an older run was audited but crashed before persisting its 03B artifact, the resume
+path reuses it only when its embedded catalogue exactly fingerprints the current one.
