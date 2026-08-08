@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 
 import auditlog
+from llm import BatchResult
 
 API = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
@@ -119,11 +120,20 @@ class Client:
                 u = payload.get("usage") or {}
                 self.spent["in"] += u.get("prompt_tokens", 0)
                 self.spent["out"] += u.get("completion_tokens", 0)
-                message = payload["choices"][0]["message"]
-                content = message.get("content") or ""
+                # Tolerate a reply with no choices at all rather than raising an
+                # IndexError: an empty response is a failure mode the caller can
+                # classify and re-run, a traceback is one it can only abort on.
+                choice = (payload.get("choices") or [{}])[0]
+                content = (choice.get("message") or {}).get("content") or ""
+                finish = choice.get("finish_reason")
                 audit.response(payload, text=content, usage=u,
-                               finish_reason=payload["choices"][0].get("finish_reason"))
-                return content
+                               finish_reason=finish)
+                if not content.strip() and finish == "length" and self.verbose:
+                    # Reasoning models spend max_tokens on reasoning first, so
+                    # the budget can be gone before a single JSON byte is written.
+                    print(f"  ! {job_id or 'request'}: hit the {max_tokens}-token "
+                          f"output budget before writing any content")
+                return BatchResult(content, finish)
             except urllib.error.HTTPError as e:
                 detail_full = e.read().decode("utf-8", "replace")
                 detail = detail_full[:400]
@@ -202,7 +212,7 @@ class Client:
         msgs = [{"role": "system", "content": f"{preamble}\n\n{corpus}"},
                 {"role": "user", "content": prompt}]
         return self._post(msgs, max_tokens, schema, job_id=job_id,
-                          operation=operation)
+                          operation=operation).text
 
     def batch(self, corpus, preamble, jobs, poll_seconds=0):
         """No batch endpoint — run concurrently to recover wall-clock time.
@@ -217,15 +227,20 @@ class Client:
                 job_id=j.id, operation="pipeline_batch_job")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(run, j) for j in jobs]
+            futures = {pool.submit(run, j): j for j in jobs}
             for i, f in enumerate(concurrent.futures.as_completed(futures), 1):
+                job = futures[f]
                 try:
-                    cid, text = f.result()
-                    out[cid] = text
+                    cid, result = f.result()
+                    out[cid] = result
                 except SystemExit:
                     raise
                 except Exception as e:
-                    print(f"  ! a request failed: {e}")
+                    # Record which job died. Silently omitting it leaves the
+                    # caller reporting a "missing response" with no cause, and
+                    # unable to tell a dead request from an empty one.
+                    print(f"  ! {job.id} failed: {e}")
+                    out[job.id] = BatchResult("", f"request_error:{type(e).__name__}")
                 if self.verbose:
                     print(f"    {i}/{len(jobs)} done", flush=True)
         return out

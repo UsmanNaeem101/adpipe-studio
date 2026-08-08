@@ -9,36 +9,36 @@ import presets
 
 class JsonParsingTests(unittest.TestCase):
     def test_plain_object(self):
-        self.assertEqual(presets._extract_json('{"a": 1}'), {"a": 1})
+        self.assertEqual(presets.extract_json('{"a": 1}'), {"a": 1})
 
     def test_fenced_json(self):
         self.assertEqual(
-            presets._extract_json('```json\n{"a": 1}\n```'), {"a": 1})
+            presets.extract_json('```json\n{"a": 1}\n```'), {"a": 1})
 
     def test_prose_prefix_and_suffix(self):
         self.assertEqual(
-            presets._extract_json('Sure! Here: {"x": 1} hope this helps'),
+            presets.extract_json('Sure! Here: {"x": 1} hope this helps'),
             {"x": 1})
 
     def test_brace_inside_string_value(self):
         # A '{' or '}' inside a quoted value must not end the object early.
         self.assertEqual(
-            presets._extract_json('{"note": "use {curly} braces", "b": 2}'),
+            presets.extract_json('{"note": "use {curly} braces", "b": 2}'),
             {"note": "use {curly} braces", "b": 2})
 
     def test_trailing_comma_repair(self):
         self.assertEqual(
-            presets._extract_json('{"a": 1, "b": [1, 2,],}'), {"a": 1, "b": [1, 2]})
+            presets.extract_json('{"a": 1, "b": [1, 2,],}'), {"a": 1, "b": [1, 2]})
 
     def test_truncated_output_is_reported_as_truncated(self):
         text = '{"a": 1, "b": [2,'  # string never closes
         with self.assertRaises(presets.PresetError) as ctx:
-            presets._extract_json(text)
+            presets.extract_json(text)
         self.assertIn("truncated", str(ctx.exception))
 
     def test_no_json_raises(self):
         with self.assertRaises(presets.PresetError):
-            presets._extract_json("the model just said no")
+            presets.extract_json("the model just said no")
 
 
 class ModelJsonRepairTests(unittest.TestCase):

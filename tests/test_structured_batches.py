@@ -113,7 +113,7 @@ class StructuredBatchTests(unittest.TestCase):
                         side_effect=[unsupported, FakeResponse()]) as call:
             result = client._post([{"role": "user", "content": "x"}], 100, SCHEMA)
         fallback_body = json.loads(call.call_args_list[1].args[0].data)
-        self.assertEqual(result, '{"records":[]}')
+        self.assertEqual(result.text, '{"records":[]}')
         self.assertNotIn("response_format", fallback_body)
         self.assertIn('"records"', fallback_body["messages"][-1]["content"])
 
@@ -163,7 +163,10 @@ class StructuredBatchTests(unittest.TestCase):
 
         self.assertIn("retention_reasons", seen[0][2])
         self.assertIn('"evidence_id":1', original_audit)
-        self.assertEqual(repaired_audit, repaired)
+        # Saved payloads now carry a diagnostic header — the stop reason and
+        # response size are what distinguish an empty reply from a prose one.
+        self.assertIn("STOP REASON:", repaired_audit)
+        self.assertTrue(repaired_audit.endswith(repaired))
         self.assertEqual(rows[0]["decision"], "retain")
 
     def test_batch_rows_repairs_incomplete_chunk_coverage(self):

@@ -87,6 +87,43 @@ class ExtractRetryTests(unittest.TestCase):
             self.assertFalse(os.path.exists(dest))
         self.assertEqual(len(fake.one_calls), 3)
 
+    def test_batch_result_from_the_provider_is_unwrapped(self):
+        """The Markdown stage consumes c.batch() directly, so it has to handle
+        the same BatchResult the JSON stages get."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.project(tmp)
+            fake = FakeClient(
+                batch_text=llm.BatchResult("# Pain points\nFrom batch", "stop"))
+            self.run_extract(cfg, fake)
+            dest = os.path.join(
+                cfg["_dir"], "research", "extractions", "shoulder", "07_pain_points.md")
+            with open(dest, encoding="utf-8") as fh:
+                written = fh.read()
+
+        self.assertEqual(written, "# Pain points\nFrom batch")
+        self.assertEqual(fake.one_calls, [])
+
+    def test_budget_starved_extraction_retries_with_more_room(self):
+        """Empty + finish_reason 'length' must not be retried at the same cap."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.project(tmp)
+            fake = FakeClient(batch_text=llm.BatchResult("", "length"),
+                              retry_texts=["# Pain points\nRecovered"])
+            budgets = []
+            original_one = fake.one
+
+            def spy(corpus, preamble, prompt, max_tokens=16000, schema=None,
+                    **kwargs):
+                budgets.append(max_tokens)
+                return original_one(corpus, preamble, prompt, max_tokens, schema,
+                                    **kwargs)
+
+            fake.one = spy
+            self.run_extract(cfg, fake)
+
+        # Jobs are created at 16000; the budget-aware retry asks for 3x.
+        self.assertEqual(budgets, [48000])
+
     def test_existing_zero_byte_file_is_not_treated_as_complete(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.project(tmp)

@@ -32,6 +32,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 
 import paths  # noqa: E402
+import presets  # noqa: E402
+from llm import BatchResult, NO_RETRY_STOP_REASONS  # noqa: E402
 
 SKILLS = os.path.join(ROOT, "skills")
 
@@ -250,21 +252,19 @@ class BatchOutputError(RuntimeError):
 
 
 def _json_object(text):
-    """Read a JSON object, tolerating a provider wrapping it in a code fence."""
-    raw = (text or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, count=1, flags=re.I)
-        raw = re.sub(r"\s*```$", "", raw, count=1)
+    """Read a JSON object out of a model reply.
+
+    Delegates to presets.extract_json — the hardened parser already used by the
+    single-call stages. It strips code fences, tolerates prose around the object,
+    scans to the object's real closing brace rather than the first stray '}', and
+    reports a truncated reply AS truncated instead of blaming a comma at the
+    character where the output happened to stop. Sharing it is what keeps the
+    batched stages and the single-call stages agreeing on what valid output is.
+    """
     try:
-        obj = json.loads(raw)
-    except (json.JSONDecodeError, TypeError) as first:
-        start = raw.find("{")
-        if start < 0:
-            raise ValueError(str(first)) from first
-        try:
-            obj, _ = json.JSONDecoder().raw_decode(raw[start:])
-        except json.JSONDecodeError as second:
-            raise ValueError(str(second)) from second
+        obj = presets.extract_json(text)
+    except presets.PresetError as e:
+        raise ValueError(str(e)) from e
     if not isinstance(obj, dict):
         raise ValueError("top-level response is not an object")
     return obj
@@ -349,11 +349,86 @@ def _decode_job_rows(job, raw, key):
 
 
 def _raw_text(value):
+    if isinstance(value, BatchResult):
+        return value.text
     if isinstance(value, str):
         return value
     if value is None:
         return ""
     return json.dumps(value, ensure_ascii=False)
+
+
+def _as_result(value):
+    """Normalise whatever a backend returned into a BatchResult.
+
+    Backends hand back a BatchResult; tests and older call sites hand back a
+    bare string. A bare string carries no stop reason, so it can only be judged
+    on its content — which is exactly the blind spot this wrapper exists to make
+    visible everywhere else.
+    """
+    if isinstance(value, BatchResult):
+        return value
+    return BatchResult(text=_raw_text(value))
+
+
+# The single-call path (presets.model_json) retries an output-budget failure at
+# 3x the budget. Batched stages use the same factor so a stage behaves the same
+# whether it ran as one call or eighty.
+BUDGET_RETRY_FACTOR = 3
+
+
+def _failure_reason(result, parse_error):
+    """Name the real failure rather than the symptom.
+
+    A provider that stopped at its output budget before writing anything did not
+    emit malformed JSON — it emitted nothing. Reporting the parser's
+    "Expecting value: line 1 column 1 (char 0)" for that case is what turns a
+    solvable budget problem into a hunt for a JSON bug that does not exist.
+    """
+    stop = result.stop_reason
+    if result.out_of_budget:
+        where = "before writing any output" if not result.text.strip() else "mid-output"
+        return (f"provider stopped at its output token budget {where} "
+                f"(stop reason {stop!r}, {len(result.text)} chars returned)")
+    if stop in NO_RETRY_STOP_REASONS:
+        return f"provider refused the request (stop reason {stop!r})"
+    if not result.text.strip():
+        detail = f", stop reason {stop!r}" if stop else ""
+        return f"provider returned an empty response{detail}"
+    return parse_error
+
+
+def _save_failure(diagnostics_dir, job, result, reason, suffix):
+    """Persist a failed response with the metadata needed to diagnose it.
+
+    The stop reason and the response length belong in the file: without them an
+    empty reply and a prose reply look identical on disk, which is precisely the
+    ambiguity that made this failure hard to read.
+    """
+    os.makedirs(diagnostics_dir, exist_ok=True)
+    with open(os.path.join(diagnostics_dir, f"{job.id}.{suffix}.txt"), "w",
+              encoding="utf-8") as fh:
+        fh.write(f"WHY SAVED: {reason}\n"
+                 f"STOP REASON: {result.stop_reason or 'unknown'}\n"
+                 f"MAX TOKENS: {job.max_tokens}\n"
+                 f"RESPONSE CHARS: {len(result.text)}\n\n{result.text}")
+
+
+def _rerun_batch(client_, corpus, preamble, failures, factor):
+    """Re-issue the ORIGINAL requests with a larger output budget.
+
+    The right recovery when a provider never finished writing: there is no prior
+    output worth repairing, and the repair prompt is strictly LONGER than the
+    request that already exhausted the budget — so repairing a budget failure at
+    the same budget is close to guaranteed to fail the same way.
+    """
+    from llm import Job
+
+    jobs = [Job(id=job.id, prompt=job.prompt,
+                max_tokens=job.max_tokens * factor, schema=job.schema,
+                expected_ids=job.expected_ids)
+            for job, _result, _reason in failures]
+    return client_.batch(corpus, preamble, jobs)
 
 
 def _repair_batch(client_, corpus, preamble, failures, key):
@@ -381,50 +456,113 @@ def _repair_batch(client_, corpus, preamble, failures, key):
     return client_.batch(corpus, preamble, jobs)
 
 
-def _batch_rows(results, jobs, key, diagnostics_dir, repair=None):
-    """Decode all jobs, repairing malformed responses before failing the stage.
+def _decode_into(decoded, job, result, key):
+    """Decode one reply into `decoded`, or return the reason it could not be.
 
-    `repair` receives all failed (job, raw, reason) tuples and returns replacement
-    raw responses keyed by job id. Originals and replacements are retained for an
-    audit trail; nothing is silently discarded.
+    Returns None on success. The reason is derived from the provider's stop
+    reason first and the parser's complaint only second, so an unfinished reply
+    is never reported as a JSON syntax error.
+    """
+    try:
+        decoded[job.id] = _decode_job_rows(job, result.text, key)
+        return None
+    except (ValueError, TypeError) as e:
+        return _failure_reason(result, str(e))
+
+
+def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None):
+    """Decode all jobs, recovering failed responses before failing the stage.
+
+    Two failure modes need two different recoveries, and conflating them is what
+    turns one bad batch into a dead stage:
+
+      the model never finished writing  — an output-budget stop, an empty reply,
+        or a transport failure. There is no output to repair, so `rerun`
+        re-issues the ORIGINAL request with a larger budget.
+      the model wrote the wrong shape   — text came back but it isn't the JSON
+        the contract asked for. `repair` hands the model its own output back and
+        asks for the shape to be fixed, which preserves the judgements already made.
+
+    A refusal is neither: it is a decision, and re-asking only spends money to be
+    refused again, so it goes straight to the error.
+
+    `rerun` receives (job, BatchResult, reason) tuples plus a budget multiplier;
+    `repair` receives (job, raw_text, reason) tuples. Both return replacement
+    responses keyed by job id. Every response along the way — original, re-run
+    and repaired — is written to `diagnostics_dir`; nothing is silently discarded.
     """
     by_id = {j.id: j for j in jobs}
     failures, decoded = [], {}
+    # Keep how each job FIRST failed. Recovery replaces the carried reply with
+    # whatever the retry produced, so without this the final report would
+    # classify a job by its re-run's empty reply and lose the budget stop that
+    # is the thing the operator actually has to fix.
+    first_result = {}
     for jid, job in sorted(by_id.items()):
-        raw = _raw_text(results.get(jid, ""))
-        try:
-            if jid not in results:
-                raise ValueError("no response returned")
-            decoded[jid] = _decode_job_rows(job, raw, key)
-        except (ValueError, TypeError) as e:
-            failures.append((job, raw, str(e)))
+        result = _as_result(results.get(jid, ""))
+        reason = ("no response returned" if jid not in results
+                  else _decode_into(decoded, job, result, key))
+        if reason:
+            first_result[jid] = result
+            failures.append((job, result, reason))
 
     unexpected = sorted(set(results) - set(by_id))
-    if failures:
-        os.makedirs(diagnostics_dir, exist_ok=True)
-        for job, raw, reason in failures:
-            with open(os.path.join(diagnostics_dir, f"{job.id}.original.txt"), "w",
-                      encoding="utf-8") as fh:
-                fh.write(f"ERROR: {reason}\n\n{raw}")
+    for job, result, reason in failures:
+        _save_failure(diagnostics_dir, job, result, reason, "original")
 
+    # ---- unfinished replies: re-run the original request with more room ------
+    if failures and rerun is not None:
+        starved = [f for f in failures if f[1].retryable]
+        if starved:
+            print(f"  ! {len(starved)}/{len(jobs)} {key} response(s) never finished "
+                  f"(output budget, empty or failed request) — re-running those "
+                  f"requests at {BUDGET_RETRY_FACTOR}x the token budget")
+            replies = rerun(starved, BUDGET_RETRY_FACTOR)
+            recovered, still_bad = set(), []
+            for job, result, original_reason in starved:
+                retried = _as_result(replies.get(job.id, ""))
+                _save_failure(diagnostics_dir, job, retried,
+                              f"re-run of: {original_reason}", "rerun")
+                if job.id not in replies:
+                    still_bad.append((job, result,
+                                      f"{original_reason}; re-run returned no response"))
+                    continue
+                reason = _decode_into(decoded, job, retried, key)
+                if reason:
+                    # Carry the re-run's reply forward: it, not the empty
+                    # original, is what a shape repair has to work from.
+                    still_bad.append((job, retried,
+                                      f"{original_reason}; re-run: {reason}"))
+                else:
+                    recovered.add(job.id)
+            print(f"    {len(recovered)}/{len(starved)} recovered on re-run")
+            failures = [f for f in failures if not f[1].retryable] + still_bad
+
+    # ---- wrong-shape replies: ask the model to fix the shape ----------------
     if failures and repair is not None:
-        print(f"  ! repairing {len(failures)} malformed/missing {key} response(s) "
-              "in one additional structured batch")
-        repaired = repair(failures)
-        still_bad = []
-        for job, original, original_reason in failures:
-            raw = _raw_text(repaired.get(job.id, ""))
-            with open(os.path.join(diagnostics_dir, f"{job.id}.repaired.txt"), "w",
-                      encoding="utf-8") as fh:
-                fh.write(raw)
-            try:
+        fixable = [f for f in failures
+                   if f[1].stop_reason not in NO_RETRY_STOP_REASONS]
+        if fixable:
+            print(f"  ! repairing {len(fixable)} malformed {key} response(s) "
+                  "in one additional structured batch")
+            repaired = repair([(job, result.text, reason)
+                               for job, result, reason in fixable])
+            still_bad = []
+            for job, result, original_reason in fixable:
+                fixed = _as_result(repaired.get(job.id, ""))
+                _save_failure(diagnostics_dir, job, fixed,
+                              f"repair of: {original_reason}", "repaired")
                 if job.id not in repaired:
-                    raise ValueError("repair returned no response")
-                decoded[job.id] = _decode_job_rows(job, raw, key)
-            except (ValueError, TypeError) as e:
-                still_bad.append((job, original, original_reason, str(e)))
-        failures = [(job, raw, f"original: {old}; repair: {new}")
-                    for job, raw, old, new in still_bad]
+                    still_bad.append((job, result,
+                                      f"original: {original_reason}; "
+                                      "repair: repair returned no response"))
+                    continue
+                reason = _decode_into(decoded, job, fixed, key)
+                if reason:
+                    still_bad.append((job, result,
+                                      f"original: {original_reason}; repair: {reason}"))
+            failures = [f for f in failures
+                        if f[1].stop_reason in NO_RETRY_STOP_REASONS] + still_bad
 
     if unexpected:
         os.makedirs(diagnostics_dir, exist_ok=True)
@@ -434,12 +572,23 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None):
                 fh.write(_raw_text(results[jid]))
 
     if failures or unexpected:
-        descriptions = [(job.id, reason) for job, _, reason in failures]
+        descriptions = [(job.id, reason) for job, _result, reason in failures]
         descriptions.extend((jid, "unexpected response id") for jid in unexpected)
         sample = "; ".join(f"{jid}: {reason}" for jid, reason in descriptions[:3])
+        # Lead with the dominant mode. "Violated the JSON contract" is true of
+        # every failure here and actionable for none of them; "ran out of output
+        # budget" tells the operator to raise max_tokens or pick another model.
+        modes = Counter(
+            "output budget exhausted" if first.out_of_budget else
+            "refused" if first.stop_reason in NO_RETRY_STOP_REASONS else
+            "empty response" if not first.text.strip() else "malformed JSON"
+            for first in (first_result[job.id] for job, _r, _reason in failures))
+        if unexpected:
+            modes["unexpected response id"] += len(unexpected)
+        breakdown = ", ".join(f"{n} {name}" for name, n in modes.most_common())
         raise BatchOutputError(
-            f"{len(descriptions)}/{len(jobs)} batch response(s) still violated the "
-            f"{key!r} JSON contract after recovery ({sample}). Original and repaired "
+            f"{len(descriptions)}/{len(jobs)} batch response(s) could not be used "
+            f"after recovery — {breakdown} ({sample}). Original, re-run and repaired "
             f"responses were saved to {diagnostics_dir}. No stage output was written.")
     return [row for jid in sorted(decoded) for row in decoded[jid]]
 
@@ -536,7 +685,8 @@ def cmd_ingest(cfg, args):
     records = _batch_rows(
         c.batch(prefix, PREAMBLE, jobs), jobs, "records",
         os.path.join(voc, "_model_failures", "01_filter"),
-        repair=lambda failed: _repair_batch(c, prefix, PREAMBLE, failed, "records"))
+        repair=lambda failed: _repair_batch(c, prefix, PREAMBLE, failed, "records"),
+        rerun=lambda failed, factor: _rerun_batch(c, prefix, PREAMBLE, failed, factor))
     _require_exact_ids(records, {r["id"] for r in pre}, "skill 01 filter")
     verdicts = {r["evidence_id"]: r for r in records}
 
@@ -574,7 +724,8 @@ def cmd_ingest(cfg, args):
     groups = _batch_rows(
         c.batch(dprefix, PREAMBLE, djobs), djobs, "groups",
         os.path.join(voc, "_model_failures", "02_deduplicate"),
-        repair=lambda failed: _repair_batch(c, dprefix, PREAMBLE, failed, "groups"))
+        repair=lambda failed: _repair_batch(c, dprefix, PREAMBLE, failed, "groups"),
+        rerun=lambda failed, factor: _rerun_batch(c, dprefix, PREAMBLE, failed, factor))
     for g in groups:
         drop.update(i for i in g["duplicate_ids"] if i != g["canonical_id"])
 
@@ -815,7 +966,9 @@ def cmd_segment(cfg, args):
             results, jobs, "assignments",
             os.path.join(voc, "_model_failures", "05_assign"),
             repair=lambda failed: _repair_batch(
-                c, prefix, PREAMBLE, failed, "assignments"))
+                c, prefix, PREAMBLE, failed, "assignments"),
+            rerun=lambda failed, factor: _rerun_batch(
+                c, prefix, PREAMBLE, failed, factor))
         _require_exact_ids(rows, {i["id"] for i in items}, "skill 05 assignment")
         with open(asg_p, "w", encoding="utf-8") as fh:
             for r in rows:
@@ -1004,16 +1157,24 @@ def cmd_extract(cfg, args):
     # skill immediately, keeping successful batch results intact.
     failed = []
     for job in jobs:
-        text = results.get(job.id, "")
-        if text and text.strip():
+        result = _as_result(results.get(job.id, ""))
+        results[job.id] = result.text
+        if result.text.strip():
             continue
-        print(f"  ! {job.id} returned no content; retrying immediately "
+        # An empty reply because the budget went on reasoning needs more ROOM,
+        # not another identical attempt. Same lesson as the batched JSON stages,
+        # and the stop reason is what makes it knowable here too.
+        budget = (job.max_tokens * BUDGET_RETRY_FACTOR if result.out_of_budget
+                  else job.max_tokens)
+        why = ("hit its output token budget before writing anything"
+               if result.out_of_budget else "returned no content")
+        print(f"  ! {job.id} {why}; retrying immediately at {budget:,} tokens, "
               f"up to {EMPTY_EXTRACTION_RETRIES} times")
         for attempt in range(1, EMPTY_EXTRACTION_RETRIES + 1):
             print(f"    {job.id}: retry {attempt}/{EMPTY_EXTRACTION_RETRIES}",
                   flush=True)
             text = c.one(
-                corpus, PREAMBLE, job.prompt, job.max_tokens, job.schema,
+                corpus, PREAMBLE, job.prompt, budget, job.schema,
                 job_id=job.id,
                 operation=f"extraction_empty_retry_{attempt}")
             if text and text.strip():

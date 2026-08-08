@@ -37,6 +37,7 @@ import urllib.error
 import urllib.request
 
 import auditlog
+from llm import BUDGET_STOP_REASONS
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEVERS_MD = os.environ.get(
@@ -535,7 +536,7 @@ def _json_end(raw, start):
     return -1
 
 
-def _extract_json(text):
+def extract_json(text):
     """Parse a JSON object from a model reply, tolerating wrapping and drift.
 
     Three problems are handled here that a plain `json.loads` cannot:
@@ -618,7 +619,7 @@ def _post_text(provider, keys, model, system, prompt, max_tokens, timeout, label
         text = ((payload.get("choices") or [{}])[0].get("message") or {}).get(
             "content", "") or ""
         finish = (payload.get("choices") or [{}])[0].get("finish_reason")
-    if not text.strip() and finish in ("length", "max_tokens"):
+    if not text.strip() and finish in BUDGET_STOP_REASONS:
         raise OutputBudgetError(
             f"the model hit its output token budget ({max_tokens}) during "
             f"reasoning and stopped before writing any JSON (finish_reason="
@@ -646,7 +647,7 @@ def model_json(provider, keys, model, system, prompt, max_tokens=10000,
         # The model ran out of output tokens mid-reasoning. Re-ask with a
         # bigger budget so it can finish thinking AND write the JSON.
         try:
-            return _extract_json(_post_text(
+            return extract_json(_post_text(
                 provider, keys, model, system, prompt,
                 max_tokens * 3, timeout, label))
         except PresetError as e:
@@ -656,7 +657,7 @@ def model_json(provider, keys, model, system, prompt, max_tokens=10000,
     except PresetError as e:
         raise
     try:
-        return _extract_json(raw)
+        return extract_json(raw)
     except PresetError as parse_err:
         reason = str(parse_err)  # capture before the except block clears it
 
@@ -678,7 +679,7 @@ def model_json(provider, keys, model, system, prompt, max_tokens=10000,
         repaired = _post_text(provider, keys, model, system,
                               repair_prompt, max_tokens, timeout,
                               f"{label} repair")
-        return _extract_json(repaired)
+        return extract_json(repaired)
     except PresetError as repair_err:
         raise PresetError(
             f"{label}: the model returned unreadable JSON ({reason}); a repair pass "
@@ -724,7 +725,7 @@ def pick(brief, reference_rel="", keys=None, model=None):
                           {"role": "user", "content": user}]})
         text = payload["choices"][0]["message"]["content"]
 
-    got = _extract_json(text)
+    got = extract_json(text)
     pid = str(got.get("id", "")).strip().zfill(2)
     p = by_id(pid)
     return {"id": p["id"], "name": p["name"], "group": p["group"],

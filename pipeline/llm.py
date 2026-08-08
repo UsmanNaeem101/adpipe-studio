@@ -56,6 +56,47 @@ class Job:
     expected_ids: tuple[int, ...] | None = None
 
 
+# Providers spell "I ran out of output room" differently: Anthropic returns a
+# stop_reason of "max_tokens", OpenAI-compatible routes a finish_reason of
+# "length". Defined once here because llm.py, openrouter.py and presets.py all
+# have to recognise the same condition.
+BUDGET_STOP_REASONS = ("max_tokens", "length")
+
+# A refusal is a decision, not a shortfall. Re-running it spends money to be
+# refused again, so it must never be classified as retryable.
+NO_RETRY_STOP_REASONS = ("refusal",)
+
+
+@dataclass
+class BatchResult:
+    """One job's reply, plus the reason generation stopped.
+
+    The stop reason is the whole difference between "the model wrote bad JSON"
+    and "the model never got as far as the JSON". Without it a decode site sees
+    an empty string, reports `Expecting value: line 1 column 1 (char 0)`, and
+    sends the reader hunting for a parser bug that isn't there.
+    """
+    text: str = ""
+    stop_reason: str | None = None
+
+    @property
+    def out_of_budget(self) -> bool:
+        return self.stop_reason in BUDGET_STOP_REASONS
+
+    @property
+    def retryable(self) -> bool:
+        """True when re-running the ORIGINAL request is the right recovery.
+
+        That is the case when the provider never finished writing: an
+        output-budget stop, an empty reply, or a transport/batch-level failure.
+        A reply that has text but the wrong shape is cheaper to repair than to
+        regenerate, and a refusal is not a shortfall at all.
+        """
+        if self.stop_reason in NO_RETRY_STOP_REASONS:
+            return False
+        return self.out_of_budget or not (self.text or "").strip()
+
+
 @dataclass
 class Estimate:
     jobs: int = 0
@@ -290,14 +331,20 @@ class Client:
                         batch_id=batch.id)
                     if m.stop_reason == "refusal":
                         failed.append(f"{res.custom_id}: refused by safety classifiers")
-                        continue
-                    out[res.custom_id] = text
+                    elif m.stop_reason == "max_tokens":
+                        failed.append(
+                            f"{res.custom_id}: hit max_tokens before finishing")
+                    # Record the reply either way, refusal included. Dropping it
+                    # here would leave the caller unable to tell a refusal from a
+                    # request that never came back, and it would retry the refusal.
+                    out[res.custom_id] = BatchResult(text, m.stop_reason)
                 else:
                     detail = getattr(
                         getattr(res.result, "error", None), "type", res.result.type)
                     audits[res.custom_id].event(
                         "batch_failure", res.result, batch_id=batch.id)
                     failed.append(f"{res.custom_id}: {detail}")
+                    out[res.custom_id] = BatchResult("", f"batch_{res.result.type}")
         except Exception as e:
             for audit in audits.values():
                 audit.error(e, phase="batch_results", batch_id=batch.id)
