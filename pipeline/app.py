@@ -74,6 +74,7 @@ _lock = threading.Lock()
 
 STAGES = [
     ("ingest",   "Skills 01-02: filter + deduplicate",         True,  True),
+    ("refine-voc", "Deterministic VOC refinement + export",    False, False),
     ("segment",  "Skills 03-06: discover, validate, assign, build", True, False),
     ("extract",  "Skills 07-26: 20 dimensions, batched",       True,  False),
     ("picc",     "Skill 27 + PICC card + 5 angles",            True,  False),
@@ -3889,6 +3890,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, f"Raw VOC file not found:\n  {src}\n",
                                   "text/plain; charset=utf-8")
             cmd.append(src)
+        elif stage == "refine-voc":
+            # Project-wide deterministic export: unlike downstream research
+            # stages it consumes the completed ingest artefacts, not a segment.
+            pass
         elif stage != "segment":
             seg = req.get("segment") or ""
             if not seg:

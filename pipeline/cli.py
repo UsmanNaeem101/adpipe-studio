@@ -2607,9 +2607,9 @@ def main():
                    help="show Stage 02 scheduler ordering, stop reasons, token "
                         "splits, and diagnostic paths")
     s.set_defaults(fn=cmd_ingest)
-    s = sub.add_parser(
+    s = common(sub.add_parser(
         "refine-voc",
-        help="regenerate production/audit VOC locally from completed deduplication")
+        help="regenerate production/audit VOC locally from completed deduplication"))
     s.set_defaults(fn=cmd_refine_voc)
     s = common(sub.add_parser("segment")); s.add_argument("--rediscover", action="store_true")
     s.add_argument("--reassign", action="store_true")

@@ -1,4 +1,5 @@
 import datetime
+import io
 import os
 import sys
 import tempfile
@@ -111,6 +112,39 @@ class AppOutputTests(unittest.TestCase):
         self.assertIn('id=force', app.PAGE)
         self.assertIn('Force redo existing outputs', app.PAGE)
         self.assertIn("force:$('#force').checked", app.PAGE)
+
+    def test_pipeline_lists_refine_voc_as_a_free_stage(self):
+        refine = [stage for stage in app.STAGES if stage[0] == "refine-voc"]
+
+        self.assertEqual(len(refine), 1)
+        self.assertFalse(refine[0][2])
+        self.assertFalse(refine[0][3])
+        self.assertLess(
+            [stage[0] for stage in app.STAGES].index("refine-voc"),
+            [stage[0] for stage in app.STAGES].index("segment"))
+
+    def test_refine_voc_runs_without_requiring_a_segment(self):
+        handler = object.__new__(app.Handler)
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        handler.wfile = io.BytesIO()
+        proc = mock.Mock(stdout=[], returncode=0)
+
+        with mock.patch.object(app.subprocess, "Popen", return_value=proc) as popen:
+            handler._run({
+                "stage": "refine-voc",
+                "project": "shoulder",
+                "force": True,
+                "provider": "openrouter",
+                "model": "example/model",
+            })
+
+        cmd = popen.call_args.args[0]
+        self.assertIn("refine-voc", cmd)
+        self.assertIn("--force", cmd)
+        self.assertIn("--provider", cmd)
+        self.assertNotIn("No segment selected", handler.wfile.getvalue().decode())
 
 
 if __name__ == "__main__":
