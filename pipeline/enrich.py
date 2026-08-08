@@ -38,7 +38,7 @@ import products
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-MODELS = {"anthropic": "claude-opus-5", "openrouter": "deepseek/deepseek-v4"}
+MODELS = {"anthropic": "claude-opus-5", "openrouter": "deepseek/deepseek-v4-flash-0731"}
 
 # States that mean a person has already settled this field.
 PROTECTED = {"user_approved", "verified_fact"}
@@ -205,27 +205,9 @@ def suggest(project, product, slug, segment_doc, sections=None, keys=None,
     provider = _provider(keys)
     model = model or MODELS[provider]
     try:
-        if provider == "anthropic":
-            payload = presets._post_json(
-                presets.ANTHROPIC_URL,
-                {"x-api-key": keys["anthropic"], "anthropic-version": "2023-06-01",
-                 "Content-Type": "application/json"},
-                {"model": model, "max_tokens": 8000, "system": SYSTEM,
-                 "messages": [{"role": "user", "content": prompt}]},
-                timeout=300, label="research enrichment")
-            text = "".join(b.get("text", "") for b in payload.get("content", []))
-        else:
-            payload = presets._post_json(
-                presets.OPENROUTER_URL,
-                {"Authorization": f"Bearer {keys['openrouter']}",
-                 "Content-Type": "application/json",
-                 "HTTP-Referer": "https://localhost/adpipe", "X-Title": "adpipe"},
-                {"model": model, "max_tokens": 8000,
-                 "messages": [{"role": "system", "content": SYSTEM},
-                              {"role": "user", "content": prompt}]},
-                timeout=300, label="research enrichment")
-            text = payload["choices"][0]["message"]["content"]
-        got = presets._extract_json(text)
+        got = presets.model_json(provider, keys, model, SYSTEM, prompt,
+                                 max_tokens=8000, timeout=300,
+                                 label="research enrichment")
     except presets.PresetError as e:
         raise EnrichError(str(e))
 

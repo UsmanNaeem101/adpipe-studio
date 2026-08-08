@@ -39,7 +39,7 @@ import products
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-MODELS = {"anthropic": "claude-opus-5", "openrouter": "deepseek/deepseek-v4"}
+MODELS = {"anthropic": "claude-opus-5", "openrouter": "deepseek/deepseek-v4-flash-0731"}
 
 # What counts as reviewed. research_derived is included because it came from the
 # pipeline rather than from a model guessing about the pipeline.
@@ -233,27 +233,9 @@ def synthesise(project, product, slug, segment_doc, sections_wanted=None, keys=N
     provider = _provider(keys)
     model = model or MODELS[provider]
     try:
-        if provider == "anthropic":
-            payload = presets._post_json(
-                presets.ANTHROPIC_URL,
-                {"x-api-key": keys["anthropic"], "anthropic-version": "2023-06-01",
-                 "Content-Type": "application/json"},
-                {"model": model, "max_tokens": 10000, "system": SYSTEM,
-                 "messages": [{"role": "user", "content": prompt}]},
-                timeout=300, label="strategy synthesis")
-            text = "".join(b.get("text", "") for b in payload.get("content", []))
-        else:
-            payload = presets._post_json(
-                presets.OPENROUTER_URL,
-                {"Authorization": f"Bearer {keys['openrouter']}",
-                 "Content-Type": "application/json",
-                 "HTTP-Referer": "https://localhost/adpipe", "X-Title": "adpipe"},
-                {"model": model, "max_tokens": 10000,
-                 "messages": [{"role": "system", "content": SYSTEM},
-                              {"role": "user", "content": prompt}]},
-                timeout=300, label="strategy synthesis")
-            text = payload["choices"][0]["message"]["content"]
-        got = presets._extract_json(text)
+        got = presets.model_json(provider, keys, model, SYSTEM, prompt,
+                                 max_tokens=10000, timeout=300,
+                                 label="strategy synthesis")
     except presets.PresetError as e:
         raise SynthError(str(e))
 

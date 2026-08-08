@@ -25,9 +25,10 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import auditlog
+import modeloutput
 
 MODEL = "claude-opus-5"
 
@@ -51,6 +52,11 @@ class Job:
     prompt: str
     max_tokens: int = 16000
     schema: dict | None = None
+    # Optional provider reasoning control. Reasoning is billed from the same
+    # output allowance as the answer, so high-volume structured stages turn it
+    # off. Honoured by the OpenRouter client; the Anthropic path uses adaptive
+    # thinking, which does not have the same starve-the-answer failure mode.
+    reasoning: dict | None = None
     # Per-record stages use this to prove that a response covered the complete
     # input chunk before any output is accepted or written.
     expected_ids: tuple[int, ...] | None = None
@@ -238,7 +244,7 @@ class Client:
 
         return text
 
-    def batch(self, corpus, preamble, jobs, poll_seconds=30) -> dict:
+    def batch(self, corpus, preamble, jobs, poll_seconds=30, _retry=False) -> dict:
         """Fan out independent jobs at 50%. Results come back keyed by custom_id in
         arbitrary order — never by position."""
         from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
@@ -278,7 +284,8 @@ class Client:
                 audit.error(e, phase="batch_poll", batch_id=batch.id)
             raise
 
-        out, failed = {}, []
+        out, failed, retries = {}, [], []
+        by_id = {j.id: j for j in jobs}
         try:
             for res in self.client.messages.batches.results(batch.id):
                 if res.result.type == "succeeded":
@@ -290,6 +297,19 @@ class Client:
                         batch_id=batch.id)
                     if m.stop_reason == "refusal":
                         failed.append(f"{res.custom_id}: refused by safety classifiers")
+                        continue
+                    job = by_id.get(res.custom_id)
+                    if job is not None and modeloutput.is_budget_exhaustion(
+                            text, m.stop_reason):
+                        # Same failure as the OpenRouter path: the whole output
+                        # allowance went on thinking. Retry this job alone with
+                        # more room — there is no JSON here to repair.
+                        retries.append(job)
+                        continue
+                    if not text.strip():
+                        failed.append(
+                            f"{res.custom_id}: "
+                            f"{modeloutput.empty_reason(m.stop_reason)}")
                         continue
                     out[res.custom_id] = text
                 else:
@@ -303,6 +323,21 @@ class Client:
                 audit.error(e, phase="batch_results", batch_id=batch.id)
             raise
 
+        if retries and not _retry:
+            bigger = [replace(j, max_tokens=j.max_tokens * modeloutput.RETRY_MULTIPLIER)
+                      for j in retries]
+            print(f"  ! {len(bigger)} job(s) spent their whole output budget on "
+                  f"thinking and returned nothing — re-running them with "
+                  f"{modeloutput.RETRY_MULTIPLIER}x the budget")
+            out.update(self.batch(corpus, preamble, bigger,
+                                  poll_seconds=poll_seconds, _retry=True))
+        elif retries:
+            failed.extend(
+                f"{j.id}: {modeloutput.budget_message(j.max_tokens, 'max_tokens', j.id)}"
+                for j in retries)
+
+        self.failures = {f.split(":", 1)[0]: f.split(":", 1)[1].strip()
+                         for f in failed if ":" in f}
         for f in failed:
             print(f"  ! {f}")
         return out

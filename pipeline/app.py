@@ -201,6 +201,65 @@ def add_product(project, doc):
     return {"project": project, "product": slug}
 
 
+def move_product(project, product, to):
+    """Relink an existing product to another project.
+
+    A product folder (products/<slug>/) is moved wholesale; its segments and
+    segment sheets move with it. The one thing that must not change is which
+    project's research a segment reads: segments with an explicit
+    `evidence_project` keep it (the product can legally point at research in
+    another project), but a segment with an EMPTY one defaulted to "this
+    product's own project" — so when the product moves, that segment's default
+    would silently switch to the destination project's research. Those segments
+    are pinned to the source project before the move so the meaning is preserved,
+    and the count is returned so the UI can say so.
+    """
+    if not SAFE_NAME.match(to or ""):
+        raise ValueError("destination project name is invalid")
+    if to not in projects():
+        raise ValueError(f"no project {to!r} — create it first")
+    if to == project:
+        raise ValueError("product already lives in that project")
+    have = products.list_products(project)
+    if product not in have:
+        raise ValueError(f"no product {product!r} in project {project!r}")
+    if product in products.list_products(to):
+        raise ValueError(
+            f"project {to!r} already has a product {product!r} — open the existing "
+            f"one or rename before moving")
+
+    src = products.product_dir(project, product)
+    dst = products.product_dir(to, product)
+
+    # Pin any segment that relied on the "own project" default so a move cannot
+    # silently re-point its research at the destination project.
+    pinned = 0
+    seg_path = os.path.join(src, "segments.json")
+    if os.path.exists(seg_path):
+        try:
+            rows = json.load(open(seg_path, encoding="utf-8"))
+        except (ValueError, OSError):
+            rows = []
+        changed = False
+        for r in rows:
+            c = ((r.get("doc") or {}).get("identity", {})
+                 .get("evidence_project", {}).get("value"))
+            if not c or not str(c).strip():
+                seg = r.setdefault("doc", {}).setdefault("identity", {})
+                seg["evidence_project"] = products.cell(
+                    project, "user_approved", "migration",
+                    f"pinned to source project before product moved from {project} "
+                    f"to {to}", "")
+                changed = True
+                pinned += 1
+        if changed:
+            json.dump(rows, open(seg_path, "w", encoding="utf-8"), indent=2)
+
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.rename(src, dst)
+    return {"project": to, "product": product, "pinned": pinned}
+
+
 def create_project(name, product, market):
     """A project is a folder, a project.json, and an empty product sheet.
 
@@ -854,6 +913,14 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
  .bf h4 input{width:auto;margin-top:2px}
  .bf p{margin:4px 0;font-size:13px;line-height:1.45}
  .bf .vis{color:var(--soft);font-size:12.5px;margin-top:7px;font-style:italic}
+ /* move-product modal — same overlay pattern as the prompt confirm */
+ #mvwrap{position:fixed;inset:0;background:rgba(20,20,20,.5);z-index:60;
+   display:flex;align-items:center;justify-content:center;padding:24px}
+ #mvwrap.hide{display:none}
+ #mvbox{background:var(--paper);border-radius:14px;width:100%;max-width:460px;
+   padding:20px 22px}
+ #mvsel{background:var(--surface);border:1.5px solid var(--line);border-radius:9px;
+   padding:9px 10px;min-height:42px}
  /* prompt confirm */
  #pmwrap{position:fixed;inset:0;background:rgba(20,20,20,.5);z-index:60;
    display:flex;align-items:center;justify-content:center;padding:24px}
@@ -1145,6 +1212,7 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
     <div class=row style="margin-bottom:16px">
       <div><label>Project</label><select id=proj></select></div>
       <div><label>Segment</label><select id=seg></select></div>
+      <div id=prodwrap class="hide"><label>Product</label><select id=prod></select></div>
     </div>
     <div class=stagelist id=stages></div>
     <div id=ingestbox class="hide" style="margin-top:16px">
@@ -1340,6 +1408,19 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 
 <!-- Nothing is sent until this is accepted. The text in the box IS what goes to
      the image model — edit it here and the edit is what gets sent. -->
+<div id=mvwrap class=hide>
+  <div id=mvbox>
+    <h2 style="margin-top:0" id=mvtitle>Move product</h2>
+    <p class=hint id=mvdesc style="margin-top:0"></p>
+    <select id=mvsel style="width:100%;margin:6px 0 4px"></select>
+    <p class=hint id=mvnote style="margin:6px 0 0"></p>
+    <div style="display:flex;gap:10px;margin-top:16px;align-items:center">
+      <button class=btn id=mvgo>Move</button>
+      <button class="btn ghost" id=mvcancel>Cancel</button>
+      <span class=hint id=mvmsg style="margin:0"></span>
+    </div>
+  </div>
+</div>
 <div id=pmwrap class=hide>
   <div id=pmbox>
     <h2 style="margin-top:0">Confirm the prompt</h2>
@@ -1823,14 +1904,50 @@ async function loadProducts(){
         <small>${esc(p.project)} / ${esc(p.product)} · truth ${p.answered}/${p.total} (${pct}%)${score}
         · <b>${p.segments}</b> segment(s), ${p.active_segments} active
         ${p.missing_required?` · <b style=color:var(--signal)>${p.missing_required} required blank</b>`:''}</small>
+        <button class="btn ghost" data-move style="margin-top:8px;padding:4px 10px;font-size:12px;float:right">Move to project…</button>
         ${p.definition?`<small style="display:block;margin-top:4px">${esc(p.definition)}</small>`:''}`;
       el.title='Open this product sheet';
       el.onclick=()=>openSheet(p.project,p.product);
+      el.querySelector('[data-move]').onclick=async ev=>{
+        ev.stopPropagation();
+        const projs=(await (await fetch('/projects')).json()).projects||[];
+        const avail=projs.filter(x=>x!==p.project);
+        if(!avail.length){ alert('No other projects to move it into.'); return; }
+        openMoveModal(p, avail);
+      };
       box.appendChild(el);
     });
   }catch(e){ box.innerHTML=`<p class=hint>⚠ ${e}</p>`; }
 }
 
+/* ---- move-product modal ---- */
+let MVMOVE=null;   // {project, product, name, avail[]} current move target
+function openMoveModal(p, avail){
+  MVMOVE=null;
+  $('#mvtitle').textContent=`Move "${p.name||p.product}" to a project`;
+  $('#mvdesc').textContent=`Currently in ${p.project}. Its segments keep their research links.`;
+  const sel=$('#mvsel'); sel.innerHTML=avail.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');
+  $('#mvnote').textContent='Segments pointing at research here stay pointed at it.';
+  $('#mvmsg').textContent='';
+  MVMOVE={project:p.project, product:p.product, name:p.name||p.product};
+  $('#mvwrap').classList.remove('hide');
+}
+$('#mvcancel').onclick=()=>{ $('#mvwrap').classList.add('hide'); MVMOVE=null; };
+$('#mvwrap').onclick=e=>{ if(e.target===$('#mvwrap')) $('#mvcancel').click(); };
+$('#mvgo').onclick=async()=>{
+  if(!MVMOVE) return;
+  const to=$('#mvsel').value; if(!to){ $('#mvmsg').textContent='Pick a destination.'; return; }
+  $('#mvgo').disabled=true; $('#mvmsg').textContent='moving…';
+  try{
+    const r=await (await fetch('/product/move',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project:MVMOVE.project, product:MVMOVE.product, to})})).json();
+    if(r.error){ $('#mvmsg').textContent='⚠ '+r.error; $('#mvgo').disabled=false; return; }
+    $('#mvwrap').classList.add('hide'); MVMOVE=null;
+    loadProducts();
+  }catch(e){ $('#mvmsg').textContent='⚠ '+e; }
+  $('#mvgo').disabled=false;
+};
 async function openSheet(proj,prod){
   const j=await (await fetch(`/product?project=${encodeURIComponent(proj)}&product=${encodeURIComponent(prod||'')}`)).json();
   if(j.error){ alert(j.error); return; }
@@ -2380,6 +2497,8 @@ const STAGES=__STAGES__;
       const showSeg = s.name==='segment';
       $('#segvocbox').classList.toggle('hide',!showSeg);
       if(showSeg) loadVocFiles();
+      const wantsProduct = ['picc','concepts','brief','run'].includes(s.name);
+      $('#prodwrap').classList.toggle('hide',!wantsProduct);
       showOpts(s.name);
       $('#runbtn').disabled=false;
       $('#runhint').textContent=s.costs?'This stage calls the selected model API — tick the approval box.':'Free — pure code.';
@@ -2398,6 +2517,23 @@ async function loadSegs(){
   $('#seg').onchange=loadPiccs;
   if(stage&&stage.name==='segment')loadVocFiles();
   loadPiccs();
+  loadProds();
+}
+/* Stages that build on a product (PICC/concepts/briefs) need to know which
+   product this project's pipeline is running for, so the segment context and
+   product truth injected into the prompt are the right ones. */
+async function loadProds(){
+  const sel=$('#prod'); if(!sel) return;
+  const pr=$('#proj').value, was=sel.value;
+  sel.innerHTML='<option value="">— default product —</option>';
+  if(!pr) return;
+  try{
+    const j=await (await fetch('/products?project='+encodeURIComponent(pr))).json();
+    (j.products||[]).filter(x=>x.project===pr).forEach(x=>{
+      const o=document.createElement('option');
+      o.value=x.product; o.textContent=x.product; sel.appendChild(o);});
+    if(was&&[...sel.options].some(o=>o.value===was)) sel.value=was;
+  }catch(e){}
 }
 /* The concepts stage builds on exactly one PICC card. Default to the selected
    segment's own, but list every card in the project so a rewritten or set-aside
@@ -2457,6 +2593,7 @@ $('#runbtn').onclick=async()=>{
               rules_only:$('#rulesonly').checked,
               n_concepts:+$('#nconcepts').value||0, n_hooks:+$('#nhooks').value||0,
               picc:$('#piccsel')?$('#piccsel').value:'',
+              product:$('#prod')?$('#prod').value:'',
               n_briefs:+$('#nbriefs').value||0,
               provider:$('#provider')?$('#provider').value:'',
               model:$('#modelid')?$('#modelid').value.trim():''};
@@ -2642,15 +2779,110 @@ async function loadOutputs(){
     assignment records exist behind them, so anything built on them inherits an
     unverifiable lineage.</p></div>`:'';
 }
+/* Render a subset of markdown to HTML, safely.
+   Input is escaped first, so no user/model content can become markup — this
+   is display only. Supported: headings, paragraphs, bold, italic, inline and
+   fenced code, bullet + numbered lists, blockquotes, tables, hr, links. */
+const MD_INLINE=[
+  [/`([^`]+)`/g, '<code>$1</code>'],
+  [/\*\*([^*]+)\*\*/g, '<strong>$1</strong>'],
+  [/(^|[^\w*])\*([^*\n]+)\*(?!\w)/g, '$1<em>$2</em>'],
+  [/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target=_blank rel=noopener>$1</a>'],
+];
+function mdInline(s){
+  s=outEsc(s);
+  MD_INLINE.forEach(([re,rep])=>s=s.replace(re,rep));
+  return s;
+}
+function mdRender(text){
+  const src=String(text??'').replace(/\r\n?/g,'\n').split('\n');
+  const out=[]; let i=0;
+  const flushPara=()=>{ if(buf.length){ out.push('<p>'+buf.join('<br>')+'</p>'); buf=[]; } };
+  let buf=[]; let fence=false;
+  while(i<src.length){
+    const line=src[i];
+    // fenced code blocks
+    if(/^```/.test(line.trim())){
+      flushPara(); fence=!fence; i++; continue;
+    }
+    if(fence){ out.push('<pre><code>'+outEsc(line)+'</code></pre>'); i++; continue; }
+    const t=line.trim();
+    // blank line -> paragraph break
+    if(!t){ flushPara(); i++; continue; }
+    // headings
+    const h=/^(#{1,6})\s+(.*)$/.exec(t);
+    if(h){ flushPara(); const n=h[1].length;
+      out.push(`<h${Math.min(n,4)} style="margin:14px 0 6px">${mdInline(h[2])}</h${Math.min(n,4)}>`);
+      i++; continue; }
+    // horizontal rule
+    if(/^(-{3,}|\*{3,}|_{3,})$/.test(t)){ flushPara();
+      out.push('<hr style="border:none;border-top:1.5px solid var(--line);margin:14px 0">');
+      i++; continue; }
+    // table: a header row then a separator row
+    if(/^\|.*\|$/.test(t)&&i+1<src.length&&/^\s*\|?[\s:|-]+\|?\s*$/.test(src[i+1].trim())&&
+       /-/.test(src[i+1])){
+      flushPara();
+      const head=t.split('|').map(c=>c.trim()).filter((c,ix,a)=>ix>0||c);
+      const headCells=head.slice(0,head.length);
+      i+=2; // consume header + separator
+      const rows=[];
+      while(i<src.length&&/^\|.*\|$/.test(src[i].trim())){
+        const cells=src[i].split('|').map(c=>c.trim());
+        rows.push(cells);
+        i++;
+      }
+      let table='<table style="border-collapse:collapse;margin:10px 0;width:100%;font-size:12.5px">';
+      table+='<thead><tr>'+headCells.map(c=>`<th style="border:1px solid var(--line);padding:5px 8px;text-align:left;background:var(--surface);white-space:nowrap">${mdInline(c)}</th>`).join('')+'</tr></thead>';
+      table+='<tbody>'+rows.map(r=>'<tr>'+headCells.map((_,ix)=>`<td style="border:1px solid var(--line);padding:5px 8px">${mdInline(r[ix]??'')}</td>`).join('')+'</tr>').join('')+'</tbody></table>';
+      out.push(table);
+      continue;
+    }
+    // blockquote
+    if(/^>\s?/.test(t)){
+      const q=[];
+      while(i<src.length&&/^>\s?/.test(src[i].trim())){ q.push(src[i].trim().replace(/^>\s?/,'')); i++; }
+      out.push('<blockquote style="margin:8px 0;padding:6px 12px;border-left:3px solid var(--accent);background:var(--surface);color:var(--soft);border-radius:0 8px 8px 0">'
+        +mdInline(q.join(' '))+'</blockquote>');
+      continue;
+    }
+    // lists
+    const b=/^([-*])\s+(.*)$/.exec(t);
+    const n=/^(\d+)[.)]\s+(.*)$/.exec(t);
+    if(b||n){
+      flushPara();
+      const ordered=!!n;
+      out.push(ordered?'<ol style="margin:8px 0;padding-left:22px">':'<ul style="margin:8px 0;padding-left:22px">');
+      while(i<src.length){
+        const tt=src[i].trim();
+        const mb=/^([-*])\s+(.*)$/.exec(tt);
+        const mn=/^(\d+)[.)]\s+(.*)$/.exec(tt);
+        const item=ordered?mn:mb;
+        if(!item) break;
+        out.push(`<li style="margin:2px 0">${mdInline(item[2])}</li>`);
+        i++;
+      }
+      out.push(ordered?'</ol>':'</ul>');
+      continue;
+    }
+    buf.push(mdInline(line));
+    i++;
+  }
+  flushPara();
+  return out.join('\n');
+}
 async function viewFile(path,kind){
   const v=$('#oview');
   if(kind==='image'){v.innerHTML=`<img src="/file?path=${encodeURIComponent(path)}"
     style="max-width:100%;border-radius:10px"><p class=hint>${outEsc(path)}</p>`;return}
   v.innerHTML='<p class=hint>Loading…</p>';
   const d=await (await fetch('/file?path='+encodeURIComponent(path))).json();
-  v.innerHTML=`<p class=hint style=margin:0>${outEsc(path)}${d.clipped?' — first 200KB of '+(d.bytes/1024).toFixed(0)+'KB':''}</p>
-    <pre style="white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;background:var(--surface);
-      padding:14px;border-radius:9px;max-height:520px;overflow:auto;margin-top:10px">${outEsc(d.text)}</pre>`;
+  const isMd=/\.(md|markdown)$/i.test(path);
+  v.innerHTML=`<p class=hint style=margin:0>${outEsc(path)}${d.clipped?' — first 200KB of '+(d.bytes/1024).toFixed(0)+'KB':''}</p>`+
+    (isMd
+      ? `<div style="font:13px/1.6 -apple-system,'Helvetica Neue',Inter,sans-serif;background:var(--surface);
+         padding:16px 20px;border-radius:9px;max-height:520px;overflow:auto;margin-top:10px">${mdRender(d.text)}</div>`
+      : `<pre style="white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;background:var(--surface);
+         padding:14px;border-radius:9px;max-height:520px;overflow:auto;margin-top:10px">${outEsc(d.text)}</pre>`);
 }
 $('#orefresh')&&($('#orefresh').onclick=loadOutputs);
 $('#oproj')&&($('#oproj').onchange=loadOutputs);
@@ -3140,6 +3372,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (ValueError, products.ProductError) as e:
                 return self._send(200, json.dumps({"error": str(e)}))
             return self._send(200, json.dumps({"ok": True, **out}))
+        if path == "/product/move":
+            req = self._json()
+            try:
+                out = move_product(req.get("project", ""), req.get("product", ""),
+                                   req.get("to", ""))
+            except (ValueError, products.ProductError) as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+            return self._send(200, json.dumps({"ok": True, **out}))
         if path == "/product/enrich":
             req = self._json()
             with _lock:
@@ -3409,6 +3649,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if stage in ("brief", "run"):
             if req.get("n_briefs"):
                 cmd += ["--briefs", str(int(req["n_briefs"]))]
+        # PICC/concepts/briefs build on a specific product in this project. Forward
+        # the one the operator picked; the CLI resolves the single product when "")
+        # is sent, so multi-product projects must make an explicit choice.
+        if stage in ("picc", "concepts", "brief", "run"):
+            if req.get("product"):
+                cmd += ["--product", str(req["product"])]
         if stage == "ingest":
             if req.get("rules_only"):
                 cmd.append("--rules-only")
