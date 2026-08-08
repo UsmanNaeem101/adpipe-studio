@@ -261,7 +261,20 @@ def move_product(project, product, to):
 
 
 def create_project(name, product, market):
-    """A project is a folder, a project.json, and an empty product sheet.
+    """A project is a folder, a project.json and a blank facts.json. No product.
+
+    Research comes first: you segment a market, then decide what to sell into it.
+    Creating a product sheet alongside the project inverted that — every new
+    project arrived with a product named after the project, whose identity and
+    market hypothesis were guesses made before a single record had been read,
+    and which then had to be renamed or deleted once the research said otherwise.
+    Products are added on demand from the Product tab (add_product) once there is
+    something to say about them, and a project with none is a normal state that
+    products.resolve_product already reports.
+
+    `product` and `market` are still recorded on the project: they are the
+    research subject, the MARKET CONTEXT line the VOC stages are given. That is
+    a different thing from a product sheet, and only the sheet is deferred.
 
     Nothing is copied from another project. Cloning montisella used to carry its
     filter regexes, compliance notes and — via the shared pipeline/facts.json —
@@ -287,15 +300,6 @@ def create_project(name, product, market):
     json.dump(facts, open(os.path.join(dest, "facts.json"), "w", encoding="utf-8"),
               indent=2)
 
-    # Seed only what we were actually told. The market line is a pre-research
-    # guess about buyers, so it is stored as a hypothesis rather than as fact —
-    # it must not read as Customer Truth until research validates it.
-    doc = products.blank_product()
-    doc["identity"]["name"] = products.cell(product or name, "user_approved", "merchant")
-    if market:
-        doc["hypothesis"]["guess"] = products.cell(
-            market, "unvalidated_hypothesis", "user")
-    products.save(name, products.slugify(product or name)[:40], doc)
     return cfg
 
 
@@ -1348,14 +1352,17 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
     <h2>New project</h2>
     <div class=row>
       <div><label>Name</label><input id=npname placeholder=lumbar_cushion></div>
-      <div><label>Product</label><input id=npproduct placeholder="Montisella lumbar cushion"></div>
+      <div><label>Research subject <span class=costs>optional</span></label>
+        <input id=npproduct placeholder="lumbar support cushions"></div>
     </div>
     <label style=margin-top:10px>Market</label>
     <input id=npmarket placeholder="desk workers with lower back pain, UK/US">
     <button class=btn id=npbtn style=margin-top:14px>Create project</button>
-    <p class=hint id=npmsg>Clones montisella's config. <b>Replace the filter regexes and
-      compliance profile</b> in <code>projects/&lt;name&gt;/project.json</code> before ingesting —
-      they are tuned for shoulder and neck pain, not your niche.</p>
+    <p class=hint id=npmsg>Nothing is copied from another project — it starts blank, so
+      <b>set the filter regexes and compliance profile</b> in
+      <code>projects/&lt;name&gt;/project.json</code> before ingesting. Subject and market are the
+      context the VOC stages are given; <b>no product is created</b> — run the research first,
+      then add products in the Product tab whenever you are ready.</p>
 
     <h2 style="margin-top:26px">Existing projects</h2>
     <div id=plist></div>
@@ -1892,7 +1899,9 @@ async function loadProducts(){
   try{
     const j=await (await fetch('/products')).json();
     const rows=j.products||[];
-    if(!rows.length){ box.innerHTML='<p class=hint>No products yet.</p>'; return; }
+    if(!rows.length){ box.innerHTML='<p class=hint>No products yet — projects start '+
+      'without one. Run the research, then add a product below whenever you are ready.</p>';
+      return; }
     box.innerHTML='<p class=hint style="margin:0 0 9px">Click a product to open '+
       'its sheet, segments and readiness.</p>';
     rows.forEach(p=>{
@@ -2611,21 +2620,6 @@ $('#runbtn').onclick=async()=>{
   $('#runbtn').disabled=false;
 };
 
-/* ---------- project creation ---------- */
-$('#npbtn').onclick=async()=>{
-  const name=$('#npname').value.trim();
-  const r=await (await fetch('/project',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({name,product:$('#npproduct').value,market:$('#npmarket').value})})).json();
-  const m=$('#npmsg');
-  if(r.error){m.textContent='⚠ '+r.error;m.style.color='var(--signal)';return;}
-  m.textContent='Created '+r.project+' — now edit its project.json filter regexes for this niche.';
-  m.style.color='var(--accent)';
-  $('#npname').value=$('#npproduct').value=$('#npmarket').value='';
-  // Reload project lists in other tabs — safe if the DOM is not ready yet.
-  if(typeof refreshRemix==='function'&&$('#rx_proj'))$('#rx_proj').onchange();
-  if($('#oproj')&&$('#oproj').onchange)$('#oproj').onchange();
-};
-
 /* ---------- VOC upload ---------- */
 let uploaded=null;
 function bindDrop(el,input,onFile){
@@ -2655,7 +2649,9 @@ $('#npbtn')&&($('#npbtn').onclick=async()=>{
     body:JSON.stringify({name:$('#npname').value.trim(),product:$('#npproduct').value,
                          market:$('#npmarket').value})})).json();
   if(r.error){m.textContent='⚠ '+r.error;m.style.color='var(--signal)';return;}
-  m.innerHTML='✓ Created <b>'+r.project+'</b>. Now edit its filter regexes in projects/'+r.project+'/project.json.';
+  m.innerHTML='✓ Created <b>'+r.project+'</b> — no product yet, which is the point. Edit its '+
+    'filter regexes in projects/'+r.project+'/project.json, run the research, then add a '+
+    'product from the Product tab.';
   m.style.color='var(--accent)';
   $('#npname').value=$('#npproduct').value=$('#npmarket').value='';
   loadProjects&&loadProjects(); renderProjectList();
