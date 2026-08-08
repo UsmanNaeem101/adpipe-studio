@@ -57,8 +57,13 @@ class Job:
     # Reasoning depth for THIS job, overriding the client's setting. Stages are
     # not equally hard: skill 01 is a bouncer deciding retain/reject against a
     # closed list of reasons, and reasoning at the depth a synthesis stage needs
-    # is what emptied its output budget. None = use the client's effort.
+    # is what emptied its output budget. None = use the client's effort;
+    # "none" disables reasoning where the provider supports it.
     effort: str | None = None
+    # A hard ceiling on the reasoning half of `max_tokens`, where the provider
+    # can enforce one. This is what turns "the answer will probably fit" into
+    # "the answer's room was never the model's to spend".
+    reasoning_max_tokens: int | None = None
 
 
 # Providers spell "I ran out of output room" differently: Anthropic returns a
@@ -192,11 +197,19 @@ class Client:
             # max_tokens caps thinking AND the response text together on Opus 5,
             # and thinking is on by default — so effort is not just a quality
             # dial, it decides how much of the budget is left to answer with.
-            "output_config": {"effort": effort or self.effort},
+            "output_config": {"effort": (effort or self.effort)},
             # Adaptive is the default on Opus 5; set it explicitly so the intent
             # survives a model swap. No temperature/top_p — rejected on Opus 5.
             "thinking": {"type": "adaptive"},
         }
+        if (effort or "").lower() == "none":
+            # Opus 5 accepts disabled thinking only at effort `high` or below,
+            # so pin the level too rather than emit a combination the API 400s.
+            # Note this is the documented-riskier setting on Opus 5 (it can leak
+            # internal tags into the response); low effort is the safer default
+            # and is what stage 01 ships with.
+            p["output_config"]["effort"] = "high"
+            p["thinking"] = {"type": "disabled"}
         if schema:
             p["output_config"]["format"] = {"type": "json_schema", "schema": schema}
         return p

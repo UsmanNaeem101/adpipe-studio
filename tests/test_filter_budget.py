@@ -74,12 +74,11 @@ class BudgetSizingTests(unittest.TestCase):
             src = os.path.join(tmp, "raw.txt")
             with open(src, "w", encoding="utf-8") as fh:
                 fh.write(raw)
-            cfg = {"_dir": tmp, "filter": {"min_words": 8},
+            cfg = {"_dir": tmp, "filter": {"min_words": 8, "chunk": chunk},
                    "product": "pillow", "market": "shoulders"}
             args = SimpleNamespace(source=src, rules_only=False, yes=True)
             with mock.patch.object(cli, "client", return_value=Client()), \
-                    mock.patch.object(llm, "confirm", return_value=True), \
-                    mock.patch.object(cli, "CHUNK_OVERRIDE", chunk, create=True):
+                    mock.patch.object(llm, "confirm", return_value=True):
                 try:
                     cli.cmd_ingest(cfg, args)
                 except SystemExit:
@@ -263,6 +262,222 @@ class ProfilerTests(unittest.TestCase):
         exceed it, or the sizing under-reserves."""
         self.assertLessEqual(profile_filter.verdict_tokens(worst_case=True), 40)
 
+
+
+
+class PromptCompositionTests(unittest.TestCase):
+    """One canonical output contract — the real failure was two competing ones.
+
+    A live run spent 8,083 reasoning tokens against an 8,000 budget and emitted
+    no content. The trace showed it deliberating over original_text,
+    normalised_text, source_url, "leave the unused reason array empty", and
+    duplicate handling — every one of which was a genuine contradiction between
+    the skill text, the preamble and the schema.
+    """
+
+    def setUp(self):
+        self.scoped = cli.skill_sections(
+            1, cli.FILTER_SKILL_SECTIONS, include_intro=False)
+        self.sent = cli.FILTER_PREAMBLE + "\n" + self.scoped
+
+    # ---- the contradictions must be gone ---------------------------------
+
+    def test_no_field_outside_the_schema_is_mentioned(self):
+        """The 9-field record shape the skill described is not a second contract."""
+        for field in ("original_text", "normalised_text", "source_url",
+                      "source_type", "thread_id", "parent_id",
+                      "source_metadata", "duplicate_of"):
+            self.assertNotIn(field, self.sent, field)
+
+    def test_the_full_skill_did_mention_them(self):
+        """Guards the test above: prove we removed something that was there."""
+        _, full = cli.skill(1)
+        for field in ("original_text", "normalised_text", "source_url"):
+            self.assertIn(field, full, field)
+
+    def test_insufficient_evidence_instruction_is_gone(self):
+        """The extraction preamble told the model to write 'insufficient
+        evidence' into a field — unsatisfiable once reasons are an enum, and a
+        direct contradiction of 'leave the unused reason array empty'."""
+        self.assertIn("insufficient evidence", cli.PREAMBLE)
+        self.assertNotIn("insufficient evidence", self.sent)
+
+    def test_stage_01_does_not_claim_a_segment_evidence_file(self):
+        """Skill 01 runs before segmentation; the extraction preamble asserts a
+        segment evidence file with URLs and assignment metadata that cannot
+        exist yet."""
+        self.assertIn("SEGMENT EVIDENCE FILE", cli.PREAMBLE)
+        self.assertNotIn("SEGMENT EVIDENCE FILE", self.sent)
+
+    def test_model_is_told_deduplication_already_happened(self):
+        self.assertIn("ALREADY been removed", cli.FILTER_PREAMBLE)
+        self.assertNotIn("## Exact duplicates", self.scoped)
+
+    def test_no_report_or_recount_is_requested(self):
+        """'Report: raw count, retained count...' and 'spot-audit at least 50'
+        had nowhere to go in the schema, and the trace shows repeated
+        recounting."""
+        _, full = cli.skill(1)
+        self.assertIn("spot-audit", full)
+        self.assertNotIn("spot-audit", self.sent)
+        self.assertNotIn("retention rate", self.sent)
+
+    def test_batch_instruction_does_not_restate_the_contract(self):
+        """The contract is stated once, in the preamble and the schema."""
+        jobs = BudgetSizingTests.build_filter_jobs(records=60, chunk=60)
+        instruction = jobs[0].prompt.split("RECORDS:")[0]
+        for restated in ("evidence_id", "records\":[", "empty"):
+            self.assertNotIn(restated, instruction, restated)
+        self.assertLess(len(instruction), 200)
+
+    # ---- but the judgement must be intact --------------------------------
+
+    def test_every_reason_code_still_reaches_the_model(self):
+        for code in cli.RETENTION_REASONS + cli.REJECTION_REASONS:
+            self.assertIn(code, self.scoped, code)
+
+    def test_retain_and_reject_criteria_are_preserved_verbatim(self):
+        _, full = cli.skill(1)
+        for heading in ("Keep it (retain)", "Bin it (reject)",
+                        "Hard boundaries (what this skill must not do)",
+                        "The one rule that governs everything"):
+            body = full.split(f"## {heading}")[1].split("\n## ")[0].strip()
+            self.assertIn(body, self.scoped, heading)
+
+    def test_scope_limit_survives_dropping_the_skill_intro(self):
+        """The intro carried 'you are the bouncer at the door' — and also a
+        'remove exact duplicates' clause that contradicted the preamble."""
+        self.assertIn("bouncer at the door", cli.FILTER_PREAMBLE)
+
+    # ---- the renderer must fail loudly, not quietly ----------------------
+
+    def test_a_renamed_section_aborts_instead_of_shipping_a_gutted_prompt(self):
+        with self.assertRaises(SystemExit) as ctx:
+            cli.skill_sections(1, ("Keep it (retain)", "No Such Section"))
+        self.assertIn("No Such Section", str(ctx.exception))
+
+    def test_every_named_section_exists_today(self):
+        cli.skill_sections(1, cli.FILTER_SKILL_SECTIONS)  # must not raise
+
+
+class StagePreambleWiringTests(unittest.TestCase):
+    """Original, re-run and repair must all carry the same contract."""
+
+    def test_all_three_paths_use_the_filter_preamble(self):
+        seen = []
+
+        class Client:
+            def estimate(self, *_a, **_k):
+                return type("E", (), {"explain": lambda _s: ""})()
+
+            def prewarm(self, _corpus, preamble):
+                seen.append(("prewarm", preamble))
+
+            def batch(self, _corpus, preamble, jobs):
+                seen.append(("batch", preamble))
+                # Force one re-run and one repair, then let the stage abort.
+                return {j.id: llm.BatchResult("", "length") for j in jobs}
+
+        from types import SimpleNamespace
+        text = ("My shoulder aches every single night and the pillow goes flat "
+                "before the morning arrives")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "raw.txt")
+            with open(src, "w", encoding="utf-8") as fh:
+                fh.write(f"{text} one\n\n{text} two")
+            cfg = {"_dir": tmp, "filter": {"min_words": 8},
+                   "product": "p", "market": "m"}
+            args = SimpleNamespace(source=src, rules_only=False, yes=True)
+            with mock.patch.object(cli, "client", return_value=Client()), \
+                    mock.patch.object(llm, "confirm", return_value=True):
+                with self.assertRaises(cli.BatchOutputError):
+                    cli.cmd_ingest(cfg, args)
+
+        self.assertGreaterEqual(len(seen), 3)  # prewarm + batch + rerun + repair
+        for where, preamble in seen:
+            self.assertIs(preamble, cli.FILTER_PREAMBLE, where)
+
+
+class StageConfigTests(unittest.TestCase):
+    """Reasoning and batch size are per-stage knobs, not global ones."""
+
+    def test_chunk_defaults_and_is_overridable_per_project(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace()
+        self.assertEqual(cli.filter_chunk({}, args), cli.FILTER_CHUNK)
+        self.assertEqual(cli.filter_chunk({"filter": {"chunk": 40}}, args), 40)
+
+    def test_effort_defaults_to_low_and_is_overridable(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace()
+        self.assertEqual(cli.filter_effort({}, args), "low")
+        self.assertEqual(cli.filter_effort({"filter": {"effort": "none"}}, args),
+                         "none")
+
+    def test_synthesis_stages_do_not_inherit_stage_01_reasoning(self):
+        """skill 02's jobs must carry no effort override — only 01 is tuned."""
+        jobs = BudgetSizingTests.build_filter_jobs(records=60, chunk=60)
+        self.assertEqual(jobs[0].effort, "low")
+        self.assertIsNone(llm.Job("d0000", "dedup").effort)
+
+
+class ReasoningCapTests(ReasoningControlTests):
+    """A ceiling on reasoning, not just a level."""
+
+    def test_reasoning_cap_is_sent_when_a_job_sets_one(self):
+        with mock.patch("urllib.request.urlopen", return_value=self.reply()) as call:
+            self.client._post([{"role": "user", "content": "x"}], 5000,
+                              effort="low", reasoning_max_tokens=2000)
+        self.assertEqual(self.sent_body(call)["reasoning"], {"max_tokens": 2000})
+
+    def test_effort_none_disables_reasoning(self):
+        with mock.patch("urllib.request.urlopen", return_value=self.reply()) as call:
+            self.client._post([{"role": "user", "content": "x"}], 100,
+                              effort="none")
+        self.assertEqual(self.sent_body(call)["reasoning"], {"enabled": False})
+
+    def test_batch_passes_each_job_reasoning_cap(self):
+        seen = []
+
+        def fake_post(_m, _mt, schema=None, retries=3, job_id=None,
+                      operation="completion", effort=None,
+                      reasoning_max_tokens=None, **_k):
+            seen.append((job_id, reasoning_max_tokens))
+            return llm.BatchResult("{}", "stop")
+
+        self.client._post = fake_post
+        self.client.batch("c", "p", [
+            llm.Job("a", "one", effort="low", reasoning_max_tokens=2000),
+            llm.Job("b", "two")])
+        self.assertCountEqual(seen, [("a", 2000), ("b", None)])
+
+    def test_stage_01_jobs_carry_the_cap(self):
+        jobs = BudgetSizingTests.build_filter_jobs(records=60, chunk=60)
+        self.assertEqual(jobs[0].reasoning_max_tokens, cli.REASONING_RESERVE)
+
+    def test_capped_reasoning_plus_answer_fits_the_sized_budget(self):
+        """The structural guarantee: if the cap is honoured, the answer always
+        has room. This is the invariant the 8,083-token run violated."""
+        for chunk in (20, 40, 60, 80, 120):
+            budget = cli._record_max_tokens(chunk, 40)
+            self.assertGreater(budget, cli.REASONING_RESERVE + chunk * 40 - 1, chunk)
+
+    def test_anthropic_effort_none_disables_thinking_legally(self):
+        """Opus 5 rejects disabled thinking above `high` effort."""
+        client = object.__new__(llm.Client)
+        client.model = "claude-opus-5"
+        client.effort = "max"
+        p = client._params([], "prompt", 100, effort="none")
+        self.assertEqual(p["thinking"], {"type": "disabled"})
+        self.assertEqual(p["output_config"]["effort"], "high")
+
+    def test_anthropic_keeps_thinking_on_at_low_effort(self):
+        client = object.__new__(llm.Client)
+        client.model = "claude-opus-5"
+        client.effort = "high"
+        p = client._params([], "prompt", 100, effort="low")
+        self.assertEqual(p["thinking"], {"type": "adaptive"})
+        self.assertEqual(p["output_config"]["effort"], "low")
 
 if __name__ == "__main__":
     unittest.main()

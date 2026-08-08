@@ -139,6 +139,55 @@ def skill(n):
     sys.exit(f"Skill {n:02d} not found in {SKILLS}")
 
 
+SECTION_RE = re.compile(r"^## (.+?)\s*$", re.M)
+
+
+def skill_sections(n, keep, include_intro=True):
+    """Render a skill as (optionally) its intro plus only the named `## ` sections.
+
+    A skill file describes the whole STAGE — including work the deterministic
+    pre-pass already did, the record shape the pipeline stores, and the report a
+    human wants at the end. The model is asked for none of that: it gets one
+    schema with four fields and `additionalProperties: false`.
+
+    Sending the whole file therefore hands the model two different output
+    contracts and asks it to reconcile them, which it does at length and at our
+    expense. This sends the judgement and drops the plumbing. `keep` is checked
+    against the file so a restructured skill fails loudly instead of silently
+    shipping a prompt with its criteria missing.
+    """
+    name, text = skill(n)
+    marks = list(SECTION_RE.finditer(text))
+    found = {m.group(1): (m.start(), m.end()) for m in marks}
+    missing = [s for s in keep if s not in found]
+    if missing:
+        sys.exit(f"{name}: expected section(s) {missing} — the skill was "
+                 f"restructured, so the prompt built from it is no longer "
+                 f"the reviewed one. Update the section list in cli.py.")
+    ends = {m.start(): (marks[i + 1].start() if i + 1 < len(marks) else len(text))
+            for i, m in enumerate(marks)}
+    out = []
+    if include_intro:
+        out.append(text[:marks[0].start()].strip() if marks else text.strip())
+    for section in keep:
+        start, _ = found[section]
+        out.append(text[start:ends[start]].strip())
+    return "\n\n".join(out)
+
+
+# The judgement half of skill 01. Everything that decides retain/reject stays;
+# what leaves is the record shape the JSON schema now states outright, the
+# exact-duplicate pass cmd_ingest already ran in code, and the self-audit and
+# report the model has nowhere to put.
+FILTER_SKILL_SECTIONS = (
+    "The one rule that governs everything",
+    "Keep it (retain)",
+    "Bin it (reject)",
+    "Hard boundaries (what this skill must not do)",
+    "Reason codes",
+)
+
+
 def client(cfg, args):
     """Pick the backend. --provider/--model win, then project.json, then Anthropic."""
     m = cfg.get("model", {})
@@ -168,6 +217,39 @@ PREAMBLE = (
 
 
 # ------------------------------------------------------------------ 01-02
+
+# PREAMBLE above is written for skills 07-26, which read a segment evidence file
+# and quote from it. At skill 01 none of that is true yet — there is no evidence
+# file, no segment, no assignment metadata, and nothing is quoted back. Worse,
+# its "write 'insufficient evidence'" rule cannot be satisfied by a schema whose
+# reason arrays are enums, so the model is left reconciling an instruction it
+# has no legal way to follow. Skill 01 gets its own operating context.
+FILTER_PREAMBLE = (
+    "You are the filtering stage of a voice-of-customer research pipeline. You "
+    "classify Reddit comments as evidence worth keeping or noise worth dropping. "
+    "That is the entire job: you are not segmenting, not summarising, not "
+    "extracting themes, and not deciding what anything means. You are the "
+    "bouncer at the door — signal gets in, chrome and spam don't, and everyone "
+    "who gets in keeps their own voice.\n\n"
+    "What you are given: numbered records, one comment each. Interface chrome, "
+    "bot boilerplate and byte-identical duplicates have ALREADY been removed in "
+    "code before you see them — do not re-run that pass, and do not look for "
+    "duplicates.\n\n"
+    "What you return: one JSON object per input record, in exactly the supplied "
+    "schema and nothing else.\n"
+    "- The record's numeric [id] is copied to evidence_id. IDs are assigned by "
+    "the pipeline; you never mint, change or re-order them.\n"
+    "- Reasons are codes from the list below, copied verbatim. Not prose, not "
+    "explanations, not new codes.\n"
+    "- The array that does not apply to your decision is []. A rejected record "
+    "has retention_reasons: [], a retained one has rejection_reasons: [].\n"
+    "- Those four fields are the whole record. The pipeline already holds the "
+    "comment text and its source, and rejects any record that adds to the "
+    "schema.\n\n"
+    "You are not asked for counts, totals, rates, a summary or a report, and "
+    "there is nowhere in the schema to put one. Judge each record once and move "
+    "on: do not re-audit or re-tally decisions you have already made."
+)
 
 POST_HDR = re.compile(r"^\s*(?:POST\s+)?URL:\s*(\S+)", re.I | re.M)
 TITLE_HDR = re.compile(r"^\s*TITLE:\s*(.+)$", re.I | re.M)
@@ -280,6 +362,31 @@ class BatchOutputError(RuntimeError):
 # reasoning AND the answer together, so a budget sized only for the answer hands
 # the whole margin to reasoning — which is exactly how skill 01 came back empty.
 REASONING_RESERVE = 2000
+
+# Stage 01 defaults. Both are overridable per project so a different model can be
+# tuned without touching code — `"filter": {"chunk": 40, "effort": "none"}` in
+# project.json. Deliberately per-stage: the synthesis stages want deep reasoning
+# and must not inherit this.
+FILTER_CHUNK = 60
+FILTER_EFFORT = "low"
+
+
+def filter_chunk(cfg, args):
+    return int(getattr(args, "chunk", None)
+               or cfg.get("filter", {}).get("chunk") or FILTER_CHUNK)
+
+
+def filter_effort(cfg, args):
+    """Reasoning depth for skill 01 only.
+
+    `none` disables reasoning outright where the provider allows it. It is not
+    the default: a borderline retain/reject is a real judgement call, and the
+    measured problem was reasoning spent reconciling contradictory instructions
+    rather than reasoning spent judging. Fix the instructions first; turn the
+    reasoning off only if your own spot-check says the quality holds.
+    """
+    return (getattr(args, "filter_effort", None)
+            or cfg.get("filter", {}).get("effort") or FILTER_EFFORT)
 
 
 def _record_max_tokens(chunk, per_record_tokens, reserve=REASONING_RESERVE):
@@ -704,19 +811,16 @@ def cmd_ingest(cfg, args):
     ctx = (f"MARKET CONTEXT: {cfg.get('product', '')} — {cfg.get('market', '')}\n")
 
     # ---- skill 01 -----------------------------------------------------------
-    _, s01 = skill(1)
-    CHUNK = 60
+    # Judgement sections only: the record shape, the duplicate pass and the
+    # self-audit are stated by the schema, done in code, and not asked for.
+    s01 = skill_sections(1, FILTER_SKILL_SECTIONS, include_intro=False)
+    CHUNK = filter_chunk(cfg, args)
     chunks = [pre[i:i + CHUNK] for i in range(0, len(pre), CHUNK)]
     jobs = [Job(id=f"f{n:04d}",
-                prompt=("Apply skill 01 to each record below. Decide retain or reject "
-                        "and give the reason(s). Keep concrete first-person experience "
-                        "by default. Never rewrite, tidy or correct customer words — "
-                        "you are only deciding what gets in. Return JSON only as "
-                        "{\"records\":[...]}, with exactly one object per input record "
-                        "and the numeric [id] copied to evidence_id. Leave the unused "
-                        "reason array empty. Reasons must be codes from skill 01's "
-                        "Reason codes list, verbatim — classify against that list, "
-                        "don't write prose.\n\nRECORDS:\n\n"
+                # The contract lives in the preamble and the schema. Repeating
+                # it here in different words is what the model was reconciling.
+                prompt=("Classify each record below: retain or reject, with "
+                        "reason codes.\n\nRECORDS:\n\n"
                         + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
                 # ~40 tokens covers a worst-case verdict: an id, a decision and
                 # two of the longest reason codes skill 01 defines.
@@ -726,19 +830,24 @@ def cmd_ingest(cfg, args):
                 # reasons drawn from a closed list. It is judgement, but it is
                 # not deep reasoning, and paying synthesis-depth reasoning 83
                 # times over is what left no budget to answer with.
-                effort="low")
+                effort=filter_effort(cfg, args),
+                reasoning_max_tokens=REASONING_RESERVE)
             for n, ch in enumerate(chunks)]
 
     prefix = f"{s01}\n\n---\n\n{ctx}"
-    print(f"\n  01 filter: {len(pre):,} records in {len(jobs)} batched chunks")
-    if not confirm(c.estimate(prefix, PREAMBLE, jobs, batched=True), args.yes):
+    print(f"\n  01 filter: {len(pre):,} records in {len(jobs)} batched chunks "
+          f"of {CHUNK} ({jobs[0].max_tokens:,} output tokens each, "
+          f"effort {jobs[0].effort})")
+    if not confirm(c.estimate(prefix, FILTER_PREAMBLE, jobs, batched=True), args.yes):
         return
-    c.prewarm(prefix, PREAMBLE)
+    c.prewarm(prefix, FILTER_PREAMBLE)
     records = _batch_rows(
-        c.batch(prefix, PREAMBLE, jobs), jobs, "records",
+        c.batch(prefix, FILTER_PREAMBLE, jobs), jobs, "records",
         os.path.join(voc, "_model_failures", "01_filter"),
-        repair=lambda failed: _repair_batch(c, prefix, PREAMBLE, failed, "records"),
-        rerun=lambda failed, factor: _rerun_batch(c, prefix, PREAMBLE, failed, factor))
+        repair=lambda failed: _repair_batch(
+            c, prefix, FILTER_PREAMBLE, failed, "records"),
+        rerun=lambda failed, factor: _rerun_batch(
+            c, prefix, FILTER_PREAMBLE, failed, factor))
     _require_exact_ids(records, {r["id"] for r in pre}, "skill 01 filter")
     verdicts = {r["evidence_id"]: r for r in records}
 

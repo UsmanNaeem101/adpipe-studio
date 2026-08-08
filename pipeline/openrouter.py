@@ -101,16 +101,25 @@ class Client:
 
     def _post(self, messages, max_tokens, schema=None, retries=3,
               job_id=None, operation="completion", effort=None,
-              send_reasoning=True):
+              send_reasoning=True, reasoning_max_tokens=None):
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens}
-        level = self.REASONING_EFFORT.get((effort or self.effort or "").lower())
-        if level and send_reasoning:
-            # Without this the route reasons at its own default, and max_tokens
-            # caps reasoning AND content together — which is how an 8000-token
-            # budget came back with 0 bytes of JSON. This is the setting whose
-            # absence broke stage 01: `effort` was accepted by the constructor
-            # and then never sent.
-            body["reasoning"] = {"effort": level}
+        want = (effort or self.effort or "").lower()
+        reasoning = None
+        if want == "none":
+            reasoning = {"enabled": False}
+        elif reasoning_max_tokens:
+            # A ceiling beats a level: `max_tokens` caps reasoning and content
+            # together, so bounding the reasoning half is what guarantees the
+            # answer still has somewhere to go. A real run spent 8,083 reasoning
+            # tokens against an 8,000 budget and returned zero bytes of JSON.
+            reasoning = {"max_tokens": reasoning_max_tokens}
+        elif self.REASONING_EFFORT.get(want):
+            reasoning = {"effort": self.REASONING_EFFORT[want]}
+        if reasoning and send_reasoning:
+            # Without this the route reasons at its own default. This is the
+            # setting whose absence broke stage 01: `effort` was accepted by the
+            # constructor and then never sent.
+            body["reasoning"] = reasoning
         if schema:
             # Require a route that supports structured output. Without
             # require_parameters OpenRouter may select a provider that silently
@@ -161,7 +170,7 @@ class Client:
                 # over-reasons. Checked before the schema fallback so a reply
                 # complaining about both loses reasoning first (the cheaper
                 # capability to give up).
-                if (send_reasoning and level and e.code in (400, 404, 422)
+                if (send_reasoning and reasoning and e.code in (400, 404, 422)
                         and "reasoning" in detail.lower()):
                     if self.verbose:
                         print("  ! this OpenRouter route does not accept the "
@@ -169,7 +178,8 @@ class Client:
                     return self._post(messages, max_tokens, schema=schema,
                                       retries=retries, job_id=job_id,
                                       operation=operation + "_no_reasoning",
-                                      effort=effort, send_reasoning=False)
+                                      effort=effort, send_reasoning=False,
+                                      reasoning_max_tokens=reasoning_max_tokens)
                 unsupported_schema = (
                     schema and e.code in (400, 404, 422)
                     and any(word in detail.lower() for word in
@@ -191,7 +201,8 @@ class Client:
                               "retrying with prompt-level schema and local validation")
                     return self._post(fallback, max_tokens, schema=None, retries=retries,
                                       job_id=job_id, operation=operation + "_schema_fallback",
-                                      effort=effort, send_reasoning=send_reasoning)
+                                      effort=effort, send_reasoning=send_reasoning,
+                                      reasoning_max_tokens=reasoning_max_tokens)
                 if e.code in (429, 500, 502, 503) and attempt < retries - 1:
                     time.sleep(2 ** attempt * 5); continue
                 if e.code == 401:
@@ -239,11 +250,13 @@ class Client:
             print("  (no prompt cache on OpenRouter — nothing to warm)")
 
     def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
-            job_id="single", operation="pipeline_single", effort=None):
+            job_id="single", operation="pipeline_single", effort=None,
+            reasoning_max_tokens=None):
         msgs = [{"role": "system", "content": f"{preamble}\n\n{corpus}"},
                 {"role": "user", "content": prompt}]
         return self._post(msgs, max_tokens, schema, job_id=job_id,
-                          operation=operation, effort=effort).text
+                          operation=operation, effort=effort,
+                          reasoning_max_tokens=reasoning_max_tokens).text
 
     def batch(self, corpus, preamble, jobs, poll_seconds=0):
         """No batch endpoint — run concurrently to recover wall-clock time.
@@ -255,7 +268,8 @@ class Client:
             return j.id, self._post(
                 [{"role": "system", "content": system},
                  {"role": "user", "content": j.prompt}], j.max_tokens, j.schema,
-                job_id=j.id, operation="pipeline_batch_job", effort=j.effort)
+                job_id=j.id, operation="pipeline_batch_job", effort=j.effort,
+                reasoning_max_tokens=j.reasoning_max_tokens)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = {pool.submit(run, j): j for j in jobs}
