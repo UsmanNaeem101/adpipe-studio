@@ -7,12 +7,45 @@ representative samples, artifact ordering, and the compact Stage 04 packet.
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections import Counter, defaultdict
 
 
 EVIDENCE_TIERS = ("core", "supporting", "context")
+
+# Included in every persisted 03A chunk fingerprint.  Prompt and schema changes
+# already alter the fingerprint themselves; this explicit semantic-contract
+# version also invalidates cached work when only the code-side quality gate
+# changes.
+HARVEST_CONTRACT_VERSION = "03a-semantic-contract-v2"
+
+# One-time compatibility contract for the first persisted 03A release.  It is
+# kept exact so completed model work can be authenticated by its old fingerprint,
+# locally revalidated, and migrated instead of being thrown away after the schema
+# gained per-chunk enums and semantic constraints.
+LEGACY_HARVEST_SKILL_V1 = """# Harvest Segment Candidates
+
+You are the high-recall harvester in a customer-segmentation pipeline. Read one
+deterministic chunk of **Core** VOC and identify every plausible recurring audience
+pattern. Missing a real minority audience is worse than returning an extra provisional
+candidate.
+
+A segment is an audience whose context, constraint, job-to-be-done, buying situation,
+or behaviour would justify different messaging, positioning, targeting, offer, or
+product decisions. A symptom, incidental attribute, arbitrary demographic, or one
+isolated comment is not a segment.
+
+For each plausible recurring pattern return a compact candidate key, plain-language
+name, audience cue, commercial distinction, every supporting evidence ID in this
+chunk, short cue terms, and an honest discovery strength. Preserve potentially
+valuable minority audiences and avoid aggressive merging; global semantic merging is
+Stage 03B's job.
+
+Do not validate, assign all evidence, write polished segment cards, invent evidence,
+or cite an ID outside this chunk. Return only the supplied structured output.
+"""
 
 # Core requires direct lived experience plus a second meaningful signal.  The
 # reason vocabulary is closed by Stage 01, so this mapping is stable and generic.
@@ -68,12 +101,21 @@ HARVEST_SCHEMA = {
     "properties": {"candidates": {"type": "array", "items": {
         "type": "object",
         "properties": {
-            "candidate_key": {"type": "string"},
-            "provisional_name": {"type": "string"},
-            "audience_cue": {"type": "string"},
-            "why_commercially_distinct": {"type": "string"},
-            "evidence_ids": {"type": "array", "items": {"type": "integer"}},
-            "cue_terms": {"type": "array", "items": {"type": "string"}},
+            "candidate_key": {
+                "type": "string", "minLength": 3,
+                "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$",
+            },
+            "provisional_name": {"type": "string", "minLength": 3},
+            "audience_cue": {"type": "string", "minLength": 3},
+            "why_commercially_distinct": {"type": "string", "minLength": 3},
+            "evidence_ids": {
+                "type": "array", "minItems": 1, "uniqueItems": True,
+                "items": {"type": "integer"},
+            },
+            "cue_terms": {
+                "type": "array", "minItems": 1, "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1},
+            },
             "discovery_strength": {"type": "string",
                                    "enum": ["strong", "probable", "emerging", "weak"]},
         },
@@ -85,6 +127,33 @@ HARVEST_SCHEMA = {
     "required": ["candidates"],
     "additionalProperties": False,
 }
+
+
+def harvest_schema(chunk_ids):
+    """Return the 03A schema constrained to exactly one chunk's evidence IDs."""
+    schema = copy.deepcopy(HARVEST_SCHEMA)
+    evidence_items = schema["properties"]["candidates"]["items"][
+        "properties"]["evidence_ids"]["items"]
+    evidence_items["enum"] = list(chunk_ids)
+    return schema
+
+
+def legacy_harvest_schema_v1():
+    """Reconstruct the exact static schema used by existing 27-chunk runs."""
+    schema = copy.deepcopy(HARVEST_SCHEMA)
+    candidate = schema["properties"]["candidates"]["items"]["properties"]
+    for name in ("candidate_key", "provisional_name", "audience_cue",
+                 "why_commercially_distinct"):
+        candidate[name].pop("minLength", None)
+        candidate[name].pop("pattern", None)
+    evidence = candidate["evidence_ids"]
+    evidence.pop("minItems", None)
+    evidence.pop("uniqueItems", None)
+    cues = candidate["cue_terms"]
+    cues.pop("minItems", None)
+    cues.pop("uniqueItems", None)
+    cues["items"].pop("minLength", None)
+    return schema
 
 CONSOLIDATE_SCHEMA = {
     "type": "object",
@@ -162,6 +231,38 @@ def evidence_text(records, include_tier=False):
     return "\n\n".join(blocks)
 
 
+def harvest_prompt(records):
+    """Render the complete 03A user turn from one evidence chunk."""
+    return (
+        "Search this evidence chunk for zero or more recurring audience "
+        "patterns. This chunk is not itself a segment: do not name the "
+        "chunk and do not assign every item. Return separate candidates "
+        "when distinct audience groups recur, cite only the IDs that "
+        "genuinely support each candidate, and leave unrelated evidence "
+        "unassigned. Every cited ID must be one shown below.\n\n"
+        + evidence_text(records, include_tier=True)
+    )
+
+
+def legacy_harvest_prompt_v1(records):
+    """Render the exact user turn used by the first persisted 03A release."""
+    return (
+        "Harvest provisional audience candidates from this complete "
+        "discovery-evidence chunk. Every cited ID must be one shown below.\n\n"
+        + evidence_text(records, include_tier=True)
+    )
+
+
+def migrate_legacy_harvest_rows(rows):
+    """Apply only the normalization aggregation already applied to V1 keys."""
+    migrated = []
+    for row in rows:
+        item = dict(row)
+        item["candidate_key"] = _key(item.get("candidate_key"))
+        migrated.append(item)
+    return migrated
+
+
 def chunk_by_tokens(records, target_tokens, prefix="chunk"):
     """Chunk in stable input order using the exact formatter's char estimate."""
     if target_tokens < 1:
@@ -200,15 +301,93 @@ def _key(value):
     return re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
 
 
-def validate_harvest_rows(rows, chunk_ids):
+_GENERIC_HARVEST_KEYS = frozenset({
+    "audience", "candidate", "segment", "harvest_candidates_from_core",
+})
+_GENERIC_HARVEST_NAMES = frozenset({"audience", "candidate", "segment"})
+_CLEAN_CANDIDATE_KEY = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
+
+
+class HarvestContractError(ValueError):
+    """A model-produced 03A row violated a repairable chunk contract."""
+
+    def __init__(self, reason, *, chunk_id=None, candidate=None,
+                 invalid_evidence_ids=None):
+        super().__init__(reason)
+        self.chunk_id = chunk_id
+        self.candidate = candidate
+        self.invalid_evidence_ids = list(invalid_evidence_ids or [])
+
+
+def validate_harvest_rows(rows, chunk_ids, chunk_id=None):
+    """Reject structurally valid but unusable 03A candidate claims.
+
+    This deliberately stays small and deterministic.  The prompt owns semantic
+    judgement; code proves only invariants that cannot be matters of opinion.
+    Evidence may overlap between candidates and input IDs may remain unassigned.
+    """
     allowed = set(chunk_ids)
+    seen_keys = set()
     for row in rows:
-        cited = set(row.get("evidence_ids") or [])
-        unknown = cited - allowed
+        raw_key = str(row.get("candidate_key") or "").strip()
+        key = _key(raw_key)
+        name = str(row.get("provisional_name") or "").strip()
+        if not _CLEAN_CANDIDATE_KEY.fullmatch(raw_key):
+            raise HarvestContractError(
+                f"03A candidate key {raw_key!r} must be a lowercase snake_case "
+                "audience slug", chunk_id=chunk_id, candidate=raw_key)
+        if key in _GENERIC_HARVEST_KEYS:
+            raise HarvestContractError(
+                f"03A candidate key {raw_key!r} is a generic task label",
+                chunk_id=chunk_id, candidate=raw_key)
+        if _key(name) in _GENERIC_HARVEST_NAMES:
+            raise HarvestContractError(
+                f"03A provisional name {name!r} is not an audience label",
+                chunk_id=chunk_id, candidate=raw_key)
+        if key in seen_keys:
+            raise HarvestContractError(
+                f"03A returned duplicate candidate key {raw_key!r}",
+                chunk_id=chunk_id, candidate=raw_key)
+        seen_keys.add(key)
+
+        evidence_ids = row.get("evidence_ids") or []
+        if not evidence_ids:
+            raise HarvestContractError(
+                f"03A candidate {raw_key!r} has no supporting evidence",
+                chunk_id=chunk_id, candidate=raw_key)
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise HarvestContractError(
+                f"03A candidate {raw_key!r} repeats a supporting evidence ID",
+                chunk_id=chunk_id, candidate=raw_key)
+        cited = set(evidence_ids)
+        unknown = sorted(cited - allowed)
         if unknown:
-            raise ValueError(
-                f"03A candidate {row.get('candidate_key')!r} cites "
-                f"{len(unknown)} evidence ID(s) outside its chunk")
+            raise HarvestContractError(
+                f"03A candidate {raw_key!r} cites "
+                f"{len(unknown)} evidence ID(s) outside its chunk",
+                chunk_id=chunk_id, candidate=raw_key,
+                invalid_evidence_ids=unknown)
+
+
+def harvest_full_chunk_claims(chunk_results):
+    """Return singleton candidates claiming every ID, for operator review.
+
+    Such a result can be legitimate for a genuinely homogeneous chunk, so it is
+    telemetry rather than a rejection rule.  Repetition across many chunks is a
+    useful signal that the model is naming chunks instead of finding audiences.
+    """
+    claims = []
+    for result in chunk_results:
+        candidates = result.get("candidates") or []
+        if len(candidates) != 1:
+            continue
+        if set(candidates[0].get("evidence_ids") or []) == set(result["evidence_ids"]):
+            claims.append({
+                "chunk_id": result["chunk_id"],
+                "candidate_key": candidates[0].get("candidate_key"),
+                "evidence_count": len(result["evidence_ids"]),
+            })
+    return claims
 
 
 def aggregate_harvest(chunk_results, minimum_evidence=2):
@@ -216,7 +395,8 @@ def aggregate_harvest(chunk_results, minimum_evidence=2):
     grouped = {}
     for result in sorted(chunk_results, key=lambda row: row["chunk_id"]):
         chunk_id = result["chunk_id"]
-        validate_harvest_rows(result["candidates"], result["evidence_ids"])
+        validate_harvest_rows(
+            result["candidates"], result["evidence_ids"], chunk_id=chunk_id)
         for index, row in enumerate(result["candidates"]):
             key = _key(row["candidate_key"])
             if not key:

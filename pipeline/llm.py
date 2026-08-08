@@ -96,6 +96,9 @@ class BatchResult:
     # was sent. It did not, and nothing in the run said so.
     reasoning_tokens: int = 0
     completion_tokens: int = 0
+    # Actual route used for aggregators such as OpenRouter.  This is telemetry,
+    # never a routing instruction; provider selection remains unchanged.
+    provider: str | None = None
 
     @property
     def budget_note(self) -> str:
@@ -333,7 +336,8 @@ class Client:
         return BatchResult(
             text, msg.stop_reason,
             getattr(msg.usage, "thinking_tokens", 0) or 0,
-            getattr(msg.usage, "output_tokens", 0) or 0)
+            getattr(msg.usage, "output_tokens", 0) or 0,
+            "Anthropic")
 
     def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
             job_id="single", operation="pipeline_single", effort=None,
@@ -411,7 +415,8 @@ class Client:
                         # Anthropic bills thinking inside output_tokens too, and
                         # reports it separately only when it is asked for.
                         getattr(m.usage, "thinking_tokens", 0) or 0,
-                        getattr(m.usage, "output_tokens", 0) or 0)
+                        getattr(m.usage, "output_tokens", 0) or 0,
+                        "Anthropic")
                 else:
                     detail = getattr(
                         getattr(res.result, "error", None), "type", res.result.type)

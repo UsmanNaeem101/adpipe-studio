@@ -145,6 +145,9 @@ class Client:
             API, data=json.dumps(body).encode(), method="POST",
             headers={"Authorization": f"Bearer {self.key}",
                      "Content-Type": "application/json",
+                     # Observability only: this surfaces the selected endpoint
+                     # and fallback attempts without influencing routing.
+                     "X-OpenRouter-Metadata": "enabled",
                      "HTTP-Referer": "https://localhost/adpipe",
                      "X-Title": "adpipe"})
         for attempt in range(retries):
@@ -168,10 +171,15 @@ class Client:
                 choice = (payload.get("choices") or [{}])[0]
                 content = (choice.get("message") or {}).get("content") or ""
                 finish = choice.get("finish_reason")
+                routing = payload.get("openrouter_metadata") or {}
+                endpoints = (routing.get("endpoints") or {}).get("available") or []
+                selected = next((endpoint.get("provider") for endpoint in endpoints
+                                 if endpoint.get("selected")), None)
                 audit.response(payload, text=content, usage=u,
                                finish_reason=finish)
                 result = BatchResult(content, finish, reasoned,
-                                     u.get("completion_tokens", 0))
+                                     u.get("completion_tokens", 0),
+                                     selected or payload.get("provider"))
                 if finish == "length" and self.verbose:
                     # Reasoning models spend max_tokens on reasoning first, so
                     # the budget can be gone before a single JSON byte is

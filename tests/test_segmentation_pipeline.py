@@ -1,6 +1,8 @@
 """Deterministic contracts for the multi-pass Stage 03 pipeline."""
 
+import dataclasses
 import json
+import io
 import os
 import sys
 import tempfile
@@ -23,6 +25,48 @@ def record(evidence_id, tier="core", text=None, thread=None, subreddit=None):
 
 
 class SegmentationBookkeepingTests(unittest.TestCase):
+    @staticmethod
+    def harvest_candidate(key="desk_workers", evidence_ids=None):
+        return {
+            "candidate_key": key, "provisional_name": "Desk workers",
+            "audience_cue": "desk work", "why_commercially_distinct": "workday",
+            "evidence_ids": list(evidence_ids or [1]), "cue_terms": ["desk"],
+            "discovery_strength": "probable",
+        }
+
+    def test_dynamic_harvest_schema_enum_is_exactly_the_chunk_ids(self):
+        schema = segmentation.harvest_schema([9, 3, 17])
+        evidence = schema["properties"]["candidates"]["items"][
+            "properties"]["evidence_ids"]
+        self.assertEqual(evidence["items"]["enum"], [9, 3, 17])
+        self.assertEqual(evidence["minItems"], 1)
+        self.assertTrue(evidence["uniqueItems"])
+        self.assertNotIn(
+            "enum", segmentation.HARVEST_SCHEMA["properties"]["candidates"]
+            ["items"]["properties"]["evidence_ids"]["items"])
+
+    def test_harvest_contract_accepts_ids_inside_chunk(self):
+        segmentation.validate_harvest_rows(
+            [self.harvest_candidate(evidence_ids=[3, 9])], [3, 9, 17],
+            chunk_id="03a_0000")
+
+    def test_harvest_contract_reports_one_or_several_outside_ids(self):
+        for bad_ids in ([3, 99], [3, 98, 99]):
+            with self.subTest(bad_ids=bad_ids), self.assertRaises(
+                    segmentation.HarvestContractError) as ctx:
+                segmentation.validate_harvest_rows(
+                    [self.harvest_candidate(evidence_ids=bad_ids)], [3, 9, 17],
+                    chunk_id="03a_0007")
+            self.assertEqual(ctx.exception.chunk_id, "03a_0007")
+            self.assertEqual(ctx.exception.invalid_evidence_ids,
+                             sorted(set(bad_ids) - {3, 9, 17}))
+
+    def test_harvest_contract_rejects_duplicate_ids(self):
+        with self.assertRaises(segmentation.HarvestContractError):
+            segmentation.validate_harvest_rows(
+                [self.harvest_candidate(evidence_ids=[3, 3])], [3, 9],
+                chunk_id="03a_0000")
+
     def test_03a_chunks_cover_every_core_item_exactly_once(self):
         rows = [record(n, text="x" * (20 + n)) for n in range(1, 20)]
         chunks = segmentation.chunk_by_tokens(rows, 40, "03a")
@@ -43,12 +87,12 @@ class SegmentationBookkeepingTests(unittest.TestCase):
     def test_03a_exact_aggregation_preserves_lineage_and_order(self):
         chunks = [{
             "chunk_id": "03a_0001", "evidence_ids": [3, 4], "candidates": [{
-                "candidate_key": "Desk workers", "provisional_name": "Desk workers",
+                "candidate_key": "desk_workers", "provisional_name": "Desk workers",
                 "audience_cue": "computer work", "why_commercially_distinct": "workday",
                 "evidence_ids": [3, 4], "cue_terms": ["desk"],
                 "discovery_strength": "strong"}]}, {
             "chunk_id": "03a_0000", "evidence_ids": [1, 2], "candidates": [{
-                "candidate_key": "desk-workers", "provisional_name": "Office workers",
+                "candidate_key": "desk_workers", "provisional_name": "Office workers",
                 "audience_cue": "sitting", "why_commercially_distinct": "ergonomics",
                 "evidence_ids": [1, 2], "cue_terms": ["computer"],
                 "discovery_strength": "probable"}]}]
@@ -136,6 +180,92 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         self.assertEqual(card["unique_subreddit_count"], 2)
         self.assertTrue(card["representative_evidence_ids"])
 
+    def test_mixed_audience_fixture_keeps_groups_separate_and_unrelated_unassigned(self):
+        fixture_path = os.path.join(
+            ROOT, "tests", "fixtures", "03a_mixed_audiences.json")
+        with open(fixture_path, encoding="utf-8") as fh:
+            fixture = json.load(fh)
+        ids = [row["id"] for row in fixture["records"]]
+
+        segmentation.validate_harvest_rows(fixture["candidates"], ids)
+        claimed = {eid for row in fixture["candidates"] for eid in row["evidence_ids"]}
+        self.assertEqual(len(fixture["candidates"]), 3)
+        self.assertEqual(claimed, set(ids) - set(fixture["unassigned_evidence_ids"]))
+        self.assertNotIn(999, claimed)
+        self.assertEqual(segmentation.harvest_full_chunk_claims([{
+            "chunk_id": "03a_0000", "evidence_ids": ids,
+            "candidates": fixture["candidates"],
+        }]), [])
+
+    def test_harvest_prompt_says_search_not_assign_and_renders_all_evidence(self):
+        rows = [record(1, text="desk worker"), record(2, text="unrelated parcel")]
+        prompt = segmentation.harvest_prompt(rows)
+        self.assertIn("zero or more recurring audience patterns", prompt)
+        self.assertIn("chunk is not itself a segment", prompt)
+        self.assertIn("leave unrelated evidence unassigned", prompt)
+        self.assertIn("[1] [core] desk worker", prompt)
+        self.assertIn("[2] [core] unrelated parcel", prompt)
+
+    def test_03a_semantic_guard_rejects_generic_labels(self):
+        base = {
+            "candidate_key": "desk_workers", "provisional_name": "Desk workers",
+            "audience_cue": "desk work", "why_commercially_distinct": "workday",
+            "evidence_ids": [1], "cue_terms": ["desk"],
+            "discovery_strength": "probable",
+        }
+        for key in ("harvest_candidates_from_core", "candidate", "segment", "audience"):
+            with self.subTest(candidate_key=key), self.assertRaises(ValueError):
+                segmentation.validate_harvest_rows([{**base, "candidate_key": key}], [1])
+        for name in ("candidate", "segment", "audience"):
+            with self.subTest(provisional_name=name), self.assertRaises(ValueError):
+                segmentation.validate_harvest_rows(
+                    [{**base, "provisional_name": name}], [1])
+
+    def test_03a_evidence_invariants_allow_overlap_and_no_total_coverage(self):
+        rows = [{
+            "candidate_key": "desk_workers", "provisional_name": "Desk workers",
+            "audience_cue": "desk", "why_commercially_distinct": "work",
+            "evidence_ids": [1, 2], "cue_terms": ["desk"],
+            "discovery_strength": "strong"}, {
+            "candidate_key": "remote_workers", "provisional_name": "Remote workers",
+            "audience_cue": "home office", "why_commercially_distinct": "remote setup",
+            "evidence_ids": [2, 3], "cue_terms": ["home office"],
+            "discovery_strength": "probable"}]
+        segmentation.validate_harvest_rows(rows, [1, 2, 3, 4])
+        self.assertNotIn(4, {eid for row in rows for eid in row["evidence_ids"]})
+
+        for evidence_ids in ([], [1, 1], [1, 99]):
+            with self.subTest(evidence_ids=evidence_ids), self.assertRaises(ValueError):
+                segmentation.validate_harvest_rows(
+                    [{**rows[0], "evidence_ids": evidence_ids}], [1, 2, 3, 4])
+
+    def test_aggregate_reports_specialized_contract_error_not_plain_value_error(self):
+        result = {
+            "chunk_id": "03a_0004", "evidence_ids": [1, 2],
+            "candidates": [self.harvest_candidate(
+                "strength_training_pain_resolvers", [1, 999])],
+        }
+        with self.assertRaises(segmentation.HarvestContractError) as ctx:
+            segmentation.aggregate_harvest([result])
+        self.assertEqual(ctx.exception.chunk_id, "03a_0004")
+        self.assertEqual(ctx.exception.candidate,
+                         "strength_training_pain_resolvers")
+        self.assertEqual(ctx.exception.invalid_evidence_ids, [999])
+
+    def test_single_meaningful_full_chunk_claim_is_review_signal_not_rejection(self):
+        candidate = {
+            "candidate_key": "dental_professionals",
+            "provisional_name": "Dental professionals",
+            "audience_cue": "chairside work",
+            "why_commercially_distinct": "profession-specific positioning",
+            "evidence_ids": [1, 2], "cue_terms": ["dentist"],
+            "discovery_strength": "strong"}
+        segmentation.validate_harvest_rows([candidate], [1, 2])
+        claims = segmentation.harvest_full_chunk_claims([{
+            "chunk_id": "03a_0000", "evidence_ids": [1, 2],
+            "candidates": [candidate]}])
+        self.assertEqual(claims[0]["candidate_key"], "dental_professionals")
+
     def test_stage04_packet_contains_metrics_and_bounded_representatives_only(self):
         rows = [record(n, text=("REP" if n == 1 else f"RAW_SECRET_{n}"))
                 for n in range(1, 20)]
@@ -151,6 +281,13 @@ class SegmentationBookkeepingTests(unittest.TestCase):
 
 
 class SegmentationArtifactTests(unittest.TestCase):
+    def test_03a_contract_version_invalidates_old_fingerprint(self):
+        job = Job(id="03a_0000", prompt="same", schema=segmentation.HARVEST_SCHEMA)
+        old = cli._job_fingerprint(job, [1, 2], "skill")
+        current = cli._job_fingerprint(
+            job, [1, 2], "skill", segmentation.HARVEST_CONTRACT_VERSION)
+        self.assertNotEqual(old, current)
+
     def test_completed_chunk_is_reused_without_model_call(self):
         chunk = {"chunk_id": "03a_0000", "evidence_ids": [1, 2],
                  "estimated_tokens": 4, "records": [record(1), record(2)]}
@@ -239,6 +376,149 @@ class SegmentationArtifactTests(unittest.TestCase):
         self.assertEqual(client.calls, 2)
         self.assertEqual(result[0]["candidates"], [])
 
+    def test_03a_semantic_failure_is_regenerated_before_persistence(self):
+        chunk = {"chunk_id": "03a_0000", "evidence_ids": [1, 2, 3],
+                 "estimated_tokens": 4,
+                 "records": [record(1), record(2), record(3)]}
+        job = Job(id="03a_0000", prompt="search audiences", max_tokens=12000,
+                  schema=segmentation.HARVEST_SCHEMA)
+        bad = {"candidates": [{
+            "candidate_key": "audience", "provisional_name": "audience",
+            "audience_cue": "whole chunk", "why_commercially_distinct": "audience",
+            "evidence_ids": [1, 2, 3], "cue_terms": ["audience"],
+            "discovery_strength": "strong"}]}
+        good = {"candidates": [{
+            "candidate_key": "desk_workers", "provisional_name": "Desk workers",
+            "audience_cue": "desk work", "why_commercially_distinct": "workday",
+            "evidence_ids": [1, 2], "cue_terms": ["desk"],
+            "discovery_strength": "probable"}]}
+
+        class Client:
+            def __init__(self):
+                self.calls = 0
+
+            def estimate(self, *args, **kwargs):
+                return mock.Mock()
+
+            def prewarm(self, *args, **kwargs):
+                pass
+
+            def batch(self, _corpus, _preamble, jobs):
+                self.calls += 1
+                payload = bad if self.calls == 1 else good
+                return {jobs[0].id: BatchResult(json.dumps(payload), "stop")}
+
+        def validator(_job, rows):
+            segmentation.validate_harvest_rows(rows, chunk["evidence_ids"])
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(llm, "confirm", return_value=True):
+            client = Client()
+            result = cli._run_persisted_segment_jobs(
+                client, "skill", [job], [chunk], "candidates", tmp,
+                os.path.join(tmp, "failures"), SimpleNamespace(yes=True), "03A",
+                row_validator=validator, repair_guidance="regenerate semantically",
+                contract_version=segmentation.HARVEST_CONTRACT_VERSION)
+            with open(os.path.join(tmp, "03a_0000.json"), encoding="utf-8") as fh:
+                saved = json.load(fh)
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(result[0]["candidates"], good["candidates"])
+        self.assertEqual(saved["candidates"], good["candidates"])
+
+    def test_26_good_cached_chunks_and_one_bad_only_repairs_bad_chunk(self):
+        chunks = [{
+            "chunk_id": f"03a_{n:04d}", "evidence_ids": [n + 1],
+            "estimated_tokens": 4, "records": [record(n + 1)],
+        } for n in range(27)]
+        jobs = [Job(
+            id=chunk["chunk_id"],
+            prompt=segmentation.harvest_prompt(chunk["records"]), max_tokens=12000,
+            schema=segmentation.harvest_schema(chunk["evidence_ids"]))
+            for chunk in chunks]
+        legacy_jobs = [dataclasses.replace(
+            job, prompt=segmentation.legacy_harvest_prompt_v1(chunk["records"]),
+            schema=segmentation.legacy_harvest_schema_v1())
+            for job, chunk in zip(jobs, chunks)]
+        compatible_fingerprints = {
+            job.id: {cli._legacy_job_fingerprint_v1(
+                job, chunk["evidence_ids"],
+                segmentation.LEGACY_HARVEST_SKILL_V1)}
+            for job, chunk in zip(legacy_jobs, chunks)}
+        allowed = {chunk["chunk_id"]: chunk["evidence_ids"] for chunk in chunks}
+
+        def candidate(evidence_id):
+            return {
+                "candidate_key": "desk_workers",
+                "provisional_name": "Desk workers",
+                "audience_cue": "desk work",
+                "why_commercially_distinct": "workday",
+                "evidence_ids": [evidence_id], "cue_terms": ["desk"],
+                "discovery_strength": "probable",
+            }
+
+        class Client:
+            def __init__(self):
+                self.batch_job_ids = []
+
+            def estimate(self, _corpus, _preamble, work, **_kwargs):
+                self.estimated_ids = [job.id for job in work]
+                return mock.Mock()
+
+            def prewarm(self, *args, **kwargs):
+                pass
+
+            def batch(self, _corpus, _preamble, work):
+                self.batch_job_ids.append([job.id for job in work])
+                job = work[0]
+                payload = {"candidates": [candidate(27)]}
+                return {job.id: BatchResult(json.dumps(payload), "stop")}
+
+        def validator(job, rows):
+            segmentation.validate_harvest_rows(
+                rows, allowed[job.id], chunk_id=job.id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for job, chunk in zip(jobs, chunks):
+                evidence_id = (999 if job.id == "03a_0026"
+                               else chunk["evidence_ids"][0])
+                saved = {
+                    "chunk_id": job.id,
+                    "evidence_ids": chunk["evidence_ids"],
+                    "estimated_input_tokens": 4,
+                    "fingerprint": next(iter(compatible_fingerprints[job.id])),
+                    "candidates": [candidate(evidence_id)],
+                }
+                if job.id == "03a_0000":
+                    saved["candidates"][0]["candidate_key"] = "DESK_WORKERS"
+                cli._json_atomic(os.path.join(tmp, job.id + ".json"), saved)
+
+            client = Client()
+            output = io.StringIO()
+            with mock.patch.object(llm, "confirm", return_value=True), \
+                    mock.patch("sys.stdout", output):
+                results = cli._run_persisted_segment_jobs(
+                    client, "skill", jobs, chunks, "candidates", tmp,
+                    os.path.join(tmp, "failures"), SimpleNamespace(yes=True),
+                    "03A", row_validator=validator,
+                    repair_guidance="preserve candidates and valid IDs",
+                    contract_version=segmentation.HARVEST_CONTRACT_VERSION,
+                    compatible_fingerprints=compatible_fingerprints,
+                    cached_migrator=lambda _job, rows, _fingerprint:
+                        segmentation.migrate_legacy_harvest_rows(rows))
+
+            self.assertEqual(client.estimated_ids, ["03a_0026"])
+            self.assertEqual(client.batch_job_ids, [["03a_0026"]])
+            self.assertEqual(results[26]["candidates"][0]["evidence_ids"], [27])
+            self.assertIn("03A CONTRACT ERROR", output.getvalue())
+            self.assertIn("chunk: 03a_0026", output.getvalue())
+            self.assertIn("invalid evidence IDs: [999]", output.getvalue())
+            for n, job in enumerate(jobs[:26]):
+                with open(os.path.join(tmp, job.id + ".json"),
+                          encoding="utf-8") as fh:
+                    migrated = json.load(fh)
+                self.assertEqual(migrated["candidates"], [candidate(n + 1)])
+                self.assertIn("migrated_from_fingerprint", migrated)
+
     def test_stage06_preserves_evidence_tier_in_file_and_manifest(self):
         segment = {"slug": "desk", "name": "Desk", "definition": "desk context",
                    "inclusion_criteria": ["desk"], "exclusion_criteria": []}
@@ -286,7 +566,7 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
             self.calls.extend(job.id for job in jobs)
             replies = {}
             for job in jobs:
-                if job.schema is segmentation.HARVEST_SCHEMA:
+                if job.id.startswith("03a_"):
                     payload = {"candidates": [{
                         "candidate_key": "desk_workers",
                         "provisional_name": "Desk workers",

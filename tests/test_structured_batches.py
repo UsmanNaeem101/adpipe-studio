@@ -36,6 +36,9 @@ class FakeResponse:
         return json.dumps({
             "choices": [{"message": {"content": '{"records":[]}'}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "openrouter_metadata": {"endpoints": {"available": [
+                {"provider": "Wafer", "selected": True}
+            ]}},
         }).encode()
 
 
@@ -67,11 +70,14 @@ class StructuredBatchTests(unittest.TestCase):
         client.effort = "high"
         client.spent = {"in": 0, "out": 0, "reasoning": 0, "cache_write": 0, "cache_read": 0}
         with mock.patch("urllib.request.urlopen", return_value=FakeResponse()) as call:
-            client._post([{"role": "user", "content": "x"}], 100, SCHEMA)
+            result = client._post(
+                [{"role": "user", "content": "x"}], 100, SCHEMA)
         request = call.call_args.args[0]
         body = json.loads(request.data)
         self.assertEqual(body["response_format"]["type"], "json_schema")
         self.assertTrue(body["provider"]["require_parameters"])
+        self.assertEqual(request.headers["X-openrouter-metadata"], "enabled")
+        self.assertEqual(result.provider, "Wafer")
         logged = {}
         for base, _dirs, files in os.walk(self.audit_tmp.name):
             for name in files:

@@ -8,6 +8,11 @@ never has to fit in one model context.
 1. **03A harvest** reads Core evidence in deterministic token-sized chunks. OpenRouter
    keeps four requests in flight; budget exhaustion promotes the rolling floor through
    12k, 16k, 24k, and 32k. Context never enters 03A. Supporting is excluded by default.
+   A chunk is a search space, not an assignment unit: candidates cite only their
+   genuine supporting IDs, evidence may remain unassigned, and semantic validation
+   rejects generic task labels or invalid evidence claims before 03B can run.
+   Each request schema enumerates exactly that chunk's evidence IDs. The same
+   constraint is checked locally after decoding and again before aggregation.
 2. Code aggregates exact candidate keys, evidence IDs, aliases, cue terms, chunk IDs,
    and result provenance. It does not make semantic merges.
 3. **03B consolidation** reads that compact catalogue globally, merges semantic
@@ -67,8 +72,17 @@ best-effort comparison data from a preserved monolithic output/audit log.
 
 `--rediscover` remains an alias for `--from 03a`; `--reassign` reruns Stage 05.
 Completed chunks are reused when their input fingerprint matches. A changed skill,
-candidate catalogue, evidence text, schema, or chunk membership invalidates only the
-affected artifact and its dependent steps.
+candidate catalogue, evidence text, schema, semantic-contract version, or chunk
+membership invalidates only the affected artifact and its dependent steps. New chunk
+artifacts record routed-provider and token-split telemetry when it is reported; this
+does not pin provider routing.
+
+The first persisted 03A contract has a narrow compatibility migration. Its exact
+legacy fingerprints are recognized and revalidated locally: valid chunks are migrated
+without a model call, legacy key casing is normalized deterministically, and only
+chunks with substantive contract violations enter structured repair. Repairs preserve
+the discovered candidates and all valid evidence IDs rather than silently deleting a
+hallucinated ID in code.
 
 ## Per-project settings
 

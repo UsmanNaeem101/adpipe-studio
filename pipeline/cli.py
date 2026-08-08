@@ -416,6 +416,7 @@ class AdaptiveStageStats:
     final_ceiling: int = ADAPTIVE_TOKEN_TIERS[0]
     completion_tokens: list[int] = dataclasses.field(default_factory=list)
     reasoning_tokens: list[int] = dataclasses.field(default_factory=list)
+    provider_routes: Counter = dataclasses.field(default_factory=Counter)
 
 
 def _adaptive_percentage(completed, total):
@@ -490,6 +491,10 @@ def _print_adaptive_summary(stats):
                               stats.total)
     _print_token_distribution("Reasoning tokens", stats.reasoning_tokens,
                               stats.total)
+    if stats.provider_routes:
+        routes = " · ".join(f"{name}: {count}" for name, count in
+                            stats.provider_routes.most_common())
+        print(f"  Provider routes:       {routes}")
 
 
 def filter_chunk(cfg, args):
@@ -544,20 +549,21 @@ def _adaptive_wave_size(client_):
         return 1
 
 
-def _adaptive_validation_error(job, result, key):
+def _adaptive_validation_error(job, result, key, row_validator=None):
     """Return why a completed adaptive-stage reply is not a success."""
     stop = result.stop_reason or ""
     if stop in NO_RETRY_STOP_REASONS or stop.startswith(("request_error", "batch_")):
         return _failure_reason(result, "provider did not complete the request")
     try:
-        _decode_job_rows(job, result.text, key)
+        _decode_job_rows(job, result.text, key, row_validator=row_validator)
     except (ValueError, TypeError) as e:
         return _failure_reason(result, str(e))
     return None
 
 
 def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
-                        stage, key, wave_size=1, stats=None, debug=False):
+                        stage, key, wave_size=1, stats=None, debug=False,
+                        row_validator=None):
     """Run one structured stage with a live, persistent output-token floor.
 
     New work is launched in rolling waves. A wave is wholly in flight before any
@@ -617,6 +623,8 @@ def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
         exhausted = []
         for job in wave:
             result = _as_result(replies.get(job.id, ""))
+            if result.provider:
+                stats.provider_routes[result.provider] += 1
             attempts[job.id].append((job, result))
             label = _token_tier_label(job.max_tokens)
             if result.out_of_budget:
@@ -632,7 +640,8 @@ def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
                 exhausted.append(job)
                 continue
 
-            validation_error = _adaptive_validation_error(job, result, key)
+            validation_error = _adaptive_validation_error(
+                job, result, key, row_validator=row_validator)
             results[job.id] = result
             final_jobs[job.id] = job
             stats.completed += 1
@@ -657,7 +666,8 @@ def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
             if debug:
                 answer = max(result.completion_tokens - result.reasoning_tokens, 0)
                 print(f"      stop_reason={result.stop_reason!r}; reasoning="
-                      f"{result.reasoning_tokens:,}; answer={answer:,}")
+                      f"{result.reasoning_tokens:,}; answer={answer:,}; provider="
+                      f"{result.provider or 'unreported'}")
 
         if exhausted and tier_index == len(ADAPTIVE_TOKEN_TIERS) - 1:
             stats.terminal_failures += len(exhausted)
@@ -876,6 +886,12 @@ def _schema_issue(value, schema, path="$"):
         return f"{path} must be {kind}"
     if "enum" in schema and value not in schema["enum"]:
         return f"{path} is not an allowed value"
+    if kind == "string":
+        if len(value) < schema.get("minLength", 0):
+            return f"{path} is shorter than minLength"
+        pattern = schema.get("pattern")
+        if pattern and re.fullmatch(pattern, value) is None:
+            return f"{path} does not match the required pattern"
     if kind == "object":
         for name in schema.get("required", []):
             if name not in value:
@@ -890,11 +906,19 @@ def _schema_issue(value, schema, path="$"):
                 issue = _schema_issue(child, props[name], f"{path}.{name}")
                 if issue:
                     return issue
-    elif kind == "array" and "items" in schema:
-        for n, child in enumerate(value):
-            issue = _schema_issue(child, schema["items"], f"{path}[{n}]")
-            if issue:
-                return issue
+    elif kind == "array":
+        if len(value) < schema.get("minItems", 0):
+            return f"{path} has fewer than minItems"
+        if schema.get("uniqueItems"):
+            markers = [json.dumps(item, sort_keys=True, ensure_ascii=False)
+                       for item in value]
+            if len(markers) != len(set(markers)):
+                return f"{path} must contain unique items"
+        if "items" in schema:
+            for n, child in enumerate(value):
+                issue = _schema_issue(child, schema["items"], f"{path}[{n}]")
+                if issue:
+                    return issue
     return None
 
 
@@ -917,7 +941,7 @@ def _coverage_issue(rows, expected_ids):
     return ", ".join(bits) if bits else None
 
 
-def _decode_job_rows(job, raw, key):
+def _decode_job_rows(job, raw, key, row_validator=None):
     payload = _json_object(raw)
     issue = _schema_issue(payload, job.schema)
     if issue:
@@ -932,6 +956,8 @@ def _decode_job_rows(job, raw, key):
         issue = _coverage_issue(rows, job.expected_ids)
         if issue:
             raise ValueError(f"incomplete record coverage ({issue})")
+    if row_validator is not None:
+        row_validator(job, rows)
     return rows
 
 
@@ -1032,23 +1058,38 @@ def _rerun_batch(client_, corpus, preamble, failures, factor):
     return client_.batch(corpus, preamble, jobs)
 
 
-def _repair_batch(client_, corpus, preamble, failures, key):
-    """Reformat failed model outputs in one structured recovery batch."""
+def _repair_batch(client_, corpus, preamble, failures, key, guidance=None):
+    """Recover invalid model outputs in one structured recovery batch.
+
+    Most callers need shape-only repair.  A stage-specific semantic validator
+    may instead supply concise regeneration guidance so a vacuous but valid JSON
+    judgement is reconsidered rather than faithfully preserved.
+    """
     from llm import Job
 
     jobs = []
     for job, raw, reason in failures:
         raw = _raw_text(raw)
         prior = raw if raw.strip() else "[No response was returned. Re-run the request.]"
+        if guidance:
+            instruction = (
+                "The JSON shape may be valid, but the substantive result violated "
+                "this stage's semantic contract. Re-evaluate the ORIGINAL REQUEST "
+                "and regenerate the affected judgement; do not preserve a generic, "
+                "unsupported, or structurally invalid candidate merely because it "
+                "appeared in the previous response.\n\n" + guidance)
+        else:
+            instruction = (
+                "Preserve every decision, reason, group, score, cue, and assignment "
+                "already present in the previous response; this is data-shape "
+                "repair, not a chance to reconsider those judgments. Use the "
+                "original request only to restore an omitted input row or to re-run "
+                "the job when no response was returned.")
         prompt = (
             "RECOVERY TASK: The previous model response could not be consumed by "
             f"the pipeline because: {reason}.\n\n"
-            "Return JSON only and obey the supplied JSON schema exactly. Preserve "
-            "every decision, reason, group, score, cue, and assignment that is "
-            "already present in the previous response; this is data-shape repair, "
-            "not a chance to reconsider those judgments. Use the original request "
-            "only to restore an omitted input row or to re-run the job when no "
-            "response was returned. The final top-level array must be named "
+            "Return JSON only and obey the supplied JSON schema exactly. "
+            + instruction + " The final top-level array must be named "
             f"{key!r}. Do not add commentary or Markdown.\n\n"
             "ORIGINAL REQUEST:\n\n" + job.prompt +
             "\n\nPREVIOUS RESPONSE:\n\n" + prior)
@@ -1059,7 +1100,7 @@ def _repair_batch(client_, corpus, preamble, failures, key):
     return client_.batch(corpus, preamble, jobs)
 
 
-def _decode_into(decoded, job, result, key):
+def _decode_into(decoded, job, result, key, row_validator=None):
     """Decode one reply into `decoded`, or return the reason it could not be.
 
     Returns None on success. The reason is derived from the provider's stop
@@ -1067,7 +1108,8 @@ def _decode_into(decoded, job, result, key):
     is never reported as a JSON syntax error.
     """
     try:
-        decoded[job.id] = _decode_job_rows(job, result.text, key)
+        decoded[job.id] = _decode_job_rows(
+            job, result.text, key, row_validator=row_validator)
         return None
     except (ValueError, TypeError) as e:
         return _failure_reason(result, str(e))
@@ -1117,7 +1159,8 @@ def _report_failure_modes(failures, total, key):
 
 
 def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
-                rerun_factor=BUDGET_RETRY_FACTOR, adaptive_stats=None):
+                rerun_factor=BUDGET_RETRY_FACTOR, adaptive_stats=None,
+                row_validator=None):
     """Decode all jobs, recovering failed responses before failing the stage.
 
     Two failure modes need two different recoveries, and conflating them is what
@@ -1148,7 +1191,8 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
     for jid, job in sorted(by_id.items()):
         result = _as_result(results.get(jid, ""))
         reason = ("no response returned" if jid not in results
-                  else _decode_into(decoded, job, result, key))
+                  else _decode_into(
+                      decoded, job, result, key, row_validator=row_validator))
         if reason:
             first_result[jid] = result
             failures.append((job, result, reason))
@@ -1178,7 +1222,8 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
                     still_bad.append((job, result,
                                       f"{original_reason}; re-run returned no response"))
                     continue
-                reason = _decode_into(decoded, job, retried, key)
+                reason = _decode_into(
+                    decoded, job, retried, key, row_validator=row_validator)
                 if reason:
                     # Carry the re-run's reply forward: it, not the empty
                     # original, is what a shape repair has to work from.
@@ -1212,7 +1257,8 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
                                       f"original: {original_reason}; "
                                       "repair: repair returned no response"))
                     continue
-                reason = _decode_into(decoded, job, fixed, key)
+                reason = _decode_into(
+                    decoded, job, fixed, key, row_validator=row_validator)
                 if reason:
                     still_bad.append((job, result,
                                       f"original: {original_reason}; repair: {reason}"))
@@ -1840,68 +1886,174 @@ def _legacy_stage03_benchmark(cfg, candidate_path):
     return benchmark
 
 
-def _job_fingerprint(job, evidence_ids, corpus=""):
+def _job_fingerprint(job, evidence_ids, corpus="", contract_version=""):
+    payload = json.dumps({"prompt": job.prompt, "schema": job.schema,
+                          "ids": list(evidence_ids), "corpus": corpus,
+                          "contract_version": contract_version}, sort_keys=True,
+                         ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _legacy_job_fingerprint_v1(job, evidence_ids, corpus=""):
+    """Fingerprint format used before semantic contract versions existed."""
     payload = json.dumps({"prompt": job.prompt, "schema": job.schema,
                           "ids": list(evidence_ids), "corpus": corpus}, sort_keys=True,
                          ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _print_03a_contract_error(error, fallback_chunk=None):
+    """Render a model-contract failure as an actionable pipeline event."""
+    chunk = getattr(error, "chunk_id", None) or fallback_chunk or "unknown"
+    candidate = getattr(error, "candidate", None) or "unknown"
+    invalid = getattr(error, "invalid_evidence_ids", None)
+    print("\n  03A CONTRACT ERROR")
+    print(f"  chunk: {chunk}")
+    print(f"  candidate: {candidate}")
+    if invalid:
+        print(f"  invalid evidence IDs: {invalid}")
+    else:
+        print(f"  violation: {error}")
+
+
 def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
-                                diagnostics_dir, args, stage, force=False):
+                                diagnostics_dir, args, stage, force=False,
+                                row_validator=None, repair_guidance=None,
+                                contract_version="", compatible_jobs=None,
+                                compatible_fingerprints=None,
+                                cached_migrator=None):
     """Run missing chunk jobs with adaptive budgets and persist each result."""
     from llm import confirm
 
     os.makedirs(artifact_dir, exist_ok=True)
-    complete, missing_jobs, missing_chunks = {}, [], []
+    compatible_by_id = {job.id: job for job in (compatible_jobs or [])}
+    complete, missing_jobs, missing_chunks, cached_repairs = {}, [], [], []
     for job, chunk in zip(jobs, chunks):
         path = os.path.join(artifact_dir, f"{job.id}.json")
-        fingerprint = _job_fingerprint(job, chunk["evidence_ids"], corpus)
+        fingerprint = _job_fingerprint(
+            job, chunk["evidence_ids"], corpus, contract_version)
         if os.path.isfile(path) and not force:
             try:
                 with open(path, encoding="utf-8") as fh:
                     saved = json.load(fh)
-                if saved.get("fingerprint") == fingerprint:
+                acceptable = {fingerprint}
+                acceptable.update(
+                    (compatible_fingerprints or {}).get(job.id, ()))
+                compatible = compatible_by_id.get(job.id)
+                if compatible is not None:
+                    acceptable.add(_job_fingerprint(
+                        compatible, chunk["evidence_ids"], corpus,
+                        contract_version))
+                if saved.get("fingerprint") in acceptable:
+                    if (saved.get("fingerprint") != fingerprint
+                            and cached_migrator is not None):
+                        saved[key] = cached_migrator(
+                            job, saved.get(key, []), saved.get("fingerprint"))
+                    if row_validator is not None:
+                        try:
+                            row_validator(job, saved.get(key, []))
+                        except segmentation.HarvestContractError as error:
+                            if repair_guidance:
+                                cached_repairs.append((job, chunk, saved, error))
+                                continue
+                            raise
+                    if saved.get("fingerprint") != fingerprint:
+                        saved["migrated_from_fingerprint"] = saved.get("fingerprint")
+                        saved["fingerprint"] = fingerprint
+                        _json_atomic(path, saved)
                     complete[job.id] = saved
                     continue
-            except (OSError, ValueError):
+            except (OSError, ValueError, TypeError):
                 pass
         missing_jobs.append(job)
         missing_chunks.append(chunk)
 
-    if missing_jobs:
-        print(f"  {stage}: {len(missing_jobs)}/{len(jobs)} chunk(s) to run; "
-              f"{len(complete)} reusable")
-        if not confirm(c.estimate(corpus, SEGMENT_PREAMBLE, missing_jobs,
+    work_jobs = missing_jobs + [job for job, _chunk, _saved, _error
+                                in cached_repairs]
+    if work_jobs:
+        detail = f"{len(missing_jobs)} new/stale"
+        if cached_repairs:
+            detail += f" · {len(cached_repairs)} cached contract repair"
+        print(f"  {stage}: {detail}; {len(complete)} reusable")
+        if not confirm(c.estimate(corpus, SEGMENT_PREAMBLE, work_jobs,
                                   batched=True), getattr(args, "yes", False)):
             return None
         c.prewarm(corpus, SEGMENT_PREAMBLE)
-        results, final_jobs = _run_adaptive_stage(
-            c, corpus, SEGMENT_PREAMBLE, missing_jobs, diagnostics_dir,
-            stage=stage, key=key, wave_size=_adaptive_wave_size(c),
-            debug=getattr(args, "segment_debug", False))
-        final_by_id = {job.id: job for job in final_jobs}
-        chunks_by_id = {job.id: chunk for job, chunk in
-                        zip(missing_jobs, missing_chunks)}
-        for original in missing_jobs:
-            job = final_by_id[original.id]
-            rows = _batch_rows(
-                {job.id: results[job.id]}, [job], key, diagnostics_dir,
-                repair=lambda failed: _repair_batch(
-                    c, corpus, SEGMENT_PREAMBLE, failed, key),
-                rerun=lambda failed, factor: _rerun_batch(
-                    c, corpus, SEGMENT_PREAMBLE, failed, factor))
-            chunk = chunks_by_id[job.id]
-            saved = {
-                "chunk_id": job.id,
-                "evidence_ids": chunk["evidence_ids"],
-                "estimated_input_tokens": chunk["estimated_tokens"],
-                "fingerprint": _job_fingerprint(
-                    original, chunk["evidence_ids"], corpus),
-                key: rows,
-            }
-            _json_atomic(os.path.join(artifact_dir, f"{job.id}.json"), saved)
-            complete[job.id] = saved
+
+        if missing_jobs:
+            stage_stats = AdaptiveStageStats(stage=stage, total=len(missing_jobs))
+            results, final_jobs = _run_adaptive_stage(
+                c, corpus, SEGMENT_PREAMBLE, missing_jobs, diagnostics_dir,
+                stage=stage, key=key, wave_size=_adaptive_wave_size(c),
+                stats=stage_stats, debug=getattr(args, "segment_debug", False),
+                row_validator=row_validator)
+            if stage_stats.provider_routes:
+                routes = " · ".join(
+                    f"{name}: {count}" for name, count in
+                    stage_stats.provider_routes.most_common())
+                print(f"  {stage} provider routes (adaptive attempts): {routes}")
+            final_by_id = {job.id: job for job in final_jobs}
+            chunks_by_id = {job.id: chunk for job, chunk in
+                            zip(missing_jobs, missing_chunks)}
+            for original in missing_jobs:
+                job = final_by_id[original.id]
+                rows = _batch_rows(
+                    {job.id: results[job.id]}, [job], key, diagnostics_dir,
+                    repair=lambda failed: _repair_batch(
+                        c, corpus, SEGMENT_PREAMBLE, failed, key,
+                        guidance=repair_guidance),
+                    rerun=lambda failed, factor: _rerun_batch(
+                        c, corpus, SEGMENT_PREAMBLE, failed, factor),
+                    row_validator=row_validator)
+                chunk = chunks_by_id[job.id]
+                saved = {
+                    "chunk_id": job.id,
+                    "evidence_ids": chunk["evidence_ids"],
+                    "estimated_input_tokens": chunk["estimated_tokens"],
+                    "fingerprint": _job_fingerprint(
+                        original, chunk["evidence_ids"], corpus,
+                        contract_version),
+                    "first_response_telemetry": {
+                        "provider": results[job.id].provider,
+                        "stop_reason": results[job.id].stop_reason,
+                        "completion_tokens": results[job.id].completion_tokens,
+                        "reasoning_tokens": results[job.id].reasoning_tokens,
+                    },
+                    key: rows,
+                }
+                _json_atomic(os.path.join(artifact_dir, f"{job.id}.json"), saved)
+                complete[job.id] = saved
+
+        for job, chunk, saved, contract_error in cached_repairs:
+            _print_03a_contract_error(contract_error, job.id)
+            print("  Repairing this chunk while preserving candidates and valid IDs...")
+            prior = BatchResult(
+                json.dumps({key: saved.get(key, [])}, ensure_ascii=False), "stop",
+                int((saved.get("first_response_telemetry") or {}).get(
+                    "reasoning_tokens") or 0),
+                int((saved.get("first_response_telemetry") or {}).get(
+                    "completion_tokens") or 0),
+                (saved.get("first_response_telemetry") or {}).get("provider"))
+            try:
+                rows = _batch_rows(
+                    {job.id: prior}, [job], key, diagnostics_dir,
+                    repair=lambda failed: _repair_batch(
+                        c, corpus, SEGMENT_PREAMBLE, failed, key,
+                        guidance=repair_guidance), row_validator=row_validator)
+            except BatchOutputError as error:
+                project = os.environ.get("ADPIPE_PROJECT", "PROJECT")
+                raise BatchOutputError(
+                    f"Stage {stage} contract repair failed for {job.id}. "
+                    f"Diagnostics: {diagnostics_dir}. Resume with: "
+                    f"./adpipe -p {project} segment") from error
+            repaired = dict(saved)
+            repaired["migrated_from_fingerprint"] = saved.get("fingerprint")
+            repaired["fingerprint"] = _job_fingerprint(
+                job, chunk["evidence_ids"], corpus, contract_version)
+            repaired["contract_repaired"] = True
+            repaired[key] = rows
+            _json_atomic(os.path.join(artifact_dir, f"{job.id}.json"), repaired)
+            complete[job.id] = repaired
     else:
         print(f"  {stage}: reusing all {len(jobs)} completed chunk(s)")
     return [complete[job.id] for job in jobs]
@@ -2002,23 +2154,87 @@ def cmd_segment(cfg, args):
                    for chunk in chunks03a]
     _json_atomic(os.path.join(discovery, "03a_chunk_manifest.json"), manifest03a)
     s03a = skill_named("03a_discover_segment_candidates.md")
+    chunk_ids03a = {chunk["chunk_id"]: tuple(chunk["evidence_ids"])
+                    for chunk in chunks03a}
+
+    def validate03a(job, rows):
+        segmentation.validate_harvest_rows(
+            rows, chunk_ids03a[job.id], chunk_id=job.id)
+
     jobs03a = [Job(
         id=chunk["chunk_id"],
-        prompt=("Harvest provisional audience candidates from this complete "
-                "discovery-evidence chunk. Every cited ID must be one shown below.\n\n"
-                + segmentation.evidence_text(chunk["records"], include_tier=True)),
+        prompt=segmentation.harvest_prompt(chunk["records"]),
         max_tokens=int(_segment_setting(cfg, "03a_max_tokens", 12000)),
-        schema=segmentation.HARVEST_SCHEMA,
+        schema=segmentation.harvest_schema(chunk["evidence_ids"]),
         effort=_segment_setting(cfg, "03a_effort", None)) for chunk in chunks03a]
-    results03a = _run_persisted_segment_jobs(
-        c, s03a, jobs03a, chunks03a, "candidates",
-        os.path.join(discovery, "03a_chunk_candidates"),
-        os.path.join(diagnostics, "03a"), args, "03A",
-        force=_segment_force(args, "03a"))
+    # Compatibility is intentionally narrow: these are the exact same jobs with
+    # the prior static schema.  A cached result from that contract is locally
+    # revalidated, migrated for free when valid, and repaired alone when invalid.
+    legacy_jobs03a = [dataclasses.replace(
+        job, schema=segmentation.HARVEST_SCHEMA) for job in jobs03a]
+    legacy_v1_jobs03a = [dataclasses.replace(
+        job, prompt=segmentation.legacy_harvest_prompt_v1(chunk["records"]),
+        schema=segmentation.legacy_harvest_schema_v1())
+        for job, chunk in zip(jobs03a, chunks03a)]
+    legacy_v1_fingerprints = {
+        job.id: {_legacy_job_fingerprint_v1(
+            job, chunk["evidence_ids"], segmentation.LEGACY_HARVEST_SKILL_V1)}
+        for job, chunk in zip(legacy_v1_jobs03a, chunks03a)
+    }
+    repair03a = (
+        "Preserve every discovered candidate and every valid supporting evidence "
+        "ID from the previous response. Correct only contract violations: remove "
+        "or replace IDs not present in this chunk, deduplicate repeated IDs, and "
+        "repair invalid keys or empty required fields. Do not merge, delete, add, "
+        "or reinterpret candidates unless that is strictly required to satisfy "
+        "the contract. Input evidence may remain unassigned.")
+
+    def run03a():
+        return _run_persisted_segment_jobs(
+            c, s03a, jobs03a, chunks03a, "candidates",
+            os.path.join(discovery, "03a_chunk_candidates"),
+            os.path.join(diagnostics, "03a"), args, "03A",
+            force=_segment_force(args, "03a"), row_validator=validate03a,
+            repair_guidance=repair03a,
+            contract_version=segmentation.HARVEST_CONTRACT_VERSION,
+            compatible_jobs=legacy_jobs03a,
+            compatible_fingerprints=legacy_v1_fingerprints,
+            cached_migrator=lambda _job, rows, _fingerprint:
+                segmentation.migrate_legacy_harvest_rows(rows))
+
+    results03a = run03a()
     if results03a is None:
         return
     meter_03a = _model_meter(c)
-    catalogue = segmentation.aggregate_harvest(results03a)
+    full_claims = segmentation.harvest_full_chunk_claims(results03a)
+    if full_claims:
+        sample = ", ".join(
+            f"{row['chunk_id']}→{row['candidate_key']} ({row['evidence_count']} IDs)"
+            for row in full_claims[:4])
+        print(f"  ! 03A review signal: {len(full_claims)}/{len(results03a)} chunk(s) "
+              f"returned one candidate claiming every input ID: {sample}")
+        print("    This is allowed for a genuinely homogeneous chunk, but repeated "
+              "instances should be audited before trusting 03B.")
+    try:
+        catalogue = segmentation.aggregate_harvest(results03a)
+    except segmentation.HarvestContractError as error:
+        # Ordinarily persisted-result validation catches this earlier. Keep the
+        # aggregate boundary guarded as defence against a manually edited or
+        # concurrently changed artifact, and send it through the same repair path.
+        _print_03a_contract_error(error)
+        print("  Repairing this chunk before aggregation...")
+        results03a = run03a()
+        if results03a is None:
+            return
+        try:
+            catalogue = segmentation.aggregate_harvest(results03a)
+        except segmentation.HarvestContractError as final_error:
+            _print_03a_contract_error(final_error)
+            project = cfg.get("name", "PROJECT")
+            raise BatchOutputError(
+                "Stage 03A contract repair did not produce a valid artifact. "
+                f"Diagnostics: {os.path.join(diagnostics, '03a')}. Resume with: "
+                f"./adpipe -p {project} segment") from final_error
     catalogue_p = os.path.join(discovery, "03a_candidate_catalogue.json")
     _json_atomic(catalogue_p, catalogue)
     print(f"  03A harvest: {len(chunks03a)} chunks · {len(catalogue)} recurring "
