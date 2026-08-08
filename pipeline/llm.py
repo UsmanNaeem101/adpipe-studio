@@ -54,6 +54,11 @@ class Job:
     # Per-record stages use this to prove that a response covered the complete
     # input chunk before any output is accepted or written.
     expected_ids: tuple[int, ...] | None = None
+    # Reasoning depth for THIS job, overriding the client's setting. Stages are
+    # not equally hard: skill 01 is a bouncer deciding retain/reject against a
+    # closed list of reasons, and reasoning at the depth a synthesis stage needs
+    # is what emptied its output budget. None = use the client's effort.
+    effort: str | None = None
 
 
 # Providers spell "I ran out of output room" differently: Anthropic returns a
@@ -178,13 +183,16 @@ class Client:
             },
         ]
 
-    def _params(self, system, prompt, max_tokens, schema=None):
+    def _params(self, system, prompt, max_tokens, schema=None, effort=None):
         p = {
             "model": self.model,
             "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": prompt}],
-            "output_config": {"effort": self.effort},
+            # max_tokens caps thinking AND the response text together on Opus 5,
+            # and thinking is on by default — so effort is not just a quality
+            # dial, it decides how much of the budget is left to answer with.
+            "output_config": {"effort": effort or self.effort},
             # Adaptive is the default on Opus 5; set it explicitly so the intent
             # survives a model swap. No temperature/top_p — rejected on Opus 5.
             "thinking": {"type": "adaptive"},
@@ -254,10 +262,11 @@ class Client:
             print(f"  cache warmed: {r.usage.cache_creation_input_tokens:,} tokens written")
 
     def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
-            job_id="single", operation="pipeline_single") -> str:
+            job_id="single", operation="pipeline_single", effort=None) -> str:
         """Single request. Always streamed — above ~16k max_tokens a non-streaming
         call risks an HTTP timeout, and these stages run long."""
-        params = self._params(self._system(corpus, preamble), prompt, max_tokens, schema)
+        params = self._params(self._system(corpus, preamble), prompt, max_tokens,
+                              schema, effort)
         audit = auditlog.start("anthropic", self.model, operation, params,
                                job_id=job_id)
         try:
@@ -287,7 +296,7 @@ class Client:
 
         system = self._system(corpus, preamble)
         params_by_id = {j.id: self._params(
-            system, j.prompt, j.max_tokens, j.schema) for j in jobs}
+            system, j.prompt, j.max_tokens, j.schema, j.effort) for j in jobs}
         audits = {j.id: auditlog.start(
             "anthropic", self.model, "pipeline_batch_job", params_by_id[j.id],
             job_id=j.id) for j in jobs}

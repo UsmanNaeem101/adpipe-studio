@@ -214,6 +214,27 @@ def parse_voc(raw):
     return items
 
 
+# Skill 01 defines a CLOSED vocabulary of reason codes; the schema used to accept
+# any string, so the model was free to compose prose instead of classifying. That
+# cost output tokens, invited deeper reasoning for what is a labelling job, and
+# left the reasons unaggregatable downstream. Mirrored from
+# skills/01_filter_voc.md § Reason codes — tests/test_filter_budget.py fails if
+# these two lists ever drift apart.
+REJECTION_REASONS = [
+    "interface_chrome", "bot_boilerplate", "empty_record", "malformed_record",
+    "spam", "affiliate_promotion", "self_promotion", "link_only",
+    "generic_acknowledgement", "reaction_only", "joke_without_signal",
+    "insult_without_signal", "off_topic", "exact_duplicate",
+    "quotation_without_new_evidence", "insufficient_information",
+]
+RETENTION_REASONS = [
+    "first_person_experience", "third_person_observation", "specific_problem",
+    "specific_context", "attempted_solution", "product_experience",
+    "competitor_experience", "outcome", "belief", "objection", "buying_trigger",
+    "buying_criterion", "desired_proof", "offer_response", "customer_terminology",
+    "customer_slang", "comparison", "workaround", "emotional_signal",
+]
+
 FILTER_SCHEMA = {
     "type": "object",
     "properties": {"records": {"type": "array", "items": {
@@ -221,8 +242,12 @@ FILTER_SCHEMA = {
         "properties": {
             "evidence_id": {"type": "integer"},
             "decision": {"type": "string", "enum": ["retain", "reject"]},
-            "retention_reasons": {"type": "array", "items": {"type": "string"}},
-            "rejection_reasons": {"type": "array", "items": {"type": "string"}},
+            "retention_reasons": {"type": "array",
+                                  "items": {"type": "string",
+                                            "enum": RETENTION_REASONS}},
+            "rejection_reasons": {"type": "array",
+                                  "items": {"type": "string",
+                                            "enum": REJECTION_REASONS}},
         },
         "required": ["evidence_id", "decision", "retention_reasons", "rejection_reasons"],
         "additionalProperties": False}}},
@@ -249,6 +274,24 @@ DEDUP_SCHEMA = {
 
 class BatchOutputError(RuntimeError):
     """A paid model batch completed but did not satisfy its data contract."""
+
+
+# Tokens to reserve for reasoning in a per-record budget. `max_tokens` caps
+# reasoning AND the answer together, so a budget sized only for the answer hands
+# the whole margin to reasoning — which is exactly how skill 01 came back empty.
+REASONING_RESERVE = 2000
+
+
+def _record_max_tokens(chunk, per_record_tokens, reserve=REASONING_RESERVE):
+    """Size a per-record batch's output budget from its schema, not by eye.
+
+    answer + reasoning reserve + 15% margin. Reserving the answer's room FIRST is
+    what makes the failure structural rather than probabilistic: whatever the
+    model spends thinking, the tokens needed to write one verdict per record were
+    never the model's to spend. `pipeline/profile_filter.py` prints the same
+    arithmetic against a real corpus.
+    """
+    return int((chunk * per_record_tokens + reserve) * 1.15)
 
 
 def _json_object(text):
@@ -671,10 +714,19 @@ def cmd_ingest(cfg, args):
                         "you are only deciding what gets in. Return JSON only as "
                         "{\"records\":[...]}, with exactly one object per input record "
                         "and the numeric [id] copied to evidence_id. Leave the unused "
-                        "reason array empty.\n\nRECORDS:\n\n"
+                        "reason array empty. Reasons must be codes from skill 01's "
+                        "Reason codes list, verbatim — classify against that list, "
+                        "don't write prose.\n\nRECORDS:\n\n"
                         + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
-                max_tokens=8000, schema=FILTER_SCHEMA,
-                expected_ids=tuple(r["id"] for r in ch))
+                # ~40 tokens covers a worst-case verdict: an id, a decision and
+                # two of the longest reason codes skill 01 defines.
+                max_tokens=_record_max_tokens(len(ch), 40), schema=FILTER_SCHEMA,
+                expected_ids=tuple(r["id"] for r in ch),
+                # Skill 01 is the bouncer at the door: retain or reject, with
+                # reasons drawn from a closed list. It is judgement, but it is
+                # not deep reasoning, and paying synthesis-depth reasoning 83
+                # times over is what left no budget to answer with.
+                effort="low")
             for n, ch in enumerate(chunks)]
 
     prefix = f"{s01}\n\n---\n\n{ctx}"

@@ -310,6 +310,7 @@ class ProviderStopReasonTests(unittest.TestCase):
         self.client.model = "deepseek/deepseek-v4-flash"
         self.client.key = "test-key"
         self.client.verbose = False
+        self.client.effort = "low"
         self.client.spent = {"in": 0, "out": 0, "cache_write": 0, "cache_read": 0}
 
     def tearDown(self):
@@ -440,7 +441,12 @@ class IngestStage01Tests(unittest.TestCase):
                 result = {}
                 for j in jobs:
                     self.seen.append((j.id, j.max_tokens))
-                    if j.max_tokens <= 8000:
+                    # Starve anything at the stage's own sized budget; only the
+                    # widened re-run gets through. Keyed off the first budget
+                    # seen so the test tracks _record_max_tokens rather than
+                    # re-hardcoding whatever number it currently produces.
+                    self.floor = getattr(self, "floor", None) or j.max_tokens
+                    if j.max_tokens <= self.floor:
                         result[j.id] = llm.BatchResult("", "length")
                     elif j.schema is cli.FILTER_SCHEMA:
                         ids = [int(x) for x in __import__("re").findall(
@@ -458,9 +464,16 @@ class IngestStage01Tests(unittest.TestCase):
 
         self.assertEqual(len(rows_out), 2)
         self.assertTrue(all(r["decision"] == "retain" for r in rows_out))
-        # Skill 01 asked for 8000 and got nothing; the re-run asked for 24000.
-        self.assertIn(("f0000", 8000), client.seen)
-        self.assertIn(("f0000", 24000), client.seen)
+        # Skill 01's budget is now derived from its schema, and the re-run is 3x
+        # whatever that came to — assert the relationship, not the constants.
+        filter_budgets = [mt for jid, mt in client.seen if jid.startswith("f")]
+        self.assertEqual(len(filter_budgets), 2)
+        first, rerun = filter_budgets
+        self.assertEqual(rerun, first * cli.BUDGET_RETRY_FACTOR)
+        # Sized off the schema, not picked round: 2 records of verdict plus the
+        # reasoning reserve, well under the old flat 8000.
+        self.assertEqual(first, cli._record_max_tokens(2, 40))
+        self.assertLess(first, 8000)
         # The starved original is still on disk, with its cause spelled out, and
         # no repair pass was ever needed.
         self.assertEqual(sorted(saved), ["f0000.original.txt", "f0000.rerun.txt"])

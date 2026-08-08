@@ -64,6 +64,7 @@ class StructuredBatchTests(unittest.TestCase):
         client = object.__new__(openrouter.Client)
         client.model = "test/model"
         client.key = "test-key"
+        client.effort = "high"
         client.spent = {"in": 0, "out": 0, "cache_write": 0, "cache_read": 0}
         with mock.patch("urllib.request.urlopen", return_value=FakeResponse()) as call:
             client._post([{"role": "user", "content": "x"}], 100, SCHEMA)
@@ -86,10 +87,11 @@ class StructuredBatchTests(unittest.TestCase):
     def test_openrouter_batch_passes_each_job_schema(self):
         client = object.__new__(openrouter.Client)
         client.verbose = False
+        client.effort = "high"
         seen = []
 
         def fake_post(_messages, _max_tokens, schema=None, retries=3,
-                      job_id=None, operation="completion"):
+                      job_id=None, operation="completion", **_kwargs):
             seen.append(schema)
             return '{"records":[]}'
 
@@ -104,6 +106,7 @@ class StructuredBatchTests(unittest.TestCase):
         client.model = "test/model"
         client.key = "test-key"
         client.verbose = False
+        client.effort = "high"
         client.spent = {"in": 0, "out": 0, "cache_write": 0, "cache_read": 0}
         unsupported = urllib.error.HTTPError(
             "https://example.test", 404, "not found", {},
