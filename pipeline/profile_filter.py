@@ -151,7 +151,7 @@ def main():
                     help="project onto a corpus of this size (e.g. 4977)")
     ap.add_argument("--chunks", default="20,30,40,60,80,120",
                     help="batch sizes to sweep")
-    ap.add_argument("--max-tokens", type=int, default=cli.FILTER_TOKEN_TIERS[0],
+    ap.add_argument("--max-tokens", type=int, default=cli.ADAPTIVE_TOKEN_TIERS[0],
                     help="ceiling to inspect (default: stage 01's 12k initial tier)")
     ap.add_argument("--model", default="claude-opus-5")
     ap.add_argument("--exact", action="store_true",

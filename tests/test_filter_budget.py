@@ -374,19 +374,10 @@ class StageConfigTests(unittest.TestCase):
         self.assertEqual(cli.filter_effort({"filter": {"effort": "none"}}, args),
                          "none")
 
-    def test_headroom_defaults_to_85_percent_and_is_overridable(self):
-        from types import SimpleNamespace
-        args = SimpleNamespace()
-        self.assertEqual(cli.filter_headroom_threshold({}, args), 0.85)
-        self.assertEqual(cli.filter_headroom_threshold(
-            {"filter": {"headroom_threshold": 0.9}}, args), 0.9)
-        self.assertEqual(cli.filter_headroom_threshold(
-            {}, SimpleNamespace(filter_headroom_threshold=0.8)), 0.8)
-
     def test_openrouter_uses_four_request_waves(self):
         self.assertEqual(
-            cli._stage01_wave_size(object.__new__(openrouter.Client)), 4)
-        self.assertEqual(cli._stage01_wave_size(object()), 1)
+            cli._adaptive_wave_size(object.__new__(openrouter.Client)), 4)
+        self.assertEqual(cli._adaptive_wave_size(object()), 1)
 
     def test_synthesis_stages_do_not_inherit_stage_01_reasoning(self):
         """skill 02's jobs must carry no effort override — only 01 is tuned."""
@@ -430,7 +421,7 @@ class ReasoningCapTests(ReasoningControlTests):
         self.assertEqual(jobs[0].reasoning_max_tokens, cli.REASONING_RESERVE)
 
     def test_initial_tier_exceeds_the_requested_reasoning_cap(self):
-        self.assertGreater(cli.FILTER_TOKEN_TIERS[0], cli.REASONING_RESERVE)
+        self.assertGreater(cli.ADAPTIVE_TOKEN_TIERS[0], cli.REASONING_RESERVE)
 
     def test_anthropic_effort_none_disables_thinking_legally(self):
         """Opus 5 rejects disabled thinking above `high` effort."""

@@ -23,7 +23,8 @@ folder, re-copy it — nothing syncs automatically.
 |---|---|---|---|---|
 | **01** filter_voc | `ingest` | `cmd_ingest()` | raw dump | `voc/retained_voc.jsonl` · `rejected_voc.jsonl` |
 | **02** deduplicate_voc | `ingest` | `cmd_ingest()` | retained | `voc/deduplicated_voc.jsonl` · `duplicate_groups.jsonl` |
-| **03** discover_segments | `segment` | `cmd_segment()` | deduplicated corpus | `voc/candidate_segments.json` |
+| deterministic refinement | `ingest` / `refine-voc` | `refine_voc()` | deduplicated + duplicate groups | `voc/production_voc.jsonl` · `audit_voc.jsonl` |
+| **03** discover_segments | `segment` | `cmd_segment()` | production corpus | `voc/candidate_segments.json` |
 | **04** validate_segments | `segment` | `cmd_segment()` | candidates | `voc/validated_segments.json` |
 | **05** assign_primary_segment | `segment` | `cmd_segment()` | validated + corpus | `voc/segment_assignments.jsonl` |
 | **06** build_segment_evidence_files | `segment` | `build_evidence_files()` | assignments | `evidence/<slug>.txt` + audit set |
@@ -82,7 +83,9 @@ contracts between stages. They now exist:
 ```
 raw dump
   → voc/retained_voc.jsonl          (01)
-  → voc/deduplicated_voc.jsonl      (02)   also written as filtered_voc.jsonl
+  → voc/deduplicated_voc.jsonl      (02)   legacy copy: filtered_voc.jsonl
+  → voc/production_voc.jsonl               deterministic lean export
+  → voc/audit_voc.jsonl                    deterministic rich audit
   → voc/candidate_segments.json     (03)
   → voc/validated_segments.json     (04)
   → voc/segment_assignments.jsonl   (05)

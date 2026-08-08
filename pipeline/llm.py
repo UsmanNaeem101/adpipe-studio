@@ -306,10 +306,15 @@ class Client:
         if self.verbose:
             print(f"  cache warmed: {r.usage.cache_creation_input_tokens:,} tokens written")
 
-    def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
-            job_id="single", operation="pipeline_single", effort=None) -> str:
-        """Single request. Always streamed — above ~16k max_tokens a non-streaming
-        call risks an HTTP timeout, and these stages run long."""
+    def one_result(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
+                   job_id="single", operation="pipeline_single", effort=None,
+                   reasoning_max_tokens=None) -> BatchResult:
+        """Single request retaining stop reason and usage for recovery.
+
+        Anthropic adaptive thinking currently has no separate reasoning-token
+        ceiling in this client. Accept the shared interface field so a Job can
+        travel intact, but do not pretend it is enforceable on this backend.
+        """
         params = self._params(self._system(corpus, preamble), prompt, max_tokens,
                               schema, effort)
         audit = auditlog.start("anthropic", self.model, operation, params,
@@ -325,13 +330,23 @@ class Client:
         text = "".join(b.text for b in msg.content if b.type == "text")
         audit.response(msg, text=text, usage=msg.usage, stop_reason=msg.stop_reason)
 
-        if msg.stop_reason == "refusal":
-            cat = getattr(msg.stop_details, "category", None)
-            raise RuntimeError(f"Request refused by safety classifiers (category: {cat}).")
-        if msg.stop_reason == "max_tokens":
-            print(f"  ! output hit max_tokens ({max_tokens}) and is truncated — raise it")
+        return BatchResult(
+            text, msg.stop_reason,
+            getattr(msg.usage, "thinking_tokens", 0) or 0,
+            getattr(msg.usage, "output_tokens", 0) or 0)
 
-        return text
+    def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
+            job_id="single", operation="pipeline_single", effort=None,
+            reasoning_max_tokens=None) -> str:
+        """Backward-compatible text-only single request."""
+        result = self.one_result(
+            corpus, preamble, prompt, max_tokens, schema, job_id, operation,
+            effort, reasoning_max_tokens)
+        if result.stop_reason == "refusal":
+            raise RuntimeError("Request refused by safety classifiers.")
+        if result.stop_reason == "max_tokens":
+            print(f"  ! output hit max_tokens ({max_tokens}) and is truncated — raise it")
+        return result.text
 
     def batch(self, corpus, preamble, jobs, poll_seconds=30) -> dict:
         """Fan out independent jobs at 50%. Results come back keyed by custom_id in

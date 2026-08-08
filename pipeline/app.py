@@ -54,11 +54,12 @@ IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 SIZES = {"4:5 portrait": "1024x1536", "1:1 square": "1024x1024",
          "1.91:1 landscape": "1536x1024"}
 
-# `filtered_voc.jsonl` is the ingest contract consumed by skills 03-06. The
-# other ingest artefacts explain how it was produced, but are not alternative
-# segmentation corpora and should not appear in the Segment source picker.
-SEGMENT_VOC_FILES = ("filtered_voc.jsonl",)
+# The deterministic refinement export is the lean ingest contract consumed by
+# skills 03-06. Rich audit and legacy files are visible as diagnostics only.
+SEGMENT_VOC_FILES = ("production_voc.jsonl",)
 INGEST_ADDITIONAL_FILES = (
+    ("audit_voc.jsonl", "audit_voc.jsonl · provenance and Stage 01/02 audit"),
+    ("filtered_voc.jsonl", "filtered_voc.jsonl · legacy rich corpus"),
     ("retained_voc.jsonl", "retained_voc.jsonl · 01 retained records"),
     ("rejected_voc.jsonl", "rejected_voc.jsonl · 01 rejected records"),
     ("deduplicated_voc.jsonl", "deduplicated_voc.jsonl · 02 deduplicated copy"),
@@ -379,8 +380,8 @@ def project_outputs(project):
                                           timespec="seconds")})
 
     voc = paths.voc(root)
-    entry("ingest", "filtered_voc.jsonl · segment-ready corpus",
-          os.path.join(voc, "filtered_voc.jsonl"), role="final")
+    entry("ingest", "production_voc.jsonl · segment-ready corpus",
+          os.path.join(voc, "production_voc.jsonl"), role="final")
     for f, lbl in INGEST_ADDITIONAL_FILES:
         entry("ingest", lbl, os.path.join(voc, f), role="additional")
 

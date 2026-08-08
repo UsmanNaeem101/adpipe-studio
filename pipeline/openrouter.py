@@ -273,14 +273,23 @@ class Client:
         if self.verbose:
             print("  (no prompt cache on OpenRouter — nothing to warm)")
 
-    def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
-            job_id="single", operation="pipeline_single", effort=None,
-            reasoning_max_tokens=None):
+    def one_result(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
+                   job_id="single", operation="pipeline_single", effort=None,
+                   reasoning_max_tokens=None):
+        """Single request with stop reason and usage preserved for recovery."""
         msgs = [{"role": "system", "content": f"{preamble}\n\n{corpus}"},
                 {"role": "user", "content": prompt}]
         return self._post(msgs, max_tokens, schema, job_id=job_id,
                           operation=operation, effort=effort,
-                          reasoning_max_tokens=reasoning_max_tokens).text
+                          reasoning_max_tokens=reasoning_max_tokens)
+
+    def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
+            job_id="single", operation="pipeline_single", effort=None,
+            reasoning_max_tokens=None):
+        """Backward-compatible text-only single request."""
+        return self.one_result(
+            corpus, preamble, prompt, max_tokens, schema, job_id, operation,
+            effort, reasoning_max_tokens).text
 
     def batch(self, corpus, preamble, jobs, poll_seconds=0):
         """No batch endpoint — run concurrently to recover wall-clock time.

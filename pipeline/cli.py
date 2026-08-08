@@ -3,6 +3,7 @@
 adpipe — raw Reddit VOC in, launch-ready static ads out.
 
     ./adpipe ingest  raw_voc.txt        filter + dedupe                (code)
+    ./adpipe refine-voc                 lean production + rich audit   (code)
     ./adpipe segment                    discover + assign + evidence   (code + model)
     ./adpipe extract <segment>          skills 07-26, batched + cached (model)
     ./adpipe picc    <segment>          barriers, PICC card, 5 angles  (model)
@@ -23,12 +24,14 @@ import dataclasses
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import statistics
 import subprocess
 import sys
 from collections import Counter, defaultdict
+from urllib.parse import urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pipeline"))
@@ -42,6 +45,8 @@ SKILLS = os.path.join(ROOT, "skills")
 # Skills 07-26 all read the evidence file and write one dimension each.
 EXTRACTORS = list(range(7, 27))
 EMPTY_EXTRACTION_RETRIES = 3
+PRODUCTION_VOC_FILE = "production_voc.jsonl"
+AUDIT_VOC_FILE = "audit_voc.jsonl"
 
 # Extraction depth presets. Keep these definitions as the single source of truth
 # for both the CLI and Studio so the selected label always matches the jobs run.
@@ -373,12 +378,103 @@ FILTER_CHUNK = 60
 FILTER_EFFORT = "low"
 DEDUP_EFFORT = None   # None = leave skill 02 exactly as it was
 
-# Stage 01 learns one persistent output floor while it runs.  These deliberately
+# Stages 01 and 02 learn a persistent output floor while they run. These deliberately
 # coarse tiers avoid paying to rediscover that a nearby ceiling is also too low.
 # A ceiling is not spend: providers charge generated tokens, not tokens allowed.
-FILTER_TOKEN_TIERS = (12000, 16000, 24000, 32000)
-FILTER_HEADROOM_THRESHOLD = 0.85
-FILTER_OPENROUTER_WAVE_SIZE = 4
+ADAPTIVE_TOKEN_TIERS = (12000, 16000, 24000, 32000)
+ADAPTIVE_OPENROUTER_WAVE_SIZE = 4
+ADAPTIVE_PROGRESS_WIDTH = 20
+
+
+@dataclasses.dataclass
+class AdaptiveStageStats:
+    """Small run-local counter set for one adaptive stage's live summary."""
+    stage: str
+    total: int
+    completed: int = 0
+    first_pass_successes: int = 0
+    budget_retries: int = 0
+    json_repairs: int = 0
+    terminal_failures: int = 0
+    budget_promotions: int = 0
+    starting_ceiling: int = ADAPTIVE_TOKEN_TIERS[0]
+    final_ceiling: int = ADAPTIVE_TOKEN_TIERS[0]
+    completion_tokens: list[int] = dataclasses.field(default_factory=list)
+    reasoning_tokens: list[int] = dataclasses.field(default_factory=list)
+
+
+def _adaptive_percentage(completed, total):
+    """Nearest whole percent without Python's surprising half-even rounding."""
+    return int((100 * completed / total) + 0.5) if total else 100
+
+
+def _adaptive_progress_bar(completed, total, width=ADAPTIVE_PROGRESS_WIDTH):
+    fraction = completed / total if total else 1
+    filled = min(width, int((width * fraction) + 0.5))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _adaptive_wave_label(jobs):
+    ids = [job.id for job in jobs]
+    if len(ids) < 2:
+        return ids[0] if ids else "none"
+    try:
+        numbers = [int(jid[1:]) for jid in ids]
+    except ValueError:
+        return ", ".join(ids)
+    if all(b == a + 1 for a, b in zip(numbers, numbers[1:])):
+        return f"{ids[0]}–{ids[-1]}"
+    return ", ".join(ids)
+
+
+def _print_adaptive_progress(stats):
+    pct = _adaptive_percentage(stats.completed, stats.total)
+    bar = _adaptive_progress_bar(stats.completed, stats.total)
+    print(f"  Stage {stats.stage}  {bar} {stats.completed}/{stats.total} "
+          f"batches ({pct}%)")
+    print(f"  Current ceiling: {_token_tier_label(stats.final_ceiling)}")
+    print(f"  First-pass successes: {stats.first_pass_successes}  ·  "
+          f"Budget retries: {stats.budget_retries}  ·  "
+          f"Repairs: {stats.json_repairs}  ·  Failures: {stats.terminal_failures}")
+
+
+def _token_distribution(values):
+    ordered = sorted(values)
+    p95 = ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+    return min(ordered), statistics.median(ordered), p95, max(ordered)
+
+
+def _format_token_value(value):
+    return f"{value:,.0f}" if float(value).is_integer() else f"{value:,.1f}"
+
+
+def _print_token_distribution(label, values, total):
+    if not values:
+        return
+    low, median, p95, high = _token_distribution(values)
+    coverage = (f" ({len(values)}/{total} batches reported)"
+                if len(values) != total else "")
+    print(f"  {label}:{coverage}")
+    print(f"    min:    {_format_token_value(low)}")
+    print(f"    median: {_format_token_value(median)}")
+    print(f"    p95:    {_format_token_value(p95)}")
+    print(f"    max:    {_format_token_value(high)}")
+
+
+def _print_adaptive_summary(stats):
+    print(f"\n  Stage {stats.stage} complete")
+    print(f"  Batches:              {stats.completed}/{stats.total}")
+    print(f"  First-pass successes: {stats.first_pass_successes}")
+    print(f"  Budget retries:        {stats.budget_retries}")
+    print(f"  JSON repairs:          {stats.json_repairs}")
+    print(f"  Terminal failures:     {stats.terminal_failures}")
+    print(f"  Starting ceiling:      {_token_tier_label(stats.starting_ceiling)}")
+    print(f"  Final ceiling:         {_token_tier_label(stats.final_ceiling)}")
+    print(f"  Budget promotions:     {stats.budget_promotions}")
+    _print_token_distribution("Completion tokens", stats.completion_tokens,
+                              stats.total)
+    _print_token_distribution("Reasoning tokens", stats.reasoning_tokens,
+                              stats.total)
 
 
 def filter_chunk(cfg, args):
@@ -412,31 +508,11 @@ def filter_effort(cfg, args):
             or cfg.get("filter", {}).get("effort") or FILTER_EFFORT)
 
 
-def filter_headroom_threshold(cfg, args):
-    """Configured fraction at which a successful Stage 01 call promotes.
-
-    This is deliberately a Stage 01 project setting rather than a global model
-    option: different stages have different output shapes and economics.
-    """
-    raw = getattr(args, "filter_headroom_threshold", None)
-    if raw is None:
-        raw = cfg.get("filter", {}).get("headroom_threshold")
-    if raw is None:
-        raw = FILTER_HEADROOM_THRESHOLD
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        sys.exit(f"filter.headroom_threshold must be a fraction, got {raw!r}")
-    if not 0 < value < 1:
-        sys.exit("filter.headroom_threshold must be greater than 0 and less than 1")
-    return value
-
-
 def _token_tier_label(tokens):
     return f"{tokens // 1000}k"
 
 
-def _stage01_wave_size(client_):
+def _adaptive_wave_size(client_):
     """OpenRouter can safely keep four calls in flight; Anthropic stays serial.
 
     Anthropic's client method submits its whole argument as one remote Batch API
@@ -447,47 +523,49 @@ def _stage01_wave_size(client_):
     """
     try:
         import openrouter
-        return (FILTER_OPENROUTER_WAVE_SIZE
+        return (ADAPTIVE_OPENROUTER_WAVE_SIZE
                 if isinstance(client_, openrouter.Client) else 1)
     except ImportError:
         return 1
 
 
-def _stage01_validation_error(job, result):
-    """Return why a completed filter reply is not a first-pass success."""
+def _adaptive_validation_error(job, result, key):
+    """Return why a completed adaptive-stage reply is not a success."""
     stop = result.stop_reason or ""
     if stop in NO_RETRY_STOP_REASONS or stop.startswith(("request_error", "batch_")):
         return _failure_reason(result, "provider did not complete the request")
     try:
-        _decode_job_rows(job, result.text, "records")
+        _decode_job_rows(job, result.text, key)
     except (ValueError, TypeError) as e:
         return _failure_reason(result, str(e))
     return None
 
 
-def _run_stage01_adaptive(client_, corpus, preamble, jobs, diagnostics_dir,
-                          headroom_threshold=FILTER_HEADROOM_THRESHOLD,
-                          wave_size=1):
-    """Run Stage 01 with a live, persistent output-token floor.
+def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
+                        stage, key, wave_size=1, stats=None, debug=False):
+    """Run one structured stage with a live, persistent output-token floor.
 
     New work is launched in rolling waves. A wave is wholly in flight before any
     result is inspected, so every member may finish at the old ceiling. At the
-    boundary, an output-budget stop or a valid response above the utilisation
-    threshold promotes the global floor. Budget-exhausted jobs are retried before
-    any never-started job, which lets their next result promote again before more
-    work is launched. Only `length`/`max_tokens` can cause a reactive promotion.
+    boundary, only an output-budget stop promotes the global floor. A successful
+    response never promotes, regardless of utilisation. Budget-exhausted jobs are
+    retried before any never-started job, which lets their next result promote
+    again before more work is launched.
 
     Returns raw results plus the exact Job variant used for each final first-pass
-    response. Shape/provider failures deliberately remain raw so Stage 01's call
-    to `_batch_rows` can use the existing recovery paths without teaching the
+    response. Shape/provider failures deliberately remain raw so the caller's
+    `_batch_rows` call can use existing recovery paths without teaching the
     generic recovery code about this state machine.
     """
     if not jobs:
         return {}, []
     if wave_size < 1:
-        raise ValueError("Stage 01 wave_size must be at least 1")
-    if not 0 < headroom_threshold < 1:
-        raise ValueError("Stage 01 headroom_threshold must be between 0 and 1")
+        raise ValueError(f"Stage {stage} wave_size must be at least 1")
+    stats = stats or AdaptiveStageStats(stage=stage, total=len(jobs))
+    if stats.total != len(jobs):
+        raise ValueError(f"Stage {stage} stats total does not match the job count")
+    if stats.stage != stage:
+        raise ValueError(f"Stage {stage} stats were labelled for Stage {stats.stage}")
 
     tier_index = 0
     pending = list(jobs)
@@ -495,23 +573,28 @@ def _run_stage01_adaptive(client_, corpus, preamble, jobs, diagnostics_dir,
     results = {}
     final_jobs = {}
     attempts = defaultdict(list)
-    start = _token_tier_label(FILTER_TOKEN_TIERS[0])
-    print(f"  Stage 01 starting ceiling: {start} "
-          f"({wave_size}-request rolling waves; proactive promotion above "
-          f"{headroom_threshold:.0%})")
+    start = _token_tier_label(ADAPTIVE_TOKEN_TIERS[0])
+    print(f"  Stage {stage} starting ceiling: {start}")
+    if debug:
+        print(f"  Scheduler: {wave_size}-request rolling waves; promotions require "
+              "finish_reason='length' or 'max_tokens'")
+    _print_adaptive_progress(stats)
 
     while retrying or pending:
+        is_retry_wave = bool(retrying)
         queue = retrying if retrying else pending
         originals = queue[:wave_size]
         del queue[:wave_size]
-        ceiling = FILTER_TOKEN_TIERS[tier_index]
+        ceiling = ADAPTIVE_TOKEN_TIERS[tier_index]
         wave = [dataclasses.replace(job, max_tokens=ceiling) for job in originals]
-        ids = ", ".join(job.id for job in wave)
-        print(f"  Stage 01 wave at {_token_tier_label(ceiling)}: {ids}")
+        print(f"  Current wave: {_adaptive_wave_label(wave)}")
+        if debug:
+            kind = "budget retry" if is_retry_wave else "untouched work"
+            print(f"  Scheduler: launching {kind} at {_token_tier_label(ceiling)}; "
+                  f"{len(retrying)} retry and {len(pending)} untouched queued")
         replies = client_.batch(corpus, preamble, wave)
 
         exhausted = []
-        proactive = []
         for job in wave:
             result = _as_result(replies.get(job.id, ""))
             attempts[job.id].append((job, result))
@@ -520,53 +603,80 @@ def _run_stage01_adaptive(client_, corpus, preamble, jobs, diagnostics_dir,
                 reason = _failure_reason(result, "output budget exhausted")
                 _save_failure(diagnostics_dir, job, result, reason,
                               f"budget_{job.max_tokens}")
-                detail = f" ({result.budget_note})" if result.budget_note else ""
-                print(f"    Batch {job.id}: {label} -> output budget exhausted{detail}")
+                if debug:
+                    print(f"    stop_reason={result.stop_reason!r} · "
+                          f"{result.budget_note or 'usage metadata unavailable'}")
+                    artifact = os.path.join(
+                        diagnostics_dir, f"{job.id}.budget_{job.max_tokens}.txt")
+                    print(f"    diagnostics: {artifact}")
                 exhausted.append(job)
                 continue
 
-            validation_error = _stage01_validation_error(job, result)
+            validation_error = _adaptive_validation_error(job, result, key)
             results[job.id] = result
             final_jobs[job.id] = job
+            stats.completed += 1
             if validation_error:
-                print(f"    Batch {job.id}: {label} -> existing recovery path "
-                      f"({validation_error})")
+                print(f"    ! {job.id}  recovery required  {validation_error}")
+                if debug:
+                    print(f"      stop_reason={result.stop_reason!r}; ceiling={label}")
                 continue
 
+            if len(attempts[job.id]) == 1:
+                stats.first_pass_successes += 1
             usage = result.completion_tokens
             utilisation = usage / job.max_tokens if usage else 0
-            usage_note = (f" ({usage:,}/{job.max_tokens:,}, {utilisation:.2%})"
-                          if usage else "")
-            print(f"    Batch {job.id}: {label} -> success{usage_note}")
-            if (utilisation > headroom_threshold
-                    and tier_index < len(FILTER_TOKEN_TIERS) - 1):
-                proactive.append((job, utilisation))
+            if usage:
+                stats.completion_tokens.append(usage)
+                print(f"    ✓ {job.id}  success  {usage:,}/{job.max_tokens:,} tokens "
+                      f"({utilisation:.2%})")
+            else:
+                print(f"    ✓ {job.id}  success  usage metadata unavailable")
+            if result.reasoning_tokens:
+                stats.reasoning_tokens.append(result.reasoning_tokens)
+            if debug:
+                answer = max(result.completion_tokens - result.reasoning_tokens, 0)
+                print(f"      stop_reason={result.stop_reason!r}; reasoning="
+                      f"{result.reasoning_tokens:,}; answer={answer:,}")
 
-        if exhausted and tier_index == len(FILTER_TOKEN_TIERS) - 1:
+        if exhausted and tier_index == len(ADAPTIVE_TOKEN_TIERS) - 1:
+            stats.terminal_failures += len(exhausted)
             failed = ", ".join(job.id for job in exhausted)
             detail = "; ".join(
                 f"{job.id}: {attempts[job.id][-1][1].budget_note or 'usage not reported'}"
                 for job in exhausted)
+            print(f"\n  STAGE {stage} FAILED")
+            for job in exhausted:
+                print(f"  {job.id} exhausted the maximum 32k ceiling")
+            print(f"  No Stage {stage} output was written.")
+            print(f"  Diagnostics saved to: {diagnostics_dir}")
             raise BatchOutputError(
-                f"Stage 01 hard ceiling exhausted: {failed} reached "
+                f"Stage {stage} hard ceiling exhausted: {failed} reached "
                 f"{_token_tier_label(ceiling)} and still ended for output budget "
                 f"({detail}). Attempts and truncated replies were saved to "
                 f"{diagnostics_dir}. No stage output was written.")
 
-        if exhausted or proactive:
+        if exhausted:
             old = ceiling
             tier_index += 1
-            new = FILTER_TOKEN_TIERS[tier_index]
-            if exhausted:
-                print(f"    Retrying budget-exhausted batches at "
-                      f"{_token_tier_label(new)} before starting new work")
-            if proactive:
-                examples = ", ".join(
-                    f"{job.id} {utilisation:.2%}" for job, utilisation in proactive)
-                print(f"    Proactive promotion: {examples} exceeded "
-                      f"{headroom_threshold:.0%}")
-            print(f"    Promoting remaining batches from {_token_tier_label(old)} "
-                  f"to {_token_tier_label(new)}")
+            new = ADAPTIVE_TOKEN_TIERS[tier_index]
+            stats.budget_promotions += 1
+            stats.final_ceiling = new
+            stats.budget_retries += len(exhausted)
+            print("\n  BUDGET EXHAUSTED")
+            for job in exhausted:
+                print(f"  {job.id} hit {_token_tier_label(old)} before completing "
+                      "the response")
+            print("  Retry:")
+            for job in exhausted:
+                print(f"  {job.id}  {_token_tier_label(old)} → "
+                      f"{_token_tier_label(new)}")
+            print(f"  New floor for untouched batches: {_token_tier_label(new)}")
+            if debug:
+                print("  Scheduler: budget retries are placed ahead of all "
+                      "untouched batches")
+        else:
+            stats.final_ceiling = ceiling
 
         # An exhausted request is always resolved before never-started work. Put
         # the just-failed jobs at the front even if a larger retry wave was
@@ -574,8 +684,24 @@ def _run_stage01_adaptive(client_, corpus, preamble, jobs, diagnostics_dir,
         if exhausted:
             retrying[:0] = exhausted
 
+        _print_adaptive_progress(stats)
+
     ordered_jobs = [final_jobs[job.id] for job in jobs]
     return results, ordered_jobs
+
+
+def _run_stage01_adaptive(client_, corpus, preamble, jobs, diagnostics_dir,
+                          wave_size=1, stats=None, debug=False):
+    return _run_adaptive_stage(
+        client_, corpus, preamble, jobs, diagnostics_dir, stage="01",
+        key="records", wave_size=wave_size, stats=stats, debug=debug)
+
+
+def _run_stage02_adaptive(client_, corpus, preamble, jobs, diagnostics_dir,
+                          wave_size=1, stats=None, debug=False):
+    return _run_adaptive_stage(
+        client_, corpus, preamble, jobs, diagnostics_dir, stage="02",
+        key="groups", wave_size=wave_size, stats=stats, debug=debug)
 
 
 def _json_object(text):
@@ -595,6 +721,120 @@ def _json_object(text):
     if not isinstance(obj, dict):
         raise ValueError("top-level response is not an object")
     return obj
+
+
+def _single_call_result(client_, corpus, preamble, job, operation):
+    """Run one Job without discarding the provider's failure metadata.
+
+    `one()` predates BatchResult and intentionally returns text for the many
+    unstructured synthesis callers. Real clients now expose `one_result()` for
+    structured callers; the fallback keeps small test/dummy clients compatible.
+    """
+    result_call = getattr(client_, "one_result", None)
+    if result_call is not None:
+        return _as_result(result_call(
+            corpus, preamble, job.prompt, job.max_tokens, job.schema,
+            job_id=job.id, operation=operation, effort=job.effort,
+            reasoning_max_tokens=job.reasoning_max_tokens))
+    return _as_result(client_.one(
+        corpus, preamble, job.prompt, job.max_tokens, job.schema))
+
+
+def _single_call_tiers(starting_ceiling):
+    """The current ceiling followed by the shared coarse tiers above it."""
+    return (starting_ceiling,) + tuple(
+        tier for tier in ADAPTIVE_TOKEN_TIERS if tier > starting_ceiling)
+
+
+def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir):
+    """Run one structured Job with failure-aware, bounded recovery.
+
+    Budget stops retry the identical Job at the next coarse ceiling. Refusals,
+    filters and unexplained empty replies fail immediately. A complete but
+    malformed/schema-invalid reply gets one shape-only repair. At no point does
+    an empty budget-starved response reach the JSON parser.
+    """
+    tiers = _single_call_tiers(job.max_tokens)
+    tier_index = 0
+    current = job
+    repairing = False
+
+    while True:
+        operation = ("single_structured_repair" if repairing
+                     else "single_structured")
+        result = _single_call_result(
+            client_, corpus, preamble, current, operation)
+
+        if result.out_of_budget:
+            reason = _failure_reason(result, "output budget exhausted")
+            _save_failure(
+                diagnostics_dir, current, result, reason,
+                f"budget_{current.max_tokens}")
+            if tier_index + 1 >= len(tiers):
+                print(f"\n  STRUCTURED CALL FAILED")
+                print(f"  {job.id} exhausted the maximum "
+                      f"{_token_tier_label(current.max_tokens)} ceiling")
+                print(f"  {result.budget_note or 'Usage metadata unavailable.'}")
+                print(f"  Diagnostics saved to: {diagnostics_dir}")
+                raise BatchOutputError(
+                    f"{job.id} stopped at its output token budget "
+                    f"(finish_reason={result.stop_reason!r}) at "
+                    f"{current.max_tokens:,} tokens; no complete structured "
+                    f"response was produced. Diagnostics: {diagnostics_dir}")
+            old = current.max_tokens
+            tier_index += 1
+            current = dataclasses.replace(current, max_tokens=tiers[tier_index])
+            print(f"\n  OUTPUT BUDGET EXHAUSTED")
+            print(f"  {job.id}: {_token_tier_label(old)} → "
+                  f"{_token_tier_label(current.max_tokens)}")
+            print(f"  {result.budget_note or 'Usage metadata unavailable.'}")
+            print("  Retrying the same structured request with more room")
+            continue
+
+        if result.stop_reason in NO_RETRY_STOP_REASONS:
+            reason = _failure_reason(result, "provider refused the request")
+            _save_failure(diagnostics_dir, current, result, reason, "blocked")
+            raise BatchOutputError(
+                f"{job.id} provider/refusal failure: {reason}. "
+                f"Diagnostics: {diagnostics_dir}")
+
+        if not result.text.strip():
+            reason = _failure_reason(result, "provider returned no content")
+            _save_failure(diagnostics_dir, current, result, reason, "empty")
+            raise BatchOutputError(
+                f"{job.id} provider failure: {reason}. "
+                f"Diagnostics: {diagnostics_dir}")
+
+        try:
+            decoded = _json_object(result.text)
+            issue = _schema_issue(decoded, current.schema) if current.schema else None
+            if issue:
+                raise ValueError(f"schema validation failed: {issue}")
+            return decoded
+        except (ValueError, TypeError) as parse_error:
+            reason = _failure_reason(result, str(parse_error))
+            _save_failure(
+                diagnostics_dir, current, result, reason,
+                "repair" if repairing else "malformed")
+            if repairing:
+                raise BatchOutputError(
+                    f"{job.id} returned malformed/schema-invalid JSON; its "
+                    f"shape-repair response also failed ({reason}). "
+                    f"Diagnostics: {diagnostics_dir}") from parse_error
+
+        repair_prompt = (
+            "RECOVERY TASK: The previous response was complete but could not be "
+            f"consumed because: {reason}.\n\n"
+            "Return JSON only and obey the supplied JSON schema exactly. Preserve "
+            "all substantive candidates, decisions, scores, rationales, IDs and "
+            "criteria already present. This is shape repair, not a chance to "
+            "reconsider the research. Do not add commentary or Markdown.\n\n"
+            "ORIGINAL REQUEST:\n\n" + job.prompt +
+            "\n\nPREVIOUS RESPONSE:\n\n" + result.text)
+        current = dataclasses.replace(current, prompt=repair_prompt)
+        repairing = True
+        print(f"  ! {job.id} returned malformed/schema-invalid JSON; "
+              "running one structured shape repair")
 
 
 def _schema_issue(value, schema, path="$"):
@@ -857,7 +1097,7 @@ def _report_failure_modes(failures, total, key):
 
 
 def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
-                rerun_factor=BUDGET_RETRY_FACTOR):
+                rerun_factor=BUDGET_RETRY_FACTOR, adaptive_stats=None):
     """Decode all jobs, recovering failed responses before failing the stage.
 
     Two failure modes need two different recoveries, and conflating them is what
@@ -936,6 +1176,8 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
         # prompt just pays for a second helping of it.
         fixable = [f for f in failures if f[1].repairable]
         if fixable:
+            if adaptive_stats is not None:
+                adaptive_stats.json_repairs += len(fixable)
             print(f"  ! repairing {len(fixable)} malformed {key} response(s) "
                   "in one additional structured batch")
             repaired = repair([(job, result.text, reason)
@@ -1002,6 +1244,148 @@ BOILER = re.compile(
     r"submission guidelines|weekly thread|link to wiki", re.I)
 
 
+def reddit_source_fields(url):
+    """Return (subreddit, thread_id) for a standard Reddit comments URL."""
+    if not isinstance(url, str) or not url.strip():
+        return None, None
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return None, None
+    if host != "reddit.com" and not host.endswith(".reddit.com"):
+        return None, None
+    parts = [part for part in parsed.path.split("/") if part]
+    if (len(parts) < 4 or parts[0].lower() != "r"
+            or parts[2].lower() != "comments"):
+        return None, None
+    subreddit, thread_id = parts[1].strip(), parts[3].strip()
+    return (subreddit or None), (thread_id or None)
+
+
+def _read_jsonl(path):
+    with open(path, encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def _write_jsonl_atomic(path, rows):
+    """Write stable JSONL without leaving a half-written canonical export."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8", newline="\n") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    os.replace(temporary, path)
+
+
+def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
+    """Deterministically split deduplicated VOC into production and audit files."""
+    voc = paths.voc(cfg["_dir"])
+    input_path = input_path or os.path.join(voc, "deduplicated_voc.jsonl")
+    groups_path = groups_path or os.path.join(voc, "duplicate_groups.jsonl")
+    production_path = os.path.join(voc, PRODUCTION_VOC_FILE)
+    audit_path = os.path.join(voc, AUDIT_VOC_FILE)
+    if not os.path.exists(input_path):
+        raise SystemExit(
+            f"No completed deduplicated VOC at {input_path}. Run ingest first.")
+
+    source_rows = _read_jsonl(input_path)
+    groups = _read_jsonl(groups_path) if os.path.exists(groups_path) else []
+    groups_by_canonical = defaultdict(list)
+    for group in groups:
+        canonical_id = group.get("canonical_id")
+        if canonical_id is not None:
+            groups_by_canonical[canonical_id].append(group)
+
+    production, audit, seen_ids = [], [], set()
+    subreddit_count = thread_count = 0
+    for position, source in enumerate(source_rows, 1):
+        if not isinstance(source, dict):
+            raise ValueError(f"VOC record {position} is not an object")
+        if "id" not in source or "text" not in source:
+            raise ValueError(f"VOC record {position} is missing id or text")
+        if source["id"] in seen_ids:
+            raise ValueError(f"VOC record {position} repeats id={source['id']!r}")
+        seen_ids.add(source["id"])
+        evidence_id = source.get("evidence_id")
+        if evidence_id is not None and evidence_id != source["id"]:
+            raise ValueError(
+                f"VOC record {position} has conflicting id={source['id']!r} "
+                f"and evidence_id={evidence_id!r}")
+        subreddit, thread_id = reddit_source_fields(source.get("url"))
+        subreddit_count += int(subreddit is not None)
+        thread_count += int(thread_id is not None)
+
+        production.append({
+            "id": source["id"],
+            "text": source["text"],
+            "thread_id": thread_id,
+            "subreddit": subreddit,
+        })
+
+        audit_row = {
+            "id": source["id"],
+            "text": source["text"],
+            "url": source.get("url") or None,
+            "title": source.get("title") or None,
+            "thread_id": thread_id,
+            "subreddit": subreddit,
+        }
+        # Keep every upstream audit/decision field except the redundant model
+        # response identifier. Production and audit both use canonical `id`.
+        reserved = {"id", "evidence_id", "text", "url", "title",
+                    "subreddit", "thread_id"}
+        for key, value in source.items():
+            if key not in reserved:
+                audit_row[key] = value
+        if groups_by_canonical.get(source["id"]):
+            # Preserve the exact Stage 02 group objects and field names. The
+            # envelope only associates them with their surviving canonical row.
+            audit_row["dedup_groups"] = groups_by_canonical[source["id"]]
+        audit.append(audit_row)
+
+    _write_jsonl_atomic(production_path, production)
+    _write_jsonl_atomic(audit_path, audit)
+    missing = len(source_rows) - min(subreddit_count, thread_count)
+    summary = {
+        "input": len(source_rows),
+        "production": len(production),
+        "audit": len(audit),
+        "subreddits": subreddit_count,
+        "thread_ids": thread_count,
+        "missing_or_non_reddit": missing,
+        "production_path": production_path,
+        "audit_path": audit_path,
+    }
+    prompt_metrics = voc_prompt_view_metrics(production)
+    summary.update(prompt_metrics)
+    if announce:
+        print("\n  refine-voc (deterministic local export)")
+        print(f"  Input:      {summary['input']:,} deduplicated evidence items")
+        print(f"  Production: {summary['production']:,} records")
+        print(f"    -> {production_path}")
+        print(f"  Audit:      {summary['audit']:,} records")
+        print(f"    -> {audit_path}")
+        print(f"  Subreddit parsed: {subreddit_count:,}")
+        print(f"  Thread IDs parsed: {thread_count:,}")
+        print(f"  Missing/non-Reddit URLs: {missing:,}")
+        print("  Prompt views (OpenRouter planning estimate, ~4 chars/token):")
+        print(f"    Stage 03 before: ~"
+              f"{prompt_metrics['stage03_before_est_tokens']:,} tokens")
+        print(f"    Stage 03 after:  ~{prompt_metrics['stage03_est_tokens']:,} "
+              f"tokens ({prompt_metrics['stage03_reduction_pct']:.1f}% reduction)")
+        print(f"    Stage 04 before: ~"
+              f"{prompt_metrics['stage04_before_est_tokens']:,} tokens")
+        print(f"    Stage 04 after:  ~{prompt_metrics['stage04_est_tokens']:,} "
+              f"tokens ({-prompt_metrics['stage04_reduction_pct']:+.1f}% change)")
+        print("  No model calls made.")
+    return summary
+
+
+def cmd_refine_voc(cfg, _args):
+    refine_voc(cfg)
+
+
 def cmd_ingest(cfg, args):
     """Skills 01 (filter) then 02 (deduplicate).
 
@@ -1066,7 +1450,7 @@ def cmd_ingest(cfg, args):
                         + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
                 # Stage 01 starts generously and learns a persistent floor from
                 # live route behaviour. Only max_tokens changes on promotion.
-                max_tokens=FILTER_TOKEN_TIERS[0], schema=FILTER_SCHEMA,
+                max_tokens=ADAPTIVE_TOKEN_TIERS[0], schema=FILTER_SCHEMA,
                 expected_ids=tuple(r["id"] for r in ch),
                 # Skill 01 is the bouncer at the door: retain or reject, with
                 # reasons drawn from a closed list. It is judgement, but it is
@@ -1084,10 +1468,11 @@ def cmd_ingest(cfg, args):
         return
     c.prewarm(prefix, FILTER_PREAMBLE)
     filter_failures = os.path.join(voc, "_model_failures", "01_filter")
+    filter_stats = AdaptiveStageStats(stage="01", total=len(jobs))
     filter_results, jobs = _run_stage01_adaptive(
         c, prefix, FILTER_PREAMBLE, jobs, filter_failures,
-        headroom_threshold=filter_headroom_threshold(cfg, args),
-        wave_size=_stage01_wave_size(c))
+        wave_size=_adaptive_wave_size(c), stats=filter_stats,
+        debug=getattr(args, "stage01_debug", False))
     records = _batch_rows(
         filter_results, jobs, "records",
         filter_failures,
@@ -1098,8 +1483,9 @@ def cmd_ingest(cfg, args):
         # The adaptive executor has already resolved every output-budget stop.
         # Empty/provider failures retain the existing recovery path but must not
         # promote or widen the ceiling.
-        rerun_factor=1)
+        rerun_factor=1, adaptive_stats=filter_stats)
     _require_exact_ids(records, {r["id"] for r in pre}, "skill 01 filter")
+    _print_adaptive_summary(filter_stats)
     verdicts = {r["evidence_id"]: r for r in records}
 
     retained = [{**r, **verdicts[r["id"]]} for r in pre
@@ -1114,6 +1500,7 @@ def cmd_ingest(cfg, args):
     _, s02 = skill(2)
     DCHUNK = 80
     dchunks = [retained[i:i + DCHUNK] for i in range(0, len(retained), DCHUNK)]
+    stage02_effort = dedup_effort(cfg, args)
     djobs = [Job(id=f"d{n:04d}",
                  prompt=("Apply skill 02 to the records below. Group only genuine "
                          "duplicates — same experience from the same source. Ten "
@@ -1124,21 +1511,35 @@ def cmd_ingest(cfg, args):
                          "empty groups list is a valid answer.\n\n"
                          "RECORDS:\n\n"
                          + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
-                 max_tokens=6000, schema=DEDUP_SCHEMA,
-                 effort=dedup_effort(cfg, args))
+                 # Stage 02 has its own adaptive floor. Its reasoning policy is
+                 # intentionally independent from Stage 01 and remains under
+                 # the client/project/CLI effort setting below.
+                 max_tokens=ADAPTIVE_TOKEN_TIERS[0], schema=DEDUP_SCHEMA,
+                 effort=stage02_effort)
              for n, ch in enumerate(dchunks)]
 
     dprefix = f"{s02}\n\n---\n\n{ctx}"
-    print(f"\n  02 deduplicate: {len(retained):,} records in {len(djobs)} chunks")
+    print(f"\n  02 deduplicate: {len(retained):,} records in {len(djobs)} chunks "
+          f"({ADAPTIVE_TOKEN_TIERS[0]:,} output tokens initially, "
+          f"effort {stage02_effort or 'provider default'})")
     if not confirm(c.estimate(dprefix, PREAMBLE, djobs, batched=True), args.yes):
         return
     c.prewarm(dprefix, PREAMBLE)
+    dedup_failures = os.path.join(voc, "_model_failures", "02_deduplicate")
+    dedup_stats = AdaptiveStageStats(stage="02", total=len(djobs))
+    dedup_results, djobs = _run_stage02_adaptive(
+        c, dprefix, PREAMBLE, djobs, dedup_failures,
+        wave_size=_adaptive_wave_size(c), stats=dedup_stats,
+        debug=getattr(args, "stage02_debug", False))
     drop = set()
     groups = _batch_rows(
-        c.batch(dprefix, PREAMBLE, djobs), djobs, "groups",
-        os.path.join(voc, "_model_failures", "02_deduplicate"),
+        dedup_results, djobs, "groups", dedup_failures,
         repair=lambda failed: _repair_batch(c, dprefix, PREAMBLE, failed, "groups"),
-        rerun=lambda failed, factor: _rerun_batch(c, dprefix, PREAMBLE, failed, factor))
+        rerun=lambda failed, factor: _rerun_batch(c, dprefix, PREAMBLE, failed, factor),
+        # Budget stops have already been retried through the tier state machine.
+        # Other retryable failures keep the existing recovery without widening.
+        rerun_factor=1, adaptive_stats=dedup_stats)
+    _print_adaptive_summary(dedup_stats)
     for g in groups:
         drop.update(i for i in g["duplicate_ids"] if i != g["canonical_id"])
 
@@ -1150,12 +1551,16 @@ def cmd_ingest(cfg, args):
         for g in groups:
             fh.write(json.dumps(g) + "\n")
 
+    # One implementation serves both normal ingest and the manual refine-voc
+    # command. This is local schema projection and URL parsing only.
+    refine_voc(cfg)
+
     types = Counter(g["duplicate_type"] for g in groups)
     print(f"  02 deduplicate: {len(drop):,} merged away "
           + ("(" + " · ".join(f"{k} {v}" for k, v in types.most_common()) + ")"
              if types else ""))
     print(f"\n  {len(deduped):,} deduplicated evidence items -> {voc}/deduplicated_voc.jsonl")
-    print(f"  (also written as filtered_voc.jsonl — the input the segment stage reads)")
+    print("  (legacy rich copy retained as filtered_voc.jsonl)")
 
 
 def _write_jsonl(path, rows):
@@ -1246,9 +1651,80 @@ ASSIGN_SCHEMA = {
 }
 
 
-def _corpus_text(items, limit=None):
+def _stage03_corpus_text(items, limit=None):
+    """Stage 03 view: exactly the stable ID and untouched customer text."""
     rows = items if limit is None else items[:limit]
     return "\n\n".join(f"[{i['id']}] {i['text']}" for i in rows)
+
+
+def _corpus_text(items, limit=None):
+    """Compatibility name for the Stage 03 ID/text formatter."""
+    return _stage03_corpus_text(items, limit)
+
+
+def _validation_corpus_text(items):
+    """Stage 04's source-diversity view, without leaking audit-only fields."""
+    blocks = []
+    for item in items:
+        subreddit = item.get("subreddit")
+        thread_id = item.get("thread_id")
+        if subreddit is None and thread_id is None:
+            subreddit, thread_id = reddit_source_fields(item.get("url"))
+        blocks.append(
+            f"[{item['id']}] [t:{thread_id or '-'}] [r:{subreddit or '-'}] "
+            f"{item['text']}")
+    return "\n\n".join(blocks)
+
+
+def _stage05_evidence_text(items):
+    """Stage 05 view: ID and text only, independent of production metadata."""
+    return _stage03_corpus_text(items)
+
+
+def voc_prompt_view_metrics(items):
+    """Measure the exact formatted strings; token values match CLI estimation."""
+    stage03 = _stage03_corpus_text(items)
+    stage04 = _validation_corpus_text(items)
+    stage03_tokens = max(len(stage03) // 4, 1)
+    stage04_tokens = max(len(stage04) // 4, 1)
+    return {
+        # Before refinement Stage 03 and Stage 04 both used `_corpus_text`,
+        # which is the same ID/text string Stage 03 still uses now.
+        "stage03_before_chars": len(stage03),
+        "stage03_chars": len(stage03),
+        "stage03_before_est_tokens": stage03_tokens,
+        "stage03_est_tokens": stage03_tokens,
+        "stage03_reduction_pct": 0.0,
+        "stage04_before_chars": len(stage03),
+        "stage04_chars": len(stage04),
+        "stage04_before_est_tokens": stage03_tokens,
+        "stage04_est_tokens": stage04_tokens,
+        "stage04_reduction_pct": round(
+            (1 - (len(stage04) / len(stage03))) * 100, 2) if stage03 else 0.0,
+    }
+
+
+def _join_production_audit(production, audit, require_complete=True):
+    """Resolve Stage 06 source records without adding audit data to prompts."""
+    audit_by_id = {item["id"]: item for item in audit}
+    joined, missing, changed = {}, [], []
+    for item in production:
+        rich = audit_by_id.get(item["id"])
+        if rich is None:
+            if require_complete:
+                missing.append(item["id"])
+            joined[item["id"]] = item
+            continue
+        if rich.get("text") != item.get("text"):
+            changed.append(item["id"])
+        joined[item["id"]] = rich
+    if missing:
+        raise ValueError(
+            f"audit VOC is missing {len(missing)} production ID(s)")
+    if changed:
+        raise ValueError(
+            f"production/audit VOC text differs for {len(changed)} ID(s)")
+    return joined
 
 
 def cmd_segment(cfg, args):
@@ -1262,15 +1738,29 @@ def cmd_segment(cfg, args):
     """
     from llm import Job, confirm
 
-    src = (getattr(args, "source", None)
-           or paths.voc(cfg["_dir"], "filtered_voc.jsonl"))
+    requested_source = getattr(args, "source", None)
+    src = requested_source or paths.voc(cfg["_dir"], PRODUCTION_VOC_FILE)
     if not os.path.exists(src):
-        sys.exit(f"No VOC source at {src}. Run: adpipe -p {cfg['name']} ingest <raw.txt>")
-    items = [json.loads(l) for l in open(src, encoding="utf-8")]
-    by_id = {i["id"]: i for i in items}
+        sys.exit(f"No production VOC at {src}. Run: adpipe -p {cfg['name']} "
+                 "refine-voc (or run ingest first).")
+    items = _read_jsonl(src)
     voc = paths.voc(cfg["_dir"]); os.makedirs(voc, exist_ok=True)
+    # Model payloads use the lean source above. Stage 06 joins the rich audit
+    # view locally so titles/URLs remain available without travelling through
+    # Stage 03/04/05 prompts.
+    audit_path = os.path.join(voc, AUDIT_VOC_FILE)
+    if not requested_source and not os.path.exists(audit_path):
+        sys.exit(f"No audit VOC at {audit_path}. Run: adpipe -p {cfg['name']} "
+                 "refine-voc before segmenting.")
+    audit_items = _read_jsonl(audit_path) if os.path.exists(audit_path) else []
+    try:
+        by_id = _join_production_audit(
+            items, audit_items, require_complete=not bool(requested_source))
+    except ValueError as error:
+        sys.exit(f"{error}; run refine-voc again.")
     c = client(cfg, args)
-    corpus = _corpus_text(items)
+    discovery_corpus = _stage03_corpus_text(items)
+    validation_corpus = _validation_corpus_text(items)
     print(f"  {len(items):,} deduplicated evidence items")
 
     # ---------------------------------------------------------------- skill 03
@@ -1288,12 +1778,15 @@ def cmd_segment(cfg, args):
                   "representative_evidence_ids using the [n] numbers shown. "
                   "Use merged_aliases (possibly empty) to record any candidates you "
                   "merged. Never build a segment from a single comment.")
-        if not confirm(c.estimate(corpus, PREAMBLE,
-                                  [Job(id="03", prompt=prompt, max_tokens=16000)]),
+        discover_job = Job(
+            id="03_discover", prompt=prompt, max_tokens=16000,
+            schema=CANDIDATE_SCHEMA)
+        if not confirm(c.estimate(discovery_corpus, PREAMBLE, [discover_job]),
                        args.yes):
             return
-        candidates = json.loads(
-            c.one(corpus, PREAMBLE, prompt, 16000, CANDIDATE_SCHEMA))["candidates"]
+        candidates = _run_single_structured(
+            c, discovery_corpus, PREAMBLE, discover_job,
+            os.path.join(voc, "_model_failures", "03_discover"))["candidates"]
         json.dump(candidates, open(cand_p, "w", encoding="utf-8"), indent=2)
         print(f"  03 discover: {len(candidates)} candidates -> {cand_p}")
 
@@ -1312,12 +1805,15 @@ def cmd_segment(cfg, args):
                   "evidence all traces to a single thread; that is a conversation, "
                   "not an audience. Leave merged_into as \"\" and split_into as [] "
                   "unless the decision is merged or split_required.")
-        if not confirm(c.estimate(corpus, PREAMBLE,
-                                  [Job(id="04", prompt=prompt, max_tokens=12000)]),
+        validation_job = Job(
+            id="04_validate", prompt=prompt, max_tokens=12000,
+            schema=VALIDATION_SCHEMA)
+        if not confirm(c.estimate(validation_corpus, PREAMBLE, [validation_job]),
                        args.yes):
             return
-        decisions = json.loads(
-            c.one(corpus, PREAMBLE, prompt, 12000, VALIDATION_SCHEMA))["decisions"]
+        decisions = _run_single_structured(
+            c, validation_corpus, PREAMBLE, validation_job,
+            os.path.join(voc, "_model_failures", "04_validate"))["decisions"]
         json.dump(decisions, open(val_p, "w", encoding="utf-8"), indent=2)
         tally = Counter(d["status"] for d in decisions)
         print(f"  04 validate: " + " · ".join(f"{k} {v}" for k, v in tally.most_common())
@@ -1364,7 +1860,7 @@ def cmd_segment(cfg, args):
                             "influence the primary choice. Return JSON only as "
                             "{\"assignments\":[...]}, with exactly one object per input "
                             "and the numeric [id] copied to evidence_id.\n\nEVIDENCE:\n\n"
-                            + "\n\n".join(f"[{i['id']}] {i['text']}" for i in ch)),
+                            + _stage05_evidence_text(ch)),
                     max_tokens=16000, schema=ASSIGN_SCHEMA,
                     expected_ids=tuple(i["id"] for i in ch))
                 for n, ch in enumerate(chunks)]
@@ -1444,7 +1940,13 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
             continue
         # Deterministic: score desc, then margin desc, then evidence id asc.
         rs.sort(key=lambda r: (-r["score"], -r["winning_margin"], r["evidence_id"]))
-        threads = {by_id[r["evidence_id"]].get("url", "") for r in rs}
+        threads = {
+            (by_id[r["evidence_id"]].get("thread_id")
+             or by_id[r["evidence_id"]].get("url"))
+            for r in rs
+            if (by_id[r["evidence_id"]].get("thread_id")
+                or by_id[r["evidence_id"]].get("url"))
+        }
         p = os.path.join(ev, f"{s['slug']}.txt")
         with open(p, "w", encoding="utf-8") as fh:
             fh.write(f"{s['name'].upper()}\n{'=' * 72}\n\n")
@@ -1459,7 +1961,8 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
             for r in rs:
                 it = by_id[r["evidence_id"]]
                 fh.write(f"[{r['evidence_id']}] TYPE: comment\n")
-                fh.write(f"TITLE: {it.get('title', '')}\nURL: {it.get('url', '')}\n")
+                fh.write(f"TITLE: {it.get('title') or ''}\n"
+                         f"URL: {it.get('url') or ''}\n")
                 fh.write(f"ASSIGNMENT SCORE: {r['score']}\n")
                 fh.write(f"WINNING MARGIN: {r['winning_margin']}\n")
                 fh.write(f"PRIMARY CUES: {', '.join(r['primary_cues'])}\n")
@@ -1479,7 +1982,8 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
         for r in unassigned:
             it = by_id.get(r["evidence_id"], {})
             fh.write(f"## [{r['evidence_id']}] {r['assignment_status']}\n")
-            fh.write(f"- Rationale: {r['rationale']}\n- URL: {it.get('url', '')}\n\n")
+            fh.write(f"- Rationale: {r['rationale']}\n"
+                     f"- URL: {it.get('url') or ''}\n\n")
             fh.write(f"{it.get('text', '')}\n\n---\n\n")
 
     if missing:
@@ -1630,18 +2134,24 @@ def read_extractions(cfg, segment, *want):
 
 def synth(cfg, args, stage, prompt, dest, max_tokens=16000, schema=None, corpus=None):
     """Run one synthesis stage against the evidence corpus + prior outputs."""
-    from llm import confirm
+    from llm import Job, confirm
     c = client(cfg, args)
     corpus = corpus if corpus is not None else open(
         evidence_path(cfg, args.segment), encoding="utf-8").read()
     if os.path.exists(dest) and not args.force:
         print(f"  {os.path.basename(dest)} exists (--force to redo)")
         return open(dest, encoding="utf-8").read()
-    if not confirm(c.estimate(corpus, PREAMBLE,
-                              [type("J", (), {"prompt": prompt, "max_tokens": max_tokens})()]),
+    job = Job(id=stage, prompt=prompt, max_tokens=max_tokens, schema=schema)
+    if not confirm(c.estimate(corpus, PREAMBLE, [job]),
                    args.yes):
         sys.exit(1)
-    text = c.one(corpus, PREAMBLE, prompt, max_tokens, schema)
+    if schema:
+        decoded = _run_single_structured(
+            c, corpus, PREAMBLE, job,
+            os.path.join(os.path.dirname(dest), "_model_failures", stage))
+        text = json.dumps(decoded, indent=2)
+    else:
+        text = c.one(corpus, PREAMBLE, prompt, max_tokens, schema)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     open(dest, "w", encoding="utf-8").write(text)
     print(f"  -> {dest}   (${c.actual_usd():.2f})")
@@ -2087,13 +2597,23 @@ def main():
     s = common(sub.add_parser("ingest")); s.add_argument("source")
     s.add_argument("--rules-only", action="store_true",
                    help="deterministic pre-pass only; skip skills 01/02 (free)")
-    s.add_argument("--filter-headroom-threshold", type=float,
-                   help="promote Stage 01 after valid usage exceeds this fraction "
-                        "of max_tokens (default: 0.85)")
+    s.add_argument("--stage01-debug", action="store_true",
+                   help="show Stage 01 scheduler ordering, stop reasons, token "
+                        "splits, and diagnostic paths")
+    s.add_argument("--dedup-effort",
+                   choices=["none", "low", "medium", "high", "xhigh", "max"],
+                   help="reasoning effort for Stage 02 only (default: provider setting)")
+    s.add_argument("--stage02-debug", action="store_true",
+                   help="show Stage 02 scheduler ordering, stop reasons, token "
+                        "splits, and diagnostic paths")
     s.set_defaults(fn=cmd_ingest)
+    s = sub.add_parser(
+        "refine-voc",
+        help="regenerate production/audit VOC locally from completed deduplication")
+    s.set_defaults(fn=cmd_refine_voc)
     s = common(sub.add_parser("segment")); s.add_argument("--rediscover", action="store_true")
     s.add_argument("--reassign", action="store_true")
-    s.add_argument("--source", help="VOC file to segment (default: voc/filtered_voc.jsonl)")
+    s.add_argument("--source", help="VOC file to segment (default: voc/production_voc.jsonl)")
     s.set_defaults(fn=cmd_segment)
     s = sub.add_parser("studio", help="open the browser UI"); s.set_defaults(fn=cmd_studio)
     for name, fn in (("extract", cmd_extract), ("picc", cmd_picc), ("concepts", cmd_concepts),

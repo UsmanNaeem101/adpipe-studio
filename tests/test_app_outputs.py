@@ -19,13 +19,14 @@ class AppOutputTests(unittest.TestCase):
         voc = os.path.join(project, "research", "voc")
         os.makedirs(voc)
         for name in (
+                "production_voc.jsonl", "audit_voc.jsonl",
                 "filtered_voc.jsonl", "deduplicated_voc.jsonl",
                 "retained_voc.jsonl", "rejected_voc.jsonl",
                 "duplicate_groups.jsonl", "candidate_segments.json"):
             with open(os.path.join(voc, name), "w", encoding="utf-8") as fh:
                 fh.write("{}\n")
         stamp = 1_700_000_000
-        os.utime(os.path.join(voc, "filtered_voc.jsonl"), (stamp, stamp))
+        os.utime(os.path.join(voc, "production_voc.jsonl"), (stamp, stamp))
         return voc, stamp
 
     def test_segment_picker_lists_only_final_ingest_contract(self):
@@ -34,8 +35,8 @@ class AppOutputTests(unittest.TestCase):
             with mock.patch.object(app, "ROOT", tmp):
                 files = app.segment_voc_files("shoulder")
 
-        self.assertEqual([f["name"] for f in files], ["filtered_voc.jsonl"])
-        self.assertEqual(files[0]["label"], "Final · filtered_voc.jsonl")
+        self.assertEqual([f["name"] for f in files], ["production_voc.jsonl"])
+        self.assertEqual(files[0]["label"], "Final · production_voc.jsonl")
         self.assertEqual(files[0]["mtime"], stamp)
         datetime.datetime.fromisoformat(files[0]["modified_at"])
 
@@ -51,10 +52,11 @@ class AppOutputTests(unittest.TestCase):
         additional = [x for x in ingest if x["role"] == "additional"]
 
         self.assertEqual([os.path.basename(x["path"]) for x in final],
-                         ["filtered_voc.jsonl"])
+                         ["production_voc.jsonl"])
         self.assertCountEqual(
             [os.path.basename(x["path"]) for x in additional],
-            ["retained_voc.jsonl", "rejected_voc.jsonl",
+            ["audit_voc.jsonl", "filtered_voc.jsonl",
+             "retained_voc.jsonl", "rejected_voc.jsonl",
              "deduplicated_voc.jsonl", "duplicate_groups.jsonl"])
         self.assertIn("candidate_segments.json",
                       [os.path.basename(x["path"]) for x in segment])
