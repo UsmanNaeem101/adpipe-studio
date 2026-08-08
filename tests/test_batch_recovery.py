@@ -15,6 +15,7 @@ Three things must hold to keep that from recurring:
   a reply that is merely the wrong shape is still repaired rather than re-run.
 """
 
+import dataclasses
 import io
 import json
 import os
@@ -473,10 +474,14 @@ class IngestStage01Tests(unittest.TestCase):
         self.assertEqual(len(filter_budgets), 2)
         first, rerun = filter_budgets
         self.assertEqual(rerun, first * cli.BUDGET_RETRY_FACTOR)
-        # Sized off the schema, not picked round: 2 records of verdict plus the
-        # reasoning reserve, well under the old flat 8000.
-        self.assertEqual(first, cli._record_max_tokens(2, 40))
-        self.assertLess(first, 8000)
+        # The first request out is the calibration probe, so its ceiling is the
+        # sized budget widened deliberately — an unused ceiling is not billed,
+        # and sizing 83 chunks from an unmeasured guess is what failed before.
+        self.assertEqual(first,
+                         cli._record_max_tokens(2, 40) * cli.CALIBRATION_CEILING)
+        # The budget the stage computes is still schema-derived and modest; only
+        # the probe is widened.
+        self.assertLess(cli._record_max_tokens(2, 40), 8000)
         # The starved original is still on disk, with its cause spelled out, and
         # no repair pass was ever needed.
         self.assertEqual(sorted(saved), ["f0000.original.txt", "f0000.rerun.txt"])
@@ -518,6 +523,214 @@ class SharedBudgetVocabularyTests(unittest.TestCase):
                                                    "finish_reason": stop}]}):
                     presets._post_text("openrouter", {"openrouter": "k"}, "m",
                                        "sys", "prompt", 100, 30, "label")
+
+
+class RecoveryCarriesReasoningSettingsTests(unittest.TestCase):
+    """A recovery request must be the SAME request, only roomier.
+
+    Both recovery paths rebuilt their Job without `effort` or
+    `reasoning_max_tokens`, so every retry silently fell back to the client
+    default. A stage configured for `low` with a 2,000-token reasoning ceiling
+    re-ran at `reasoning: {"effort": "high"}` with no ceiling at all — the run
+    that produced this test escalated reasoning on 77 requests that had failed
+    *because of* reasoning, and spent the widened budget thinking again.
+    """
+
+    def failing_job(self, **over):
+        kw = dict(id="f0000", prompt="classify these", max_tokens=5060,
+                  schema=cli.FILTER_SCHEMA, expected_ids=(1,),
+                  effort="low", reasoning_max_tokens=2000)
+        kw.update(over)
+        return llm.Job(**kw)
+
+    def capture(self, fn):
+        seen = {}
+
+        class Client:
+            def batch(_self, _corpus, _preamble, jobs):
+                seen["jobs"] = jobs
+                return {j.id: llm.BatchResult('{"records":[]}', "stop") for j in jobs}
+
+        fn(Client())
+        return seen["jobs"]
+
+    def test_rerun_keeps_the_stage_reasoning_settings(self):
+        job = self.failing_job()
+        result = llm.BatchResult("", "length")
+        sent = self.capture(lambda c: cli._rerun_batch(
+            c, "corpus", "preamble", [(job, result, "budget")], 3))
+        self.assertEqual(sent[0].effort, "low")
+        self.assertEqual(sent[0].reasoning_max_tokens, 2000)
+
+    def test_rerun_widens_only_the_total_budget(self):
+        job = self.failing_job()
+        sent = self.capture(lambda c: cli._rerun_batch(
+            c, "corpus", "preamble",
+            [(job, llm.BatchResult("", "length"), "budget")], 3))
+        self.assertEqual(sent[0].max_tokens, 5060 * 3)
+
+    def test_rerun_sizes_from_the_observed_spend_when_it_is_larger(self):
+        """A reply that stopped at its ceiling proves the ceiling was too low,
+        never by how much — so believe the meter over the arithmetic."""
+        job = self.failing_job(max_tokens=5060)
+        result = llm.BatchResult("", "length", reasoning_tokens=9000,
+                                 completion_tokens=9000)
+        sent = self.capture(lambda c: cli._rerun_batch(
+            c, "corpus", "preamble", [(job, result, "budget")], 3))
+        self.assertEqual(sent[0].max_tokens, 27000)
+
+    def test_recovery_carries_every_job_field_it_does_not_change(self):
+        """The guard against this bug returning in a new field's costume.
+
+        The rebuild listed fields by hand, so a field it forgot was silently
+        dropped rather than flagged. Recovery now derives the job with
+        dataclasses.replace: anything added to Job travels by default, and this
+        fails if some site goes back to naming fields one at a time.
+        """
+        job = self.failing_job()
+        changed = {"max_tokens", "prompt"}
+        for fn, args in (
+                (cli._rerun_batch, ([(job, llm.BatchResult("", "length"), "b")], 3)),
+                (cli._repair_batch, ([(job, "half json", "malformed")], "records"))):
+            sent = self.capture(
+                lambda c, f=fn, a=args: f(c, "corpus", "preamble", *a))[0]
+            for field in dataclasses.fields(llm.Job):
+                if field.name not in changed:
+                    self.assertEqual(
+                        getattr(sent, field.name), getattr(job, field.name),
+                        f"{fn.__name__} dropped Job.{field.name}")
+
+    def test_repair_keeps_the_stage_reasoning_settings(self):
+        job = self.failing_job()
+        sent = self.capture(lambda c: cli._repair_batch(
+            c, "corpus", "preamble", [(job, "half a json", "malformed")],
+            "records"))
+        self.assertEqual(sent[0].effort, "low")
+        self.assertEqual(sent[0].reasoning_max_tokens, 2000)
+
+
+class CalibrationTests(unittest.TestCase):
+    """Size the stage from one measured request, not from an assumption.
+
+    `reasoning.max_tokens` is a request, not a guarantee. The failing run sent
+    a 2,000-token ceiling on every chunk, sized all 83 budgets on the assumption
+    it would be honoured, and had no way to notice that it wasn't.
+    """
+
+    def jobs(self, n, max_tokens=5060):
+        return [llm.Job(id=f"f{i:04d}", prompt=f"chunk {i}", max_tokens=max_tokens,
+                        schema=cli.FILTER_SCHEMA, expected_ids=(i,),
+                        effort="low", reasoning_max_tokens=2000)
+                for i in range(n)]
+
+    class Client:
+        def __init__(self, reply):
+            self.reply, self.calls = reply, []
+
+        def batch(self, _corpus, _preamble, jobs):
+            self.calls.append(jobs)
+            return {j.id: self.reply(j) for j in jobs}
+
+    def calibrate(self, jobs, reply):
+        client = self.Client(reply)
+        results, sized = cli._calibrate_budget(client, "corpus", "pre", jobs, "01")
+        return client, results, sized
+
+    def test_probe_goes_out_with_a_widened_ceiling(self):
+        client, _r, _j = self.calibrate(
+            self.jobs(3),
+            lambda j: llm.BatchResult('{"records":[]}', "stop", 1500, 3000))
+        self.assertEqual(len(client.calls[0]), 1)
+        self.assertEqual(client.calls[0][0].max_tokens,
+                         5060 * cli.CALIBRATION_CEILING)
+
+    def test_probe_keeps_the_stage_reasoning_settings(self):
+        client, _r, _j = self.calibrate(
+            self.jobs(2),
+            lambda j: llm.BatchResult('{"records":[]}', "stop", 1500, 3000))
+        self.assertEqual(client.calls[0][0].effort, "low")
+        self.assertEqual(client.calls[0][0].reasoning_max_tokens, 2000)
+
+    def test_remaining_chunks_are_sized_from_the_measurement(self):
+        client, _r, _j = self.calibrate(
+            self.jobs(3),
+            lambda j: llm.BatchResult('{"records":[]}', "stop", 1500, 4000))
+        rest = client.calls[1]
+        self.assertEqual(len(rest), 2)
+        self.assertEqual(rest[0].max_tokens,
+                         int(4000 * cli.CALIBRATION_MARGIN))
+
+    def test_a_measured_overrun_raises_the_budget_above_the_computed_one(self):
+        """The failing run in miniature: the route ignores the 2,000-token
+        ceiling and spends 9,000. The remaining chunks must be sized for what
+        the route does, not for what it was asked to do."""
+        client, _r, _j = self.calibrate(
+            self.jobs(3),
+            lambda j: llm.BatchResult('{"records":[]}', "stop", 9000, 11000))
+        self.assertGreater(client.calls[1][0].max_tokens, 5060)
+
+    def test_measurement_never_shrinks_the_computed_budget(self):
+        client, _r, _j = self.calibrate(
+            self.jobs(3),
+            lambda j: llm.BatchResult('{"records":[]}', "stop", 10, 20))
+        self.assertEqual(client.calls[1][0].max_tokens, 5060)
+
+    def test_probe_result_is_reused_rather_than_paid_for_twice(self):
+        client, results, _j = self.calibrate(
+            self.jobs(3),
+            lambda j: llm.BatchResult('{"records":[]}', "stop", 100, 200))
+        self.assertIn("f0000", results)
+        self.assertEqual(len(client.calls), 2)
+        self.assertNotIn("f0000", [j.id for j in client.calls[1]])
+
+    def test_missing_usage_keeps_the_headroom_rather_than_the_guess(self):
+        """No measurement means no grounds for a tight budget."""
+        client, _r, _j = self.calibrate(
+            self.jobs(3), lambda j: llm.BatchResult('{"records":[]}', "stop"))
+        self.assertEqual(client.calls[1][0].max_tokens,
+                         5060 * cli.CALIBRATION_CEILING)
+
+    def test_single_chunk_stage_still_returns_its_result(self):
+        _c, results, jobs = self.calibrate(
+            self.jobs(1), lambda j: llm.BatchResult('{"records":[]}', "stop", 1, 2))
+        self.assertEqual(list(results), ["f0000"])
+        self.assertEqual(len(jobs), 1)
+
+    def test_empty_stage_is_a_no_op(self):
+        client = self.Client(lambda j: llm.BatchResult())
+        results, jobs = cli._calibrate_budget(client, "c", "p", [], "01")
+        self.assertEqual((results, jobs), ({}, []))
+        self.assertEqual(client.calls, [])
+
+
+class BudgetVisibilityTests(unittest.TestCase):
+    """You cannot fix a budget you cannot see being spent.
+
+    BatchResult carried only text and a stop reason, so a run could not tell
+    "ran out of room" from "reasoned instead of answering" — the two are the
+    same stop reason and completely different problems.
+    """
+
+    def test_budget_note_splits_reasoning_from_answer(self):
+        note = llm.BatchResult("x", "length", 4800, 5060).budget_note
+        self.assertIn("4,800 reasoning", note)
+        self.assertIn("260 answer", note)
+
+    def test_budget_note_is_empty_when_usage_is_unreported(self):
+        self.assertEqual(llm.BatchResult("x", "length").budget_note, "")
+
+    def test_saved_failure_records_what_was_asked_and_what_was_spent(self):
+        job = llm.Job("f0000", "p", max_tokens=5060, effort="low",
+                      reasoning_max_tokens=2000)
+        result = llm.BatchResult("", "length", 5060, 5060)
+        with tempfile.TemporaryDirectory() as tmp:
+            cli._save_failure(tmp, job, result, "budget", "original")
+            with open(os.path.join(tmp, "f0000.original.txt"),
+                      encoding="utf-8") as fh:
+                saved = fh.read()
+        self.assertIn("REASONING ASKED: 2000", saved)
+        self.assertIn("effort low", saved)
+        self.assertIn("5,060 reasoning", saved)
 
 
 if __name__ == "__main__":

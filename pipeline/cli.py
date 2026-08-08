@@ -19,6 +19,7 @@ skip the prompt. -p/--project selects the project (default: montisella).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime
 import hashlib
 import json
@@ -415,6 +416,73 @@ def _record_max_tokens(chunk, per_record_tokens, reserve=REASONING_RESERVE):
     return int((chunk * per_record_tokens + reserve) * 1.15)
 
 
+# The probe's ceiling, as a multiple of the computed budget, and the margin held
+# over the spend it measures. A ceiling is not a purchase — providers bill tokens
+# generated, not tokens allowed — so a generous probe ceiling costs nothing and a
+# tight one costs the stage.
+CALIBRATION_CEILING = 4
+CALIBRATION_MARGIN = 1.4
+
+
+def _calibrate_budget(client_, corpus, preamble, jobs, label):
+    """Measure one real request, then size the rest of the stage from it.
+
+    `max_tokens` caps reasoning and answer together, so a batch's budget is only
+    safe if you know what the route spends reasoning — and you cannot know that
+    from the request. `reasoning.max_tokens` is a request, not a guarantee: this
+    pipeline sized 83 chunks at 5,060 tokens on the assumption a 2,000-token
+    ceiling would be honoured, and 77 of them came back unfinished.
+
+    So measure instead of assuming. One chunk goes out with a deliberately
+    generous ceiling, and every remaining chunk is sized from what it actually
+    spent. The probe is a chunk that had to be judged anyway, an unused ceiling is
+    free, and the cost of being wrong drops from 77 re-runs to one request.
+
+    Returns (results, jobs) with the probe's reply already in `results` and every
+    other job resized, so nothing is paid for twice.
+    """
+    if not jobs:
+        return {}, jobs
+    probe = jobs[0]
+    ceiling = probe.max_tokens * CALIBRATION_CEILING
+    print(f"  calibrating {label} on 1 of {len(jobs)} chunks "
+          f"(ceiling {ceiling:,} tokens — you are billed for what is generated, "
+          f"not for what is allowed)")
+    first = dataclasses.replace(probe, max_tokens=ceiling)
+    results = client_.batch(corpus, preamble, [first])
+    measured = _as_result(results.get(probe.id, ""))
+
+    if not measured.completion_tokens:
+        # No usage reported. Keep the generous ceiling rather than falling back to
+        # the budget that has already failed: without a measurement, headroom is
+        # the only defence left.
+        print(f"  ! {label}: the route reported no token usage — keeping the "
+              f"{ceiling:,}-token ceiling instead of the computed budget")
+        sized = ceiling
+    else:
+        sized = max(int(measured.completion_tokens * CALIBRATION_MARGIN),
+                    probe.max_tokens)
+        asked = probe.reasoning_max_tokens
+        note = ""
+        if asked and measured.reasoning_tokens > asked:
+            # The exact assumption that broke the last run, now stated out loud
+            # the moment it is observed instead of inferred from the wreckage.
+            note = (f" — the route IGNORED the {asked:,}-token reasoning ceiling "
+                    f"it was sent")
+        print(f"  {label}: measured {measured.budget_note or 'nothing'}"
+              f"{note}; sizing the remaining {len(jobs) - 1} chunks at "
+              f"{sized:,} tokens")
+        if measured.out_of_budget:
+            print(f"  ! {label}: even the calibration ceiling was exhausted — "
+                  f"reduce the chunk size or set \"filter\": {{\"effort\": \"none\"}} "
+                  f"in project.json")
+
+    jobs = [first] + [dataclasses.replace(j, max_tokens=sized) for j in jobs[1:]]
+    if len(jobs) > 1:
+        results.update(client_.batch(corpus, preamble, jobs[1:]))
+    return results, jobs
+
+
 def _json_object(text):
     """Read a JSON object out of a model reply.
 
@@ -575,6 +643,9 @@ def _save_failure(diagnostics_dir, job, result, reason, suffix):
         fh.write(f"WHY SAVED: {reason}\n"
                  f"STOP REASON: {result.stop_reason or 'unknown'}\n"
                  f"MAX TOKENS: {job.max_tokens}\n"
+                 f"REASONING ASKED: {job.reasoning_max_tokens or 'uncapped'}"
+                 f" (effort {job.effort or 'client default'})\n"
+                 f"BUDGET SPENT: {result.budget_note or 'not reported'}\n"
                  f"RESPONSE CHARS: {len(result.text)}\n\n{result.text}")
 
 
@@ -585,13 +656,24 @@ def _rerun_batch(client_, corpus, preamble, failures, factor):
     output worth repairing, and the repair prompt is strictly LONGER than the
     request that already exhausted the budget — so repairing a budget failure at
     the same budget is close to guaranteed to fail the same way.
-    """
-    from llm import Job
 
-    jobs = [Job(id=job.id, prompt=job.prompt,
-                max_tokens=job.max_tokens * factor, schema=job.schema,
-                expected_ids=job.expected_ids)
-            for job, _result, _reason in failures]
+    A re-run is the SAME request with more room, so it is derived from the job
+    rather than rebuilt from its parts. Listing the fields by hand is what broke
+    this: the rebuild named prompt, budget, schema and ids but not `effort` or
+    `reasoning_max_tokens`, so every recovery request fell back to the client
+    default and a stage pinned to a 2,000-token reasoning ceiling re-ran at
+    `reasoning: {"effort": "high"}` with no ceiling — escalating reasoning on
+    requests that had failed because of reasoning, and spending the wider budget
+    on thinking rather than answering. `replace` carries every field the caller
+    does not explicitly change, including ones added later.
+    """
+    jobs = []
+    for job, result, _reason in failures:
+        # Prefer the observed spend over a multiple of a budget already known to
+        # be wrong: a reply that stopped at its ceiling proves only that the
+        # ceiling was too low, never by how much.
+        budget = max(job.max_tokens * factor, result.completion_tokens * factor)
+        jobs.append(dataclasses.replace(job, max_tokens=int(budget)))
     return client_.batch(corpus, preamble, jobs)
 
 
@@ -615,8 +697,10 @@ def _repair_batch(client_, corpus, preamble, failures, key):
             f"{key!r}. Do not add commentary or Markdown.\n\n"
             "ORIGINAL REQUEST:\n\n" + job.prompt +
             "\n\nPREVIOUS RESPONSE:\n\n" + prior)
-        jobs.append(Job(id=job.id, prompt=prompt, max_tokens=job.max_tokens,
-                        schema=job.schema, expected_ids=job.expected_ids))
+        # Derived from the original for the same reason as the re-run: a repair
+        # that silently reasons at the client default is a different request
+        # from the one being repaired, and a more expensive one.
+        jobs.append(dataclasses.replace(job, prompt=prompt))
     return client_.batch(corpus, preamble, jobs)
 
 
@@ -856,8 +940,10 @@ def cmd_ingest(cfg, args):
     if not confirm(c.estimate(prefix, FILTER_PREAMBLE, jobs, batched=True), args.yes):
         return
     c.prewarm(prefix, FILTER_PREAMBLE)
+    filter_results, jobs = _calibrate_budget(c, prefix, FILTER_PREAMBLE, jobs,
+                                             "01 filter")
     records = _batch_rows(
-        c.batch(prefix, FILTER_PREAMBLE, jobs), jobs, "records",
+        filter_results, jobs, "records",
         os.path.join(voc, "_model_failures", "01_filter"),
         repair=lambda failed: _repair_batch(
             c, prefix, FILTER_PREAMBLE, failed, "records"),

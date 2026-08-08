@@ -63,8 +63,14 @@ class BudgetSizingTests(unittest.TestCase):
                 pass
 
             def batch(self, _corpus, _preamble, jobs):
-                captured.setdefault("jobs", jobs)
-                raise SystemExit("stop after capture")
+                raise AssertionError("calibration should intercept before this")
+
+        def capture(_client, _corpus, _preamble, jobs, _label):
+            # Intercept at calibration rather than at the first batch call: the
+            # first call is now the calibration probe, which carries a
+            # deliberately widened ceiling and so is not the job as constructed.
+            captured["jobs"] = jobs
+            raise SystemExit("stop after capture")
 
         from types import SimpleNamespace
         text = ("My shoulder aches every single night and the pillow goes flat "
@@ -78,6 +84,7 @@ class BudgetSizingTests(unittest.TestCase):
                    "product": "pillow", "market": "shoulders"}
             args = SimpleNamespace(source=src, rules_only=False, yes=True)
             with mock.patch.object(cli, "client", return_value=Client()), \
+                    mock.patch.object(cli, "_calibrate_budget", capture), \
                     mock.patch.object(llm, "confirm", return_value=True):
                 try:
                     cli.cmd_ingest(cfg, args)

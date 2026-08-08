@@ -88,6 +88,23 @@ class BatchResult:
     """
     text: str = ""
     stop_reason: str | None = None
+    # How the output budget was actually spent. `max_tokens` caps reasoning and
+    # answer together, so "ran out of room" and "reasoned instead of answering"
+    # are the same stop reason and different problems — and only these numbers
+    # tell them apart. Without them the last fix rested on an assumption that
+    # could not be checked: that the provider honoured the reasoning ceiling it
+    # was sent. It did not, and nothing in the run said so.
+    reasoning_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def budget_note(self) -> str:
+        """One phrase describing where the budget went, or "" if not reported."""
+        if not self.completion_tokens and not self.reasoning_tokens:
+            return ""
+        answer = max(self.completion_tokens - self.reasoning_tokens, 0)
+        return (f"{self.completion_tokens:,} completion tokens "
+                f"({self.reasoning_tokens:,} reasoning, {answer:,} answer)")
 
     @property
     def out_of_budget(self) -> bool:
@@ -374,7 +391,12 @@ class Client:
                     # Record the reply either way, refusal included. Dropping it
                     # here would leave the caller unable to tell a refusal from a
                     # request that never came back, and it would retry the refusal.
-                    out[res.custom_id] = BatchResult(text, m.stop_reason)
+                    out[res.custom_id] = BatchResult(
+                        text, m.stop_reason,
+                        # Anthropic bills thinking inside output_tokens too, and
+                        # reports it separately only when it is asked for.
+                        getattr(m.usage, "thinking_tokens", 0) or 0,
+                        getattr(m.usage, "output_tokens", 0) or 0)
                 else:
                     detail = getattr(
                         getattr(res.result, "error", None), "type", res.result.type)

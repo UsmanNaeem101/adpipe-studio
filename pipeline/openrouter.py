@@ -104,6 +104,15 @@ class Client:
               job_id=None, operation="completion", effort=None,
               send_reasoning=True, reasoning_max_tokens=None):
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens}
+        # ONE reasoning policy, three mutually exclusive wire shapes, chosen by
+        # precedence from the job's settings. Because the shape is selected here
+        # rather than declared by the caller, a caller that loses `effort` and
+        # `reasoning_max_tokens` does not get an error — it silently falls
+        # through to `self.effort` and gets a DIFFERENT policy. That is exactly
+        # what a hand-rebuilt recovery Job did: a stage pinned to a 2,000-token
+        # ceiling re-ran at {"effort": "high"} with no ceiling at all. Job is a
+        # dataclass and every rebuild now goes through dataclasses.replace, so
+        # the settings travel with the job instead of being re-specified.
         want = (effort or self.effort or "").lower()
         reasoning = None
         if want == "none":
@@ -149,9 +158,10 @@ class Client:
                 # answer, so it is the number that decides whether a budget is
                 # survivable — and it was invisible here. Providers report it as
                 # completion_tokens_details.reasoning_tokens; some flatten it.
-                self.spent["reasoning"] += (
+                reasoned = (
                     (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
                     or u.get("reasoning_tokens") or 0)
+                self.spent["reasoning"] += reasoned
                 # Tolerate a reply with no choices at all rather than raising an
                 # IndexError: an empty response is a failure mode the caller can
                 # classify and re-run, a traceback is one it can only abort on.
@@ -160,12 +170,18 @@ class Client:
                 finish = choice.get("finish_reason")
                 audit.response(payload, text=content, usage=u,
                                finish_reason=finish)
-                if not content.strip() and finish == "length" and self.verbose:
+                result = BatchResult(content, finish, reasoned,
+                                     u.get("completion_tokens", 0))
+                if finish == "length" and self.verbose:
                     # Reasoning models spend max_tokens on reasoning first, so
-                    # the budget can be gone before a single JSON byte is written.
-                    print(f"  ! {job_id or 'request'}: hit the {max_tokens}-token "
-                          f"output budget before writing any content")
-                return BatchResult(content, finish)
+                    # the budget can be gone before a single JSON byte is
+                    # written. Report the split, not just the fact: "hit the
+                    # budget" was printed for empty replies only, so a run whose
+                    # replies were truncated mid-JSON said nothing at all until
+                    # the totals came in 83 requests later.
+                    print(f"  ! {job_id or 'request'}: hit the {max_tokens:,}-token "
+                          f"output budget — {result.budget_note or 'no usage reported'}")
+                return result
             except urllib.error.HTTPError as e:
                 detail_full = e.read().decode("utf-8", "replace")
                 detail = detail_full[:400]
