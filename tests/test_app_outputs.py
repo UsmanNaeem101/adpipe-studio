@@ -25,7 +25,10 @@ class AppOutputTests(unittest.TestCase):
                 "retained_voc.jsonl", "rejected_voc.jsonl",
                 "duplicate_groups.jsonl", "candidate_segments.json"):
             with open(os.path.join(voc, name), "w", encoding="utf-8") as fh:
-                fh.write("{}\n")
+                if name.endswith(".jsonl") and name != "duplicate_groups.jsonl":
+                    fh.write('{"id":"e1","text":"customer voice"}\n')
+                else:
+                    fh.write("{}\n")
         stamp = 1_700_000_000
         os.utime(os.path.join(voc, "production_voc.jsonl"), (stamp, stamp))
         return voc, stamp
@@ -40,6 +43,17 @@ class AppOutputTests(unittest.TestCase):
         self.assertEqual(files[0]["label"], "Final · production_voc.jsonl")
         self.assertEqual(files[0]["mtime"], stamp)
         datetime.datetime.fromisoformat(files[0]["modified_at"])
+
+    def test_refine_picker_lists_record_jsonl_and_recommends_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make_project(tmp)
+            with mock.patch.object(app, "ROOT", tmp):
+                files = app.refine_voc_files("shoulder")
+
+        self.assertEqual(files[0]["name"], "deduplicated_voc.jsonl")
+        self.assertTrue(files[0]["recommended"])
+        self.assertIn("Recommended", files[0]["label"])
+        self.assertNotIn("duplicate_groups.jsonl", [row["name"] for row in files])
 
     def test_outputs_classify_ingest_final_and_additional_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -138,12 +152,30 @@ class AppOutputTests(unittest.TestCase):
                 "force": True,
                 "provider": "openrouter",
                 "model": "example/model",
+                "refine_source": "/tmp/chosen.jsonl",
             })
 
+        self.assertFalse(popen.called)
+        self.assertIn("not a refinable file", handler.wfile.getvalue().decode())
+
+    def test_refine_voc_passes_selected_project_file_to_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            voc, _stamp = self.make_project(tmp)
+            chosen = os.path.join(voc, "deduplicated_voc.jsonl")
+            handler = object.__new__(app.Handler)
+            handler.send_response = mock.Mock()
+            handler.send_header = mock.Mock()
+            handler.end_headers = mock.Mock()
+            handler.wfile = io.BytesIO()
+            proc = mock.Mock(stdout=[], returncode=0)
+
+            with mock.patch.object(app, "ROOT", tmp), \
+                    mock.patch.object(app.subprocess, "Popen", return_value=proc) as popen:
+                handler._run({"stage": "refine-voc", "project": "shoulder",
+                              "refine_source": chosen})
+
         cmd = popen.call_args.args[0]
-        self.assertIn("refine-voc", cmd)
-        self.assertIn("--force", cmd)
-        self.assertIn("--provider", cmd)
+        self.assertEqual(cmd[cmd.index("--source") + 1], os.path.realpath(chosen))
         self.assertNotIn("No segment selected", handler.wfile.getvalue().decode())
 
 

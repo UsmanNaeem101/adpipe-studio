@@ -613,6 +613,41 @@ def segment_voc_files(project):
     return files
 
 
+def refine_voc_files(project):
+    """Project-owned JSONL inputs whose records have the refinement contract."""
+    if project not in projects():
+        return []
+    voc_dir = paths.voc(os.path.join(ROOT, "projects", project))
+    if not os.path.isdir(voc_dir):
+        return []
+    files = []
+    for base, _dirs, names in os.walk(voc_dir):
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(base, name)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    first = next((json.loads(line) for line in fh if line.strip()), None)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(first, dict) or not {"id", "text"} <= set(first):
+                continue
+            stat = os.stat(path)
+            rel = os.path.relpath(path, voc_dir)
+            recommended = rel == "deduplicated_voc.jsonl"
+            files.append({
+                "name": rel,
+                "label": ("Recommended" if recommended else "Available") + f" · {rel}",
+                "path": path,
+                "mtime": stat.st_mtime,
+                "modified_at": datetime.datetime.fromtimestamp(
+                    stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+                "recommended": recommended,
+            })
+    return sorted(files, key=lambda row: (not row["recommended"], row["name"]))
+
+
 DIMCACHE = os.path.join(ROOT, ".cache", "dims.json")
 _dims_mem = None
 
@@ -1399,6 +1434,16 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
       </select>
       <p class=hint>Only completed, segment-ready ingest files are shown. Audit and
         intermediate files remain available on the Outputs tab.</p>
+    </div>
+    <div id=refinevocbox class="hide" style="margin-top:16px">
+      <label>VOC file to refine</label>
+      <select id=refinevoc style="width:100%">
+        <option value="">Loading refinable VOC files…</option>
+      </select>
+      <p class=hint>Choose a project JSONL containing <code>id</code> and
+        <code>text</code>. The recommended input is the Stage 02 deduplicated file;
+        refinement rewrites <code>production_voc.jsonl</code> and
+        <code>audit_voc.jsonl</code>.</p>
     </div>
     <div id=opt_model style="margin-top:16px">
       <div class=row>
@@ -2675,6 +2720,9 @@ const STAGES=__STAGES__;
       const showSeg = s.name==='segment';
       $('#segvocbox').classList.toggle('hide',!showSeg);
       if(showSeg) loadVocFiles();
+      const showRefine = s.name==='refine-voc';
+      $('#refinevocbox').classList.toggle('hide',!showRefine);
+      if(showRefine) loadRefineVocFiles();
       const wantsProduct = ['picc','concepts','brief','run'].includes(s.name);
       $('#prodwrap').classList.toggle('hide',!wantsProduct);
       showOpts(s.name);
@@ -2694,6 +2742,7 @@ async function loadSegs(){
     :'<option value="">— none yet —</option>';
   $('#seg').onchange=loadPiccs;
   if(stage&&stage.name==='segment')loadVocFiles();
+  if(stage&&stage.name==='refine-voc')loadRefineVocFiles();
   loadPiccs();
   loadProds();
 }
@@ -2758,6 +2807,24 @@ async function loadVocFiles(){
     if(was&&[...s.options].some(o=>o.value===was))s.value=was;
   }catch(e){s.innerHTML='<option value="">Could not load final ingest file</option>';}
 }
+async function loadRefineVocFiles(){
+  const pr=$('#proj').value; if(!pr)return;
+  const s=$('#refinevoc'); const was=s.value;
+  s.innerHTML='<option value="">Loading refinable VOC files…</option>'; s.disabled=true;
+  try{
+    const j=await (await fetch('/refine-voc-files?project='+encodeURIComponent(pr))).json();
+    const files=j.files||[]; s.innerHTML='';
+    if(!files.length){
+      s.innerHTML='<option value="">No refinable VOC JSONL — run ingest first</option>';
+      return;
+    }
+    files.forEach(f=>{const o=document.createElement('option');
+      const when=new Date(f.mtime*1000).toLocaleString([],{dateStyle:'medium',timeStyle:'short'});
+      o.value=f.path; o.textContent=`${f.label} — ${when}`; s.appendChild(o);});
+    s.disabled=false;
+    if(was&&[...s.options].some(o=>o.value===was))s.value=was;
+  }catch(e){s.innerHTML='<option value="">Could not load refinable VOC files</option>';}
+}
 $('#runbtn').onclick=async()=>{
   if(!stage) return;
   const free = stage.name==='ingest' && $('#rulesonly').checked;
@@ -2766,6 +2833,7 @@ $('#runbtn').onclick=async()=>{
   const log=$('#log'); log.textContent=''; $('#runbtn').disabled=true;
   const body={stage:stage.name,project:$('#proj').value,segment:$('#seg').value,
               source:$('#ingestpath').value.trim(),voc_source:$('#segvoc')?$('#segvoc').value:'',
+              refine_source:$('#refinevoc')?$('#refinevoc').value:'',
               approve:$('#approve').checked,
               force:$('#force').checked,
               rules_only:$('#rulesonly').checked,
@@ -3434,6 +3502,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if pr not in projects():
                 return self._send(200, json.dumps({"error": "unknown project"}))
             return self._send(200, json.dumps({"files": segment_voc_files(pr)}))
+        if u.path == "/refine-voc-files":
+            pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
+            if pr not in projects():
+                return self._send(200, json.dumps({"error": "unknown project"}))
+            return self._send(200, json.dumps({"files": refine_voc_files(pr)}))
         if u.path == "/file":
             q = urllib.parse.parse_qs(u.query)
             rel = q.get("path", [""])[0]
@@ -3893,7 +3966,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif stage == "refine-voc":
             # Project-wide deterministic export: unlike downstream research
             # stages it consumes the completed ingest artefacts, not a segment.
-            pass
+            src = req.get("refine_source") or ""
+            if src:
+                allowed = {os.path.realpath(row["path"])
+                           for row in refine_voc_files(req.get("project") or "")}
+                src = os.path.realpath(src)
+                if src not in allowed:
+                    return self._send(
+                        200, "Selected VOC file is not a refinable file in this project.\n",
+                        "text/plain; charset=utf-8")
+                cmd += ["--source", src]
         elif stage != "segment":
             seg = req.get("segment") or ""
             if not seg:

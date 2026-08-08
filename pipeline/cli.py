@@ -1348,6 +1348,7 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
     _write_jsonl_atomic(audit_path, audit)
     missing = len(source_rows) - min(subreddit_count, thread_count)
     summary = {
+        "input_path": input_path,
         "input": len(source_rows),
         "production": len(production),
         "audit": len(audit),
@@ -1361,6 +1362,7 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
     summary.update(prompt_metrics)
     if announce:
         print("\n  refine-voc (deterministic local export)")
+        print(f"  Source:     {input_path}")
         print(f"  Input:      {summary['input']:,} deduplicated evidence items")
         print(f"  Production: {summary['production']:,} records")
         print(f"    -> {production_path}")
@@ -1382,8 +1384,8 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
     return summary
 
 
-def cmd_refine_voc(cfg, _args):
-    refine_voc(cfg)
+def cmd_refine_voc(cfg, args):
+    refine_voc(cfg, input_path=getattr(args, "source", None))
 
 
 def cmd_ingest(cfg, args):
@@ -2610,6 +2612,8 @@ def main():
     s = common(sub.add_parser(
         "refine-voc",
         help="regenerate production/audit VOC locally from completed deduplication"))
+    s.add_argument("--source", help="VOC JSONL to refine (default: "
+                                     "voc/deduplicated_voc.jsonl)")
     s.set_defaults(fn=cmd_refine_voc)
     s = common(sub.add_parser("segment")); s.add_argument("--rediscover", action="store_true")
     s.add_argument("--reassign", action="store_true")

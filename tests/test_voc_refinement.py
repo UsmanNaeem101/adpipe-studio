@@ -145,6 +145,18 @@ class VocRefinementTests(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(
                 tmp, "research", "voc", cli.PRODUCTION_VOC_FILE)))
 
+    def test_manual_command_uses_explicit_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            voc, _rows, _groups = self.fixture(tmp)
+            alternate = os.path.join(voc, "alternate.jsonl")
+            cli._write_jsonl(alternate, [{"id": "chosen", "text": "selected"}])
+
+            cli.cmd_refine_voc({"_dir": tmp}, SimpleNamespace(source=alternate))
+
+            production = cli._read_jsonl(
+                os.path.join(voc, cli.PRODUCTION_VOC_FILE))
+        self.assertEqual(production[0]["id"], "chosen")
+
     def test_downstream_payloads_use_only_fields_each_stage_needs(self):
         production = [{
             "id": 1, "text": "exact text", "subreddit": "Pain",

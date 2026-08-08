@@ -46,9 +46,12 @@ without filtering, deduplication, provider setup, or model calls:
 
 ```bash
 ./adpipe -p PROJECT refine-voc
+./adpipe -p PROJECT refine-voc --source /path/to/alternate_voc.jsonl
 ```
 
-The command deterministically overwrites the two derived exports.
+Studio exposes the same choice on the Pipeline page and recommends
+`deduplicated_voc.jsonl`. Only project JSONL files containing `id` and `text` are
+listed. The command deterministically overwrites the two derived exports.
 
 ## Downstream consumers
 
