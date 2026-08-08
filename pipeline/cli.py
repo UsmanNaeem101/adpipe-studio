@@ -381,20 +381,31 @@ def _repair_batch(client_, corpus, preamble, failures, key):
     return client_.batch(corpus, preamble, jobs)
 
 
-def _batch_rows(results, jobs, key, diagnostics_dir, repair=None):
+def _batch_rows(results, jobs, key, diagnostics_dir, repair=None,
+                failure_reasons=None):
     """Decode all jobs, repairing malformed responses before failing the stage.
 
     `repair` receives all failed (job, raw, reason) tuples and returns replacement
     raw responses keyed by job id. Originals and replacements are retained for an
     audit trail; nothing is silently discarded.
+
+    `failure_reasons` maps job id -> the provider's own explanation for a request
+    that produced no usable text. Those are reported verbatim: an empty response
+    is a provider/model failure, and calling it a JSON syntax error (which is what
+    handing "" to a parser produces) sends the operator hunting the wrong bug.
     """
     by_id = {j.id: j for j in jobs}
+    reasons = failure_reasons or {}
     failures, decoded = [], {}
     for jid, job in sorted(by_id.items()):
         raw = _raw_text(results.get(jid, ""))
         try:
             if jid not in results:
-                raise ValueError("no response returned")
+                raise ValueError(reasons.get(jid) or "no response returned")
+            if not raw.strip():
+                raise ValueError(reasons.get(jid) or
+                                 "the model returned an empty response — no JSON "
+                                 "was produced")
             decoded[jid] = _decode_job_rows(job, raw, key)
         except (ValueError, TypeError) as e:
             failures.append((job, raw, str(e)))
@@ -454,6 +465,14 @@ def _require_exact_ids(rows, expected_ids, label):
 
 # Interface chrome. Skill 01 explicitly permits stripping junk AROUND a comment,
 # so removing these deterministically costs nothing and never touches customer words.
+# Skills 01/02 are high-volume structured classification: "is this record concrete
+# first-person experience, yes or no". The model does not need a reasoning block
+# per record to answer that, and on OpenRouter reasoning is billed out of the SAME
+# max_tokens allowance as the JSON — 60 records x thousands of reasoning tokens
+# starves the answer and returns empty content. Turn it off for these stages;
+# providers that have no reasoning mode ignore the field.
+NO_REASONING = {"enabled": False}
+
 BOILER = re.compile(
     r"welcome to reddit|become a redditor|create an account|sign up|log in|"
     r"this is an archived post|i am a bot|automoderator|permalinkembedsave|"
@@ -525,6 +544,7 @@ def cmd_ingest(cfg, args):
                         "reason array empty.\n\nRECORDS:\n\n"
                         + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
                 max_tokens=8000, schema=FILTER_SCHEMA,
+                reasoning=NO_REASONING,
                 expected_ids=tuple(r["id"] for r in ch))
             for n, ch in enumerate(chunks)]
 
@@ -536,7 +556,8 @@ def cmd_ingest(cfg, args):
     records = _batch_rows(
         c.batch(prefix, PREAMBLE, jobs), jobs, "records",
         os.path.join(voc, "_model_failures", "01_filter"),
-        repair=lambda failed: _repair_batch(c, prefix, PREAMBLE, failed, "records"))
+        repair=lambda failed: _repair_batch(c, prefix, PREAMBLE, failed, "records"),
+        failure_reasons=getattr(c, "failures", {}))
     _require_exact_ids(records, {r["id"] for r in pre}, "skill 01 filter")
     verdicts = {r["evidence_id"]: r for r in records}
 
@@ -562,7 +583,7 @@ def cmd_ingest(cfg, args):
                          "empty groups list is a valid answer.\n\n"
                          "RECORDS:\n\n"
                          + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
-                 max_tokens=6000, schema=DEDUP_SCHEMA)
+                 max_tokens=6000, schema=DEDUP_SCHEMA, reasoning=NO_REASONING)
              for n, ch in enumerate(dchunks)]
 
     dprefix = f"{s02}\n\n---\n\n{ctx}"
@@ -574,7 +595,8 @@ def cmd_ingest(cfg, args):
     groups = _batch_rows(
         c.batch(dprefix, PREAMBLE, djobs), djobs, "groups",
         os.path.join(voc, "_model_failures", "02_deduplicate"),
-        repair=lambda failed: _repair_batch(c, dprefix, PREAMBLE, failed, "groups"))
+        repair=lambda failed: _repair_batch(c, dprefix, PREAMBLE, failed, "groups"),
+        failure_reasons=getattr(c, "failures", {}))
     for g in groups:
         drop.update(i for i in g["duplicate_ids"] if i != g["canonical_id"])
 

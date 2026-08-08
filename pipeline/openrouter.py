@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 
 import auditlog
+import modeloutput
 
 API = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
@@ -45,6 +46,10 @@ PRICING = {
     "deepseek/deepseek-chat":     {"in": 0.14, "out": 0.28},
     "_default":                   {"in": 0.50, "out": 1.50},
 }
+
+
+class EmptyResponse(Exception):
+    """The model returned no content for a reason other than the token budget."""
 
 
 class Estimate:
@@ -93,8 +98,15 @@ class Client:
     # ------------------------------------------------------------- internals
 
     def _post(self, messages, max_tokens, schema=None, retries=3,
-              job_id=None, operation="completion"):
+              job_id=None, operation="completion", reasoning=None,
+              budget_retry=True):
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens}
+        if reasoning is not None:
+            # Reasoning is billed from the SAME max_tokens allowance as the answer.
+            # For a high-volume structured classification stage the model can burn
+            # the whole budget thinking and return empty content, so callers that
+            # do not need reasoning turn it off here rather than paying for it.
+            body["reasoning"] = reasoning
         if schema:
             # Require a route that supports structured output. Without
             # require_parameters OpenRouter may select a provider that silently
@@ -119,10 +131,32 @@ class Client:
                 u = payload.get("usage") or {}
                 self.spent["in"] += u.get("prompt_tokens", 0)
                 self.spent["out"] += u.get("completion_tokens", 0)
-                message = payload["choices"][0]["message"]
+                choice = payload["choices"][0]
+                message = choice["message"]
                 content = message.get("content") or ""
+                finish = choice.get("finish_reason")
                 audit.response(payload, text=content, usage=u,
-                               finish_reason=payload["choices"][0].get("finish_reason"))
+                               finish_reason=finish)
+                if modeloutput.is_budget_exhaustion(content, finish):
+                    # The model spent its whole allowance on reasoning. Re-ask the
+                    # ORIGINAL request with more room; repairing "" cannot work.
+                    if not budget_retry:
+                        raise modeloutput.OutputBudgetExhausted(
+                            modeloutput.budget_message(max_tokens, finish, job_id),
+                            max_tokens=max_tokens, finish_reason=finish)
+                    bigger = max_tokens * modeloutput.RETRY_MULTIPLIER
+                    if self.verbose:
+                        print(f"  ! {job_id or 'request'}: empty content with "
+                              f"finish_reason={finish!r} — retrying with "
+                              f"max_tokens={bigger:,}")
+                    return self._post(
+                        messages, bigger, schema=schema, retries=retries,
+                        job_id=job_id, operation=operation + "_budget_retry",
+                        reasoning=reasoning, budget_retry=False)
+                if not content.strip():
+                    # Empty for some other reason — surface the provider's own
+                    # reason rather than letting a JSON parser invent one.
+                    raise EmptyResponse(modeloutput.empty_reason(finish))
                 return content
             except urllib.error.HTTPError as e:
                 detail_full = e.read().decode("utf-8", "replace")
@@ -198,34 +232,43 @@ class Client:
             print("  (no prompt cache on OpenRouter — nothing to warm)")
 
     def one(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
-            job_id="single", operation="pipeline_single"):
+            job_id="single", operation="pipeline_single", reasoning=None):
         msgs = [{"role": "system", "content": f"{preamble}\n\n{corpus}"},
                 {"role": "user", "content": prompt}]
         return self._post(msgs, max_tokens, schema, job_id=job_id,
-                          operation=operation)
+                          operation=operation, reasoning=reasoning)
 
     def batch(self, corpus, preamble, jobs, poll_seconds=0):
         """No batch endpoint — run concurrently to recover wall-clock time.
-        Modest concurrency so a rate limit doesn't take the whole run down."""
+        Modest concurrency so a rate limit doesn't take the whole run down.
+
+        A job that produced no usable response is left OUT of the returned map and
+        its reason recorded in `self.failures`, so the caller reports what the
+        provider actually said instead of a downstream JSON syntax error.
+        """
         system = f"{preamble}\n\n{corpus}"
         out = {}
+        self.failures = {}
 
         def run(j):
             return j.id, self._post(
                 [{"role": "system", "content": system},
                  {"role": "user", "content": j.prompt}], j.max_tokens, j.schema,
-                job_id=j.id, operation="pipeline_batch_job")
+                job_id=j.id, operation="pipeline_batch_job",
+                reasoning=getattr(j, "reasoning", None))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(run, j) for j in jobs]
+            futures = {pool.submit(run, j): j for j in jobs}
             for i, f in enumerate(concurrent.futures.as_completed(futures), 1):
+                job = futures[f]
                 try:
                     cid, text = f.result()
                     out[cid] = text
                 except SystemExit:
                     raise
                 except Exception as e:
-                    print(f"  ! a request failed: {e}")
+                    self.failures[job.id] = str(e)
+                    print(f"  ! {job.id}: {e}")
                 if self.verbose:
                     print(f"    {i}/{len(jobs)} done", flush=True)
         return out

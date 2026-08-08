@@ -89,7 +89,8 @@ class StructuredBatchTests(unittest.TestCase):
         seen = []
 
         def fake_post(_messages, _max_tokens, schema=None, retries=3,
-                      job_id=None, operation="completion"):
+                      job_id=None, operation="completion", reasoning=None,
+                      budget_retry=True):
             seen.append(schema)
             return '{"records":[]}'
 
