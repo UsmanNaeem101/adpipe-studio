@@ -22,15 +22,18 @@ from __future__ import annotations
 import base64
 import datetime
 import http.server
+import io
 import json
 import mimetypes
 import os
+import re
 import socketserver
 import subprocess
 import sys
 import threading
 import urllib.parse
 import webbrowser
+import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pipeline"))
@@ -116,7 +119,7 @@ def segments(project):
     return sorted(out)
 
 
-SAFE_NAME = __import__("re").compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
+SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
 
 
 TEMPLATE_PROJECT = {
@@ -431,6 +434,160 @@ def project_outputs(project):
                     entry("logs", label, path,
                           "image" if f.endswith(".png") else "text")
     return out
+
+
+# The audit log's own stage label. auditlog writes "context" before "metadata"
+# and "request", so it is in the first few hundred bytes — worth reading a prefix
+# rather than parsing ~30KB of prompt for each of the several hundred runs one
+# ingest leaves behind.
+_STAGE_RE = re.compile(r'"stage"\s*:\s*"([^"]*)"')
+
+
+def _run_stage(request_json):
+    """This request's stage, read cheaply but not carelessly.
+
+    The prefix scan is bounded to the "context" block. Searching the whole prefix
+    for a "stage" key would happily match one inside the prompt or the schema and
+    file the log under a stage that never ran it — a mislabelled log is worse
+    than a slow one, because it is missing from the export you go looking in.
+    """
+    try:
+        with open(request_json, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+    start = head.find('"context"')
+    if start >= 0:
+        block = head[start:]
+        # Stop at the next top-level key so the scan cannot run past the context.
+        for following in ('"metadata"', '"request"'):
+            cut = block.find(following)
+            if cut >= 0:
+                block = block[:cut]
+        found = _STAGE_RE.search(block)
+        if found:
+            return found.group(1) or None
+        # A complete context block with no stage in it is a real answer:
+        # unattributed, no need to re-read the file to confirm it.
+        if len(head) < 4096 or '"metadata"' in head or '"request"' in head:
+            return None
+    try:
+        with open(request_json, encoding="utf-8", errors="replace") as fh:
+            return ((json.load(fh).get("context") or {}).get("stage")) or None
+    except (ValueError, OSError):
+        return None
+
+
+def log_runs(project):
+    """Every audited model call in a project, with the stage that made it.
+
+    One request is one directory (request.json, response.json, events.jsonl),
+    so a stage is a set of directories rather than a file — which is why picking
+    them out of the Outputs list by hand does not scale: an 83-chunk ingest with
+    a recovery pass leaves several hundred rows there, in the order they happen
+    to sort, and the interesting ones are the failures scattered among them.
+    """
+    root = os.path.join(ROOT, "projects", project, "logs", "model")
+    runs = []
+    if not os.path.isdir(root):
+        return runs
+    for base, _dirs, files in os.walk(root):
+        if "request.json" not in files:
+            continue
+        size = 0
+        for f in files:
+            try:
+                size += os.path.getsize(os.path.join(base, f))
+            except OSError:
+                pass
+        runs.append({
+            "dir": base,
+            "rel": os.path.relpath(base, root),
+            "stage": _run_stage(os.path.join(base, "request.json")) or "unattributed",
+            "files": sorted(files),
+            "bytes": size,
+            "mtime": os.path.getmtime(base),
+        })
+    runs.sort(key=lambda r: r["rel"])
+    return runs
+
+
+def log_stages(project):
+    """What is available to export, so the button can say what it will hand over."""
+    stages = {}
+    for run in log_runs(project):
+        s = stages.setdefault(run["stage"],
+                              {"stage": run["stage"], "runs": 0, "files": 0,
+                               "bytes": 0, "mtime": 0})
+        s["runs"] += 1
+        s["files"] += len(run["files"])
+        s["bytes"] += run["bytes"]
+        s["mtime"] = max(s["mtime"], run["mtime"])
+    out = sorted(stages.values(), key=lambda s: -s["mtime"])
+    for s in out:
+        s["modified_at"] = datetime.datetime.fromtimestamp(
+            s["mtime"]).astimezone().isoformat(timespec="seconds")
+    return out
+
+
+def export_logs(project, stage=""):
+    """Zip every audited request for one stage, plus a manifest describing them.
+
+    Returns (filename, bytes). An empty stage exports every stage — asking for
+    "everything that happened" is a legitimate request, and making the caller
+    enumerate stages to get it is the same busywork this replaces.
+
+    The manifest goes in first so the archive is readable without unpacking it:
+    it lists every run with its stage, operation, job id and model, which is
+    enough to find the one request worth opening among several hundred.
+    """
+    if project not in projects():
+        raise ValueError(f"unknown project {project!r}")
+    runs = [r for r in log_runs(project) if not stage or r["stage"] == stage]
+    if not runs:
+        raise ValueError(
+            f"no model logs for stage {stage!r} in {project!r}"
+            if stage else f"no model logs in {project!r} yet")
+
+    manifest = []
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for run in runs:
+            row = {"path": run["rel"], "stage": run["stage"],
+                   "bytes": run["bytes"], "files": run["files"]}
+            try:
+                with open(os.path.join(run["dir"], "request.json"),
+                          encoding="utf-8", errors="replace") as fh:
+                    req = json.load(fh)
+                row.update({k: req.get(k) for k in
+                            ("started_at", "provider", "model", "operation",
+                             "job_id")})
+            except (ValueError, OSError):
+                row["unreadable"] = True
+            manifest.append(row)
+            for name in run["files"]:
+                src = os.path.join(run["dir"], name)
+                try:
+                    zf.write(src, os.path.join(run["rel"], name))
+                except OSError:
+                    # One unreadable file must not cost the export. Say so in
+                    # the manifest rather than dropping it silently.
+                    row.setdefault("skipped", []).append(name)
+        zf.writestr("manifest.json", json.dumps({
+            "project": project,
+            "stage": stage or "(all stages)",
+            "exported_at": datetime.datetime.now().astimezone().isoformat(
+                timespec="seconds"),
+            "runs": len(runs),
+            "note": "One directory per model request: request.json is what was "
+                    "sent, response.json is what came back (including usage and "
+                    "finish_reason), events.jsonl holds retries and errors.",
+            "requests": manifest,
+        }, indent=2))
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = f"{project}-{re.sub(r'[^a-z0-9]+', '-', (stage or 'all').lower())}-logs-{stamp}.zip"
+    return name, buf.getvalue()
 
 
 def segment_voc_files(project):
@@ -1337,6 +1494,15 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
       <div><label>Project</label><select id=oproj></select></div>
       <div style="display:flex;align-items:flex-end"><button class="btn ghost" id=orefresh>Refresh</button></div>
     </div>
+    <div class=row style="margin-bottom:14px;align-items:flex-end">
+      <div><label>Model logs</label><select id=logstage></select></div>
+      <div style="display:flex;align-items:flex-end">
+        <button class="btn ghost" id=logexport>Export logs</button></div>
+    </div>
+    <p class=hint id=logmsg style="margin:-6px 0 14px">One folder per model
+      request — what was sent, what came back (usage and finish reason included),
+      and any retries — plus a manifest listing them. This is what to attach when
+      a stage fails.</p>
     <div id=provwarn></div>
     <div class=grid style="grid-template-columns:340px 1fr">
       <div class=cats id=olist style=max-height:600px></div>
@@ -1456,7 +1622,8 @@ $$('.tab').forEach(b=>b.onclick=()=>{
   });
   // Lazy-load, guarded: these helpers are defined later in the file.
   if(b.dataset.t==='library'  && typeof loadLibrary==='function') loadLibrary();
-  if(b.dataset.t==='outputs'  && typeof loadOutputs==='function') loadOutputs();
+  if(b.dataset.t==='outputs'  && typeof loadOutputs==='function'){
+    loadOutputs(); if(typeof loadLogStages==='function') loadLogStages(); }
   if(b.dataset.t==='settings' && typeof renderProjectList==='function') renderProjectList();
   if(b.dataset.t==='product' && typeof loadProducts==='function'){ loadProducts(); renderNewProduct(); loadNewProjectPicker(); }
 });
@@ -2880,8 +3047,52 @@ async function viewFile(path,kind){
       : `<pre style="white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;background:var(--surface);
          padding:14px;border-radius:9px;max-height:520px;overflow:auto;margin-top:10px">${outEsc(d.text)}</pre>`);
 }
-$('#orefresh')&&($('#orefresh').onclick=loadOutputs);
-$('#oproj')&&($('#oproj').onchange=loadOutputs);
+/* ---------- model log export ----------
+   The Outputs list shows one row per log FILE, which is unusable at the scale a
+   failing stage produces: an 83-chunk ingest with a recovery pass leaves several
+   hundred of them and the interesting ones are scattered through the middle.
+   This exports a whole stage in one archive instead. */
+function logSize(n){
+  return n > 1048576 ? (n/1048576).toFixed(1)+' MB' : Math.max(1,Math.round(n/1024))+' KB';
+}
+async function loadLogStages(){
+  const sel=$('#logstage'); if(!sel) return;
+  const pr=$('#oproj')&&$('#oproj').value, was=sel.value;
+  sel.innerHTML=''; if($('#logexport'))$('#logexport').disabled=true;
+  if(!pr) return;
+  try{
+    const j=await (await fetch('/logs?project='+encodeURIComponent(pr))).json();
+    const stages=j.stages||[];
+    if(!stages.length){
+      sel.innerHTML='<option value="">— no model logs yet —</option>';
+      return;
+    }
+    let total=0, files=0;
+    stages.forEach(s=>{total+=s.bytes; files+=s.files;
+      const o=document.createElement('option');
+      o.value=s.stage;
+      o.textContent=`${s.stage} — ${s.runs} request${s.runs===1?'':'s'} (${logSize(s.bytes)})`;
+      sel.appendChild(o);});
+    // Offer everything as well: "what happened in this project" is a real
+    // question, and answering it should not mean exporting stages one at a time.
+    const all=document.createElement('option');
+    all.value=''; all.textContent=`all stages — ${files} files (${logSize(total)})`;
+    sel.appendChild(all);
+    if(was!==null&&[...sel.options].some(o=>o.value===was)) sel.value=was;
+    $('#logexport').disabled=false;
+  }catch(e){ sel.innerHTML='<option value="">— could not read logs —</option>'; }
+}
+$('#logexport')&&($('#logexport').onclick=()=>{
+  const pr=$('#oproj')&&$('#oproj').value;
+  if(!pr){ $('#logmsg').textContent='Pick a project first.'; return; }
+  const stage=$('#logstage').value;
+  // A plain navigation, so the browser's own download UI handles a large
+  // archive rather than this buffering it into memory to re-offer it.
+  window.location='/logs/export?project='+encodeURIComponent(pr)+
+    '&stage='+encodeURIComponent(stage);
+});
+$('#orefresh')&&($('#orefresh').onclick=()=>{loadOutputs();loadLogStages();});
+$('#oproj')&&($('#oproj').onchange=()=>{loadOutputs();loadLogStages();});
 /* Populate the output tab's project picker if empty. This runs once but is
    safe to re-fire: setting .innerHTML on an already-populated select is a no-op
    because the option values are the same. */
@@ -3090,11 +3301,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", download=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        if download:
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{download}"')
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -3198,6 +3412,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/outputs":
             pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             return self._send(200, json.dumps(project_outputs(pr) if pr else {}))
+        if u.path == "/logs":
+            pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
+            if pr not in projects():
+                return self._send(200, json.dumps({"stages": []}))
+            return self._send(200, json.dumps({"stages": log_stages(pr)}))
+        if u.path == "/logs/export":
+            q = urllib.parse.parse_qs(u.query)
+            try:
+                name, blob = export_logs(q.get("project", [""])[0],
+                                         q.get("stage", [""])[0])
+            except ValueError as e:
+                # A browser navigation, not a fetch — answer in something a
+                # person reading a blank tab can act on.
+                return self._send(404, str(e), "text/plain")
+            return self._send(200, blob, "application/zip", download=name)
         if u.path == "/voc-files":
             pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             if pr not in projects():
