@@ -233,6 +233,64 @@ class SegmentationBookkeepingTests(unittest.TestCase):
                 [self.consolidated(["provider_invented_key"])],
                 [self.provisional("desk")])
 
+    def test_03b_partial_repair_is_merged_into_complete_100_row_catalogue(self):
+        provisional = [self.provisional(f"source_{index}", [index + 1])
+                       for index in range(100)]
+        original_rows = []
+        for index in range(100):
+            row = self.consolidated(
+                [f"source_{index}"], f"canonical_slug_{index}")
+            row["candidate_id"] = f"seg_{index:03d}"
+            row["name"] = f"Canonical audience {index}"
+            original_rows.append(row)
+        original_rows[2]["merged_candidate_keys"] = ["invented_two"]
+        original_rows[77]["merged_candidate_keys"] = ["invented_seventy_seven"]
+        original = {"candidates": original_rows}
+        untouched_before = json.loads(json.dumps(original_rows[50]))
+        repair = {"candidates": []}
+        for index in (2, 77):
+            row = json.loads(json.dumps(original_rows[index]))
+            row["merged_candidate_keys"] = [f"source_{index}"]
+            row["slug"] = "attempted_unrelated_change"
+            repair["candidates"].append(row)
+
+        merged = segmentation.merge_consolidation_repair(original, repair)
+        segmentation.validate_consolidated_lineage(
+            merged["candidates"], provisional)
+        final = segmentation.finalize_consolidated(
+            merged["candidates"], provisional)
+
+        self.assertEqual(len(repair["candidates"]), 2)
+        self.assertEqual(len(merged["candidates"]), 100)
+        self.assertEqual(len(final), 100)
+        self.assertEqual(merged["candidates"][50], untouched_before)
+        self.assertEqual(merged["candidates"][2]["slug"], "canonical_slug_2")
+        self.assertEqual(merged["candidates"][77]["slug"],
+                         "canonical_slug_77")
+        self.assertEqual(merged["candidates"][2]["merged_candidate_keys"],
+                         ["source_2"])
+        self.assertEqual(merged["candidates"][77]["merged_candidate_keys"],
+                         ["source_77"])
+
+    def test_03b_partial_repair_missing_an_invalid_row_is_rejected(self):
+        provisional = [self.provisional("source_one"),
+                       self.provisional("source_two")]
+        first = self.consolidated(["invalid_one"], "first")
+        first["candidate_id"] = "seg_001"
+        second = self.consolidated(["invalid_two"], "second")
+        second["candidate_id"] = "seg_002"
+        repair = json.loads(json.dumps(first))
+        repair["merged_candidate_keys"] = ["source_one"]
+
+        merged = segmentation.merge_consolidation_repair(
+            {"candidates": [first, second]}, {"candidates": [repair]})
+
+        with self.assertRaises(segmentation.ConsolidationContractError) as ctx:
+            segmentation.validate_consolidated_lineage(
+                merged["candidates"], provisional)
+        self.assertEqual(ctx.exception.invalid_references[0]["candidate_id"],
+                         "seg_002")
+
     def test_03c_keeps_recurring_novelty_and_ignores_isolated_proposal(self):
         audits = [
             {"evidence_id": 1, "status": "possible_new_candidate",

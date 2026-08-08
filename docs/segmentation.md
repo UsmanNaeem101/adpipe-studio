@@ -126,3 +126,7 @@ a provider ignores the schema. An otherwise complete response with invalid linea
 saved to diagnostics and gets one bounded repair using that response—03A is not rerun.
 If an older run was audited but crashed before persisting its 03B artifact, the resume
 path reuses it only when its embedded catalogue exactly fingerprints the current one.
+Lineage repair rows are patches keyed by the existing canonical `candidate_id`, never a
+replacement catalogue: code copies only `merged_candidate_keys` into the complete
+original response, preserves every other field, requires the original candidate count,
+and revalidates the reconstructed full collection before writing the 03B artifact.

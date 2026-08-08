@@ -546,6 +546,51 @@ def validate_consolidated_lineage(rows, provisional_catalogue):
         raise ConsolidationContractError(invalid_references)
 
 
+def merge_consolidation_repair(original_payload, repaired_payload):
+    """Patch only 03B lineage fields into the complete original collection.
+
+    A repair response may contain only the affected candidates. Treating that
+    response as a replacement silently collapsed a 208-row catalogue to two
+    rows. Candidate identity and every non-lineage field are therefore owned by
+    the original completed response; repair may change only
+    `merged_candidate_keys`, keyed by an existing `candidate_id`.
+    """
+    original_rows = original_payload.get("candidates")
+    repaired_rows = repaired_payload.get("candidates")
+    if not isinstance(original_rows, list) or not isinstance(repaired_rows, list):
+        raise ValueError("03B collection repair requires candidate arrays")
+    original_ids = [row.get("candidate_id") for row in original_rows
+                    if isinstance(row, dict)]
+    if len(original_ids) != len(original_rows) or len(set(original_ids)) != len(
+            original_ids):
+        raise ValueError("03B original collection has invalid candidate identity")
+    repaired_ids = [row.get("candidate_id") for row in repaired_rows
+                    if isinstance(row, dict)]
+    if len(repaired_ids) != len(repaired_rows) or len(set(repaired_ids)) != len(
+            repaired_ids):
+        raise ValueError("03B repair has invalid or duplicate candidate identity")
+    unknown = [candidate_id for candidate_id in repaired_ids
+               if candidate_id not in set(original_ids)]
+    if unknown:
+        raise ValueError(
+            f"03B repair introduced unknown candidate ID {unknown[0]!r}")
+
+    merged = copy.deepcopy(original_payload)
+    by_id = {row["candidate_id"]: row for row in merged["candidates"]}
+    for repaired in repaired_rows:
+        if "merged_candidate_keys" not in repaired:
+            raise ValueError(
+                f"03B repair omitted lineage for {repaired['candidate_id']!r}")
+        by_id[repaired["candidate_id"]]["merged_candidate_keys"] = copy.deepcopy(
+            repaired["merged_candidate_keys"])
+
+    if len(merged["candidates"]) != len(original_rows):
+        raise ValueError(
+            "03B CONTRACT REPAIR CATASTROPHIC DROP: candidate count changed "
+            f"from {len(original_rows)} to {len(merged['candidates'])}")
+    return merged
+
+
 def finalize_consolidated(rows, provisional_catalogue):
     """Replace model-estimated evidence lineage with exact deterministic unions."""
     validate_consolidated_lineage(rows, provisional_catalogue)

@@ -787,7 +787,8 @@ def _single_call_tiers(starting_ceiling, token_tiers=ADAPTIVE_TOKEN_TIERS):
 def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
                            token_tiers=ADAPTIVE_TOKEN_TIERS,
                            response_validator=None, repair_guidance=None,
-                           validation_error_handler=None, initial_result=None):
+                           validation_error_handler=None, initial_result=None,
+                           repair_merger=None):
     """Run one structured Job with failure-aware, bounded recovery.
 
     Budget stops retry the identical Job at the next coarse ceiling. Refusals,
@@ -801,6 +802,7 @@ def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
     repairing = False
     pending_result = (_as_result(initial_result)
                       if initial_result is not None else None)
+    repair_source = None
 
     while True:
         operation = ("single_structured_repair" if repairing
@@ -853,8 +855,11 @@ def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
                 f"Diagnostics: {diagnostics_dir}")
 
         recovery_error = None
+        decoded = None
         try:
             decoded = _json_object(result.text)
+            if repairing and repair_merger is not None and repair_source is not None:
+                decoded = repair_merger(repair_source, decoded)
             # Stage-specific semantic/provenance contracts run before the
             # general schema check so they can report useful source identifiers
             # instead of only an anonymous enum path. Validators must tolerate
@@ -867,6 +872,10 @@ def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
             return decoded
         except (ValueError, TypeError) as parse_error:
             recovery_error = parse_error
+            if (not repairing and repair_merger is not None and decoded is not None
+                    and isinstance(
+                        parse_error, segmentation.ConsolidationContractError)):
+                repair_source = decoded
             reason = _failure_reason(result, str(parse_error))
             if validation_error_handler is not None:
                 validation_error_handler(
@@ -2195,16 +2204,19 @@ def _run_03b_consolidation(client_, corpus, preamble, job, catalogue,
         token_tiers=STAGE03B_TOKEN_TIERS,
         response_validator=validate,
         repair_guidance=(
-            "Preserve every canonical candidate and every already-valid field. "
-            "Correct only contract violations. In merged_candidate_keys, replace "
-            "invented or rewritten source keys with the exact candidate_key values "
-            "from the supplied 03A catalogue that the candidate genuinely merged. "
-            "Do not change a canonical candidate_id, slug, name, definition, or "
-            "other valid content merely to make it resemble a source key."),
+            "Return a repair row for every candidate identified by the contract "
+            "error; do not omit any affected candidate. The pipeline will merge "
+            "those rows into the complete original collection by candidate_id. "
+            "Correct only merged_candidate_keys, replacing invented or rewritten "
+            "source keys with exact candidate_key values from the supplied 03A "
+            "catalogue that the candidate genuinely merged. Preserve candidate_id "
+            "exactly. Do not change a canonical slug, name, definition, or other "
+            "valid content; non-lineage changes will be ignored."),
         validation_error_handler=lambda error, **context:
             _print_03b_contract_error(error, **context)
             if isinstance(error, segmentation.ConsolidationContractError) else None,
-        initial_result=initial_result)
+        initial_result=initial_result,
+        repair_merger=segmentation.merge_consolidation_repair)
     try:
         return segmentation.finalize_consolidated(payload["candidates"], catalogue)
     except segmentation.ConsolidationContractError as error:
