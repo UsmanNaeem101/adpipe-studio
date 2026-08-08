@@ -309,5 +309,56 @@ class StructuredBatchTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
 
 
+class ProviderSafeSchemaTests(unittest.TestCase):
+    def test_drops_local_validation_keywords(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "a": {"type": "array", "minItems": 1, "uniqueItems": True,
+                      "items": {"type": "integer"}},
+                "b": {"type": "string", "minLength": 3, "pattern": "^x+$"},
+            },
+            "required": ["a"],
+            "additionalProperties": False,
+        }
+        safe = openrouter._provider_safe_schema(schema)
+        self.assertNotIn("uniqueItems", safe["properties"]["a"])
+        self.assertNotIn("minItems", safe["properties"]["a"])
+        self.assertNotIn("minLength", safe["properties"]["b"])
+        self.assertNotIn("pattern", safe["properties"]["b"])
+        # Shape contract is preserved.
+        self.assertEqual(safe["properties"]["a"]["items"]["type"], "integer")
+        self.assertEqual(safe["required"], ["a"])
+        self.assertIs(safe["additionalProperties"], False)
+
+    def test_preserves_enums_and_nested_structure(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "k": {"type": "string", "enum": ["a", "b"], "minLength": 2},
+                "rows": {"type": "array",
+                         "items": {"type": "object",
+                                   "properties": {"x": {"type": "integer",
+                                                        "minimum": 0}},
+                                   "required": ["x"]}},
+            },
+            "required": ["k"],
+        }
+        safe = openrouter._provider_safe_schema(schema)
+        self.assertEqual(safe["properties"]["k"]["enum"], ["a", "b"])
+        self.assertNotIn("minLength", safe["properties"]["k"])
+        self.assertIn("minimum", safe["properties"]["rows"]["items"]["properties"]["x"])
+        self.assertEqual(safe["properties"]["rows"]["items"]["required"], ["x"])
+
+    def test_drops_everywhere_recursively(self):
+        schema = {"type": "object",
+                  "properties": {"l": {"type": "array", "uniqueItems": True,
+                                       "items": {"type": "array",
+                                                 "uniqueItems": True,
+                                                 "items": {"type": "integer"}}}}}
+        safe = openrouter._provider_safe_schema(schema)
+        self.assertNotIn("uniqueItems", json.dumps(safe))
+
+
 if __name__ == "__main__":
     unittest.main()

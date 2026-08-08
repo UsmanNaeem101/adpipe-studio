@@ -48,6 +48,31 @@ PRICING = {
     "_default":                   {"in": 0.50, "out": 1.50},
 }
 
+# JSON-schema keywords OpenRouter's provider routes reject even when they accept
+# structured output. Azure's structured-output endpoint, for example, 400s on
+# `uniqueItems`, and some reject `minItems`/`minLength`/`pattern` on the wire.
+# These are all VALIDATION-only constraints that cli.py's _schema_issue enforces
+# locally anyway, so stripping them from the wire changes nothing about what is
+# accepted downstream — it only keeps the request from bouncing.
+_WIRE_DROP_KEYS = ("uniqueItems", "minItems", "maxItems", "minLength",
+                   "maxLength", "pattern", "minProperties", "maxProperties")
+
+
+def _provider_safe_schema(schema):
+    """Recursively remove validation keywords some providers reject on the wire.
+
+    Keeps type/enum/properties/required/additionalProperties/items — the shape
+    the structured-output endpoint needs — and drops the local-validation-only
+    extras. cli.py re-applies the dropped constraints after the reply comes
+    back, so nothing is weakened, only moved off the wire.
+    """
+    if isinstance(schema, dict):
+        return {k: _provider_safe_schema(v)
+                for k, v in schema.items() if k not in _WIRE_DROP_KEYS}
+    if isinstance(schema, list):
+        return [_provider_safe_schema(x) for x in schema]
+    return schema
+
 
 class Estimate:
     def __init__(self, jobs, corpus_tokens, prompt_tokens, out_tokens, model):
@@ -144,7 +169,8 @@ class Client:
             # JSON contract it asked for.
             body["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {"name": "result", "strict": True, "schema": schema}}
+                "json_schema": {"name": "result", "strict": True,
+                                "schema": _provider_safe_schema(schema)}}
             body["provider"] = {"require_parameters": True}
         audit = auditlog.start("openrouter", self.model, operation, body, job_id,
                                {"endpoint": API, "retries": retries})
