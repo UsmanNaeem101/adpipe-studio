@@ -1259,7 +1259,8 @@ def _rerun_batch(client_, corpus, preamble, failures, factor):
     return client_.batch(corpus, preamble, jobs)
 
 
-def _repair_batch(client_, corpus, preamble, failures, key, guidance=None):
+def _repair_batch(client_, corpus, preamble, failures, key, guidance=None,
+                  preserve_guidance=None):
     """Recover invalid model outputs in one structured recovery batch.
 
     Most callers need shape-only repair.  A stage-specific semantic validator
@@ -1286,6 +1287,8 @@ def _repair_batch(client_, corpus, preamble, failures, key, guidance=None):
                 "repair, not a chance to reconsider those judgments. Use the "
                 "original request only to restore an omitted input row or to re-run "
                 "the job when no response was returned.")
+            if preserve_guidance:
+                instruction += "\n\n" + preserve_guidance
         prompt = (
             "RECOVERY TASK: The previous model response could not be consumed by "
             f"the pipeline because: {reason}.\n\n"
@@ -1452,8 +1455,10 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
             repair_attempts += 1
             if adaptive_stats is not None:
                 adaptive_stats.json_repairs += len(fixable)
+            chunk_ids = ", ".join(job.id for job, _result, _reason in fixable)
             print(f"  ! repairing {len(fixable)} malformed {key} response(s) "
-                  "in one additional structured batch")
+                  f"in one additional structured batch (attempt 1/"
+                  f"{MAX_BATCH_REPAIR_ATTEMPTS}; chunks: {chunk_ids})")
             repaired = repair([(job, result.text, reason)
                                for job, result, reason in fixable])
             still_bad = []
@@ -2473,6 +2478,141 @@ def _stage05_grammar_rate_limited(result):
             and "grammar compilation rate limit exceeded" in message)
 
 
+def _stage05_assignment_rows(value):
+    """Find one unambiguous assignment-row array inside wrapper-only drift.
+
+    This deliberately does not edit a row.  It only recognizes arrays whose
+    objects already look like Stage 05 assignment rows, then lets the normal
+    schema and exact-coverage validators decide whether their contents are
+    usable.  Multiple different arrays are ambiguous and therefore not fixed.
+    """
+    found = []
+
+    def visit(node, path):
+        if isinstance(node, list):
+            looks_like_rows = bool(node) and all(
+                isinstance(row, dict) for row in node) and any(
+                    "evidence_id" in row for row in node)
+            if looks_like_rows:
+                found.append((node, path))
+                return
+            for index, child in enumerate(node):
+                if isinstance(child, (dict, list)):
+                    visit(child, f"{path}[{index}]")
+        elif isinstance(node, dict):
+            for key, child in node.items():
+                if isinstance(child, (dict, list)):
+                    visit(child, f"{path}.{key}")
+
+    visit(value, "$")
+    unique = []
+    for rows, path in found:
+        if not any(rows == prior for prior, _prior_path in unique):
+            unique.append((rows, path))
+    return unique
+
+
+def _normalize_stage05_assignment_wrapper(raw):
+    """Canonicalize only objectively structural Stage 05 wrapper mistakes.
+
+    Accepted drift includes a bare row array, a differently named wrapper, an
+    extra object/list layer, duplicate equivalent wrappers, and harmless
+    metadata beside the one assignment array.  Assignment decisions are never
+    added, removed, merged, or reinterpreted here.
+    """
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, count=1, flags=re.I)
+        text = re.sub(r"\s*```$", "", text, count=1)
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        try:
+            payload = presets.extract_json(raw)
+        except presets.PresetError:
+            return raw, None
+
+    if (isinstance(payload, dict) and set(payload) == {"assignments"}
+            and isinstance(payload["assignments"], list)):
+        return raw, None
+
+    candidates = _stage05_assignment_rows(payload)
+    if len(candidates) != 1:
+        return raw, None
+    rows, path = candidates[0]
+    normalized = json.dumps({"assignments": rows}, ensure_ascii=False)
+    return normalized, {
+        "kind": "wrapper_only",
+        "source_path": path,
+        "assignment_count": len(rows),
+    }
+
+
+def _normalize_stage05_result(job, value, events=None):
+    """Return a BatchResult with safe wrapper drift normalized, if present."""
+    result = _as_result(value)
+    normalized, event = _normalize_stage05_assignment_wrapper(result.text)
+    if event is None:
+        return result
+    event = {"chunk_id": job.id, **event}
+    if events is not None:
+        events[job.id] = event
+    print("\n  STAGE 05 STRUCTURAL NORMALIZATION")
+    print(f"  chunk: {job.id}")
+    print(f"  assignment array recovered from: {event['source_path']}")
+    print(f"  rows preserved unchanged: {event['assignment_count']}")
+    print("  model calls made: 0")
+    return dataclasses.replace(result, text=normalized)
+
+
+def _merge_stage05_incomplete_coverage(job, original_raw, reviewed_rows):
+    """Preserve valid prior rows and import only IDs omitted by the model.
+
+    A complete reviewer artifact is still required and validated first.  This
+    merge is allowed only when the original payload's sole defect is missing
+    coverage: its wrapper/schema are valid and it has no unknown or duplicate
+    IDs.  No existing assignment decision can therefore be overwritten by a
+    contract repair that was asked only to restore omitted rows.
+    """
+    try:
+        payload = _json_object(original_raw)
+        original_rows = payload.get("assignments")
+        if not isinstance(original_rows, list):
+            return reviewed_rows, None
+        if _schema_issue(payload, job.schema):
+            return reviewed_rows, None
+    except (ValueError, TypeError):
+        return reviewed_rows, None
+
+    expected = list(job.expected_ids or ())
+    original_ids = [row.get("evidence_id") for row in original_rows]
+    counts = Counter(original_ids)
+    missing = [evidence_id for evidence_id in expected
+               if evidence_id not in counts]
+    extra = [evidence_id for evidence_id in original_ids
+             if evidence_id not in set(expected)]
+    duplicate = [evidence_id for evidence_id, count in counts.items()
+                 if count > 1]
+    if not missing or extra or duplicate:
+        return reviewed_rows, None
+
+    reviewed_by_id = {row["evidence_id"]: row for row in reviewed_rows}
+    original_by_id = {row["evidence_id"]: row for row in original_rows}
+    if any(evidence_id not in reviewed_by_id for evidence_id in missing):
+        return reviewed_rows, None
+    merged = [original_by_id.get(evidence_id, reviewed_by_id[evidence_id])
+              for evidence_id in expected]
+    _decode_job_rows(
+        job, json.dumps({"assignments": merged}, ensure_ascii=False),
+        "assignments")
+    return merged, {
+        "kind": "incomplete_coverage",
+        "preserved_existing_rows": len(original_rows),
+        "imported_evidence_ids": missing,
+        "overwritten_existing_rows": 0,
+    }
+
+
 class _Stage05BatchRunner:
     """Paced native-Anthropic Message Batch transport for Stage 05 only."""
 
@@ -2493,6 +2633,7 @@ class _Stage05BatchRunner:
         self.clock_fn = clock_fn
         self.success_callback = success_callback
         self.last_submission_at = None
+        self.normalization_events = {}
 
     def _pace(self):
         if self.last_submission_at is None:
@@ -2524,7 +2665,12 @@ class _Stage05BatchRunner:
             self.success_callback(job, result)
 
     def _wave(self, corpus, preamble, jobs):
-        replies = self._submit(corpus, preamble, jobs)
+        raw_replies = self._submit(corpus, preamble, jobs)
+        replies = {
+            job.id: _normalize_stage05_result(
+                job, raw_replies.get(job.id, ""), self.normalization_events)
+            for job in jobs
+        }
         self._persist_completed(jobs, replies)
         by_id = {job.id: job for job in jobs}
         limited = [job for job in jobs if _stage05_grammar_rate_limited(
@@ -2539,7 +2685,12 @@ class _Stage05BatchRunner:
                   "compilation rate limit")
             print(f"  Retry attempt: {attempt}/{self.grammar_retry_attempts}")
             print("  Retrying only those requests in a later paced Message Batch")
-            retried = self._submit(corpus, preamble, limited)
+            raw_retried = self._submit(corpus, preamble, limited)
+            retried = {
+                job.id: _normalize_stage05_result(
+                    job, raw_retried.get(job.id, ""), self.normalization_events)
+                for job in limited
+            }
             self._persist_completed(limited, retried)
             for job in limited:
                 replies[job.id] = _as_result(retried.get(job.id, ""))
@@ -2550,7 +2701,12 @@ class _Stage05BatchRunner:
 
     def __call__(self, corpus, preamble, jobs):
         if not self.native_anthropic:
-            return self.client.batch(corpus, preamble, jobs)
+            raw_replies = self.client.batch(corpus, preamble, jobs)
+            return {
+                job.id: _normalize_stage05_result(
+                    job, raw_replies.get(job.id, ""), self.normalization_events)
+                for job in jobs
+            }
         replies = {}
         for start in range(0, len(jobs), self.wave_size):
             wave = jobs[start:start + self.wave_size]
@@ -2577,10 +2733,10 @@ def _stage05_audit_recoveries(project_dir, jobs, corpus, preamble):
     """
     wanted = {job.id: job for job in jobs}
     if not wanted:
-        return {}
+        return {}, {}
     log_root = os.path.join(project_dir, "logs", "model")
     if not os.path.isdir(log_root):
-        return {}
+        return {}, {}
     roots = []
     for root, _dirs, files in os.walk(log_root):
         if ("request.json" in files and "response.json" in files
@@ -2589,6 +2745,7 @@ def _stage05_audit_recoveries(project_dir, jobs, corpus, preamble):
     expected_system = [text for text in (preamble, corpus)
                        if isinstance(text, str) and text.strip()]
     recovered = {}
+    reviewable = {}
     for root in sorted(roots, key=os.path.getmtime, reverse=True):
         try:
             request = _load_json(os.path.join(root, "request.json"))
@@ -2614,7 +2771,7 @@ def _stage05_audit_recoveries(project_dir, jobs, corpus, preamble):
             if stop not in ("end_turn", "stop"):
                 continue
             text = response.get("text") or ""
-            rows = _decode_job_rows(job, text, "assignments")
+            normalized, normalization = _normalize_stage05_assignment_wrapper(text)
             usage = metadata.get("usage") or {}
             output_details = (usage.get("output_tokens_details") or
                               usage.get("completion_tokens_details") or {})
@@ -2627,15 +2784,28 @@ def _stage05_audit_recoveries(project_dir, jobs, corpus, preamble):
                     usage.get("output_tokens") or
                     usage.get("completion_tokens") or 0),
                 provider=request.get("provider"))
+            result = dataclasses.replace(result, text=normalized)
+            audited_job = dataclasses.replace(
+                job, max_tokens=int(body.get("max_tokens") or job.max_tokens))
+            source = os.path.relpath(root, project_dir)
+            try:
+                rows = _decode_job_rows(job, normalized, "assignments")
+            except (ValueError, TypeError) as error:
+                reviewable.setdefault(job.id, (
+                    audited_job, result, str(error), source, normalization))
+                continue
             recovered[job.id] = (
-                result, rows, os.path.relpath(root, project_dir))
+                result, rows, source, normalization)
+            reviewable.pop(job.id, None)
         except (OSError, ValueError, TypeError, AttributeError, KeyError):
             continue
-    return recovered
+    return recovered, reviewable
 
 
 def _stage05_artifact(original, chunk, corpus, rows, result, *,
-                      audit_source=None, repaired=False):
+                      audit_source=None, repaired=False,
+                      deterministic_normalization=None,
+                      incomplete_coverage_merge=None):
     saved = {
         "chunk_id": original.id,
         "evidence_ids": chunk["evidence_ids"],
@@ -2654,6 +2824,10 @@ def _stage05_artifact(original, chunk, corpus, rows, result, *,
         saved["migrated_from_model_audit"] = audit_source
     if repaired:
         saved["structured_repair"] = True
+    if deterministic_normalization:
+        saved["deterministic_normalization"] = deterministic_normalization
+    if incomplete_coverage_merge:
+        saved["incomplete_coverage_merge"] = incomplete_coverage_merge
     return saved
 
 
@@ -2701,20 +2875,23 @@ def _run_stage05_assignments(c, corpus, jobs, chunks, artifact_dir,
 
     missing = [job for job in jobs if job.id not in complete]
     if missing and not force:
-        audited = _stage05_audit_recoveries(
+        audited, reviewable_audits = _stage05_audit_recoveries(
             project_dir, missing, corpus, SEGMENT_PREAMBLE)
         for job in missing:
             if job.id not in audited:
                 continue
-            result, rows, source = audited[job.id]
+            result, rows, source, normalization = audited[job.id]
             saved = _stage05_artifact(
                 job, chunks_by_id[job.id], corpus, rows, result,
-                audit_source=source)
+                audit_source=source,
+                deterministic_normalization=normalization)
             _json_atomic(os.path.join(artifact_dir, f"{job.id}.json"), saved)
             complete[job.id] = saved
         if audited:
             print(f"  Stage 05 audit migration: preserved {len(audited)} "
                   "completed paid response(s); 0 model calls made")
+    else:
+        reviewable_audits = {}
 
     stats.reusable = len(complete)
     missing = [job for job in jobs if job.id not in complete]
@@ -2722,10 +2899,21 @@ def _run_stage05_assignments(c, corpus, jobs, chunks, artifact_dir,
         print(f"  05 assign: reusing all {len(jobs)} completed chunk artifact(s)")
         return [complete[job.id] for job in jobs]
 
+    reviewable_audits = {
+        job_id: recovery for job_id, recovery in reviewable_audits.items()
+        if job_id in {job.id for job in missing}
+    }
+    fresh_missing = [job for job in missing if job.id not in reviewable_audits]
     native_anthropic = bool(getattr(c, "native_anthropic_batches", False))
     wave_size = (STAGE05_ANTHROPIC_WAVE_SIZE if native_anthropic
-                 else len(missing))
+                 else max(len(fresh_missing), 1))
     print(f"  05 assign: {len(missing)} unfinished; {len(complete)} reusable")
+    if reviewable_audits:
+        chunk_ids = ", ".join(sorted(reviewable_audits))
+        print(f"  Stage 05 audit recovery: {len(reviewable_audits)} completed "
+              f"contract-invalid response(s) will go directly to one bounded "
+              f"reviewer each ({chunk_ids})")
+        print("  Original assignment calls replayed for these chunks: 0")
     if native_anthropic:
         print(f"  Stage 05 Anthropic waves: up to {wave_size} requests · "
               f"{STAGE05_ANTHROPIC_BATCH_INTERVAL_SECONDS}s minimum interval")
@@ -2740,13 +2928,15 @@ def _run_stage05_assignments(c, corpus, jobs, chunks, artifact_dir,
 
     runner = _Stage05BatchRunner(c, stats)
     proxy = _Stage05BatchProxy(runner)
-    adaptive_stats = AdaptiveStageStats(stage="05", total=len(missing))
+    adaptive_stats = AdaptiveStageStats(stage="05", total=len(fresh_missing))
 
     def persist_success(final_job, result):
         original = originals[final_job.id]
         rows = _decode_job_rows(original, result.text, "assignments")
         saved = _stage05_artifact(
-            original, chunks_by_id[original.id], corpus, rows, result)
+            original, chunks_by_id[original.id], corpus, rows, result,
+            deterministic_normalization=runner.normalization_events.get(
+                original.id))
         _json_atomic(os.path.join(artifact_dir, f"{original.id}.json"), saved)
         complete[original.id] = saved
         stats.successful_ids.add(original.id)
@@ -2758,18 +2948,35 @@ def _run_stage05_assignments(c, corpus, jobs, chunks, artifact_dir,
     # so an interrupted backoff never discards completed paid work.
     runner.success_callback = persist_success
 
-    try:
-        results, final_jobs = _run_adaptive_stage(
-            c, corpus, SEGMENT_PREAMBLE, missing, diagnostics_dir,
-            stage="05", key="assignments", wave_size=wave_size,
-            stats=adaptive_stats, debug=getattr(args, "segment_debug", False),
-            token_tiers=STAGE05_TOKEN_TIERS, batch_runner=runner,
-            success_callback=persist_success,
-            first_pass_exclusions=stats.grammar_retried_ids)
-    except BatchOutputError:
-        stats.hard_failure_ids.update(adaptive_stats.terminal_failure_ids)
-        _print_stage05_execution_summary(stats, adaptive_stats, len(jobs))
-        raise
+    results, final_jobs = {}, []
+    if fresh_missing:
+        try:
+            results, final_jobs = _run_adaptive_stage(
+                c, corpus, SEGMENT_PREAMBLE, fresh_missing, diagnostics_dir,
+                stage="05", key="assignments", wave_size=wave_size,
+                stats=adaptive_stats,
+                debug=getattr(args, "segment_debug", False),
+                token_tiers=STAGE05_TOKEN_TIERS, batch_runner=runner,
+                success_callback=persist_success,
+                first_pass_exclusions=stats.grammar_retried_ids)
+        except BatchOutputError:
+            stats.hard_failure_ids.update(adaptive_stats.terminal_failure_ids)
+            _print_stage05_execution_summary(stats, adaptive_stats, len(jobs))
+            raise
+
+    for job_id in sorted(reviewable_audits):
+        audited_job, result, reason, source, normalization = (
+            reviewable_audits[job_id])
+        results[job_id] = result
+        final_jobs.append(audited_job)
+        runner.normalization_events.update(
+            {job_id: {"chunk_id": job_id, **normalization}}
+            if normalization else {})
+        print("\n  STAGE 05 CONTRACT REVIEW")
+        print(f"  chunk: {job_id}")
+        print(f"  completed response reused from: {source}")
+        print(f"  contract violation: {reason}")
+        print("  original assignment call replayed: no")
 
     final_by_id = {job.id: job for job in final_jobs}
     errors = []
@@ -2780,18 +2987,40 @@ def _run_stage05_assignments(c, corpus, jobs, chunks, artifact_dir,
         result = results[original.id]
         repairs_before = adaptive_stats.json_repairs
         try:
+            result = _normalize_stage05_result(
+                final_job, result, runner.normalization_events)
             rows = _batch_rows(
                 {original.id: result}, [final_job], "assignments",
                 diagnostics_dir,
                 repair=lambda failed: _repair_batch(
-                    proxy, corpus, SEGMENT_PREAMBLE, failed, "assignments"),
+                    proxy, corpus, SEGMENT_PREAMBLE, failed, "assignments",
+                    preserve_guidance=(
+                        "Return the COMPLETE corrected assignment artifact for "
+                        "this chunk, including every valid row from the previous "
+                        "response plus one row for every omitted input evidence "
+                        "ID. The validated segment catalogue is in the system "
+                        "context. Do not return only the repaired or missing rows.")),
                 rerun=lambda failed, factor: _rerun_batch(
                     proxy, corpus, SEGMENT_PREAMBLE, failed, factor),
                 rerun_factor=1, adaptive_stats=adaptive_stats)
             repaired = adaptive_stats.json_repairs > repairs_before
+            rows, coverage_merge = _merge_stage05_incomplete_coverage(
+                original, result.text, rows)
+            if coverage_merge:
+                imported = ", ".join(
+                    str(value) for value in
+                    coverage_merge["imported_evidence_ids"])
+                print("\n  STAGE 05 INCOMPLETE-COVERAGE MERGE")
+                print(f"  chunk: {original.id}")
+                print(f"  existing rows preserved exactly: "
+                      f"{coverage_merge['preserved_existing_rows']}")
+                print(f"  reviewer rows imported only for missing IDs: {imported}")
+                print("  existing assignment decisions overwritten: 0")
             saved = _stage05_artifact(
                 original, chunks_by_id[original.id], corpus, rows, result,
-                repaired=repaired)
+                repaired=repaired,
+                deterministic_normalization=runner.normalization_events.get(
+                    original.id), incomplete_coverage_merge=coverage_merge)
             _json_atomic(os.path.join(
                 artifact_dir, f"{original.id}.json"), saved)
             complete[original.id] = saved
