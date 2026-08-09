@@ -37,6 +37,7 @@ PRICING = {
     "claude-opus-5":   {"in": 5.00, "out": 25.00},
     "claude-sonnet-5": {"in": 3.00, "out": 15.00},
     "claude-haiku-4-5": {"in": 1.00, "out": 5.00},
+    "claude-haiku-4-5-20251001": {"in": 1.00, "out": 5.00},
 }
 CACHE_WRITE_1H = 2.00   # 1-hour TTL write premium
 CACHE_READ = 0.10       # cache read discount
@@ -216,44 +217,75 @@ class Client:
 
     # ---------------------------------------------------------------- helpers
 
+    @staticmethod
+    def _normalise_system(system):
+        """Return valid Anthropic system content, or ``None`` when absent.
+
+        Anthropic rejects a text block whose text is empty.  Keep strings as
+        strings and structured blocks as blocks so counting and inference use
+        the caller's real request shape; only impossible empty text blocks are
+        removed.
+        """
+        if system is None:
+            return None
+        if isinstance(system, str):
+            return system if system.strip() else None
+
+        blocks = []
+        for block in system:
+            if (isinstance(block, dict) and block.get("type") == "text"
+                    and not str(block.get("text") or "").strip()):
+                continue
+            blocks.append(dict(block) if isinstance(block, dict) else block)
+        return blocks or None
+
     def _system(self, corpus: str, preamble: str):
         """Stable cached prefix. Nothing volatile may appear before the breakpoint —
         no timestamps, no per-job ids — or every job pays full price."""
-        return [
-            {"type": "text", "text": preamble},
-            {
-                "type": "text",
-                "text": corpus,
-                # 1h TTL: an extraction batch can take a while, and re-running a
-                # stage later in the same session should still hit the entry.
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
-            },
-        ]
+        blocks = []
+        if preamble and preamble.strip():
+            blocks.append({"type": "text", "text": preamble})
+        if corpus and corpus.strip():
+            blocks.append({"type": "text", "text": corpus})
+        if not blocks:
+            return None
+        # The cache breakpoint belongs on the last real block. This caches the
+        # complete stable prefix whether it consists of preamble + corpus or
+        # only one of them, and never creates an empty placeholder block.
+        blocks[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        return blocks
 
     def _params(self, system, prompt, max_tokens, schema=None, effort=None):
         p = {
             "model": self.model,
             "max_tokens": max_tokens,
-            "system": system,
             "messages": [{"role": "user", "content": prompt}],
-            # max_tokens caps thinking AND the response text together on Opus 5,
-            # and thinking is on by default — so effort is not just a quality
-            # dial, it decides how much of the budget is left to answer with.
-            "output_config": {"effort": (effort or self.effort)},
             # Adaptive is the default on Opus 5; set it explicitly so the intent
             # survives a model swap. No temperature/top_p — rejected on Opus 5.
             "thinking": {"type": "adaptive"},
         }
+        # Haiku 4.5 accepts adaptive thinking but rejects output_config.effort.
+        # Keep the reasoning mode, and omit only the unsupported control in both
+        # counting and inference because both paths are built here.
+        supports_effort = not self.model.startswith("claude-haiku-4-5")
+        output_config = ({"effort": (effort or self.effort)}
+                         if supports_effort else {})
+        system = self._normalise_system(system)
+        if system is not None:
+            p["system"] = system
         if (effort or "").lower() == "none":
             # Opus 5 accepts disabled thinking only at effort `high` or below,
             # so pin the level too rather than emit a combination the API 400s.
             # Note this is the documented-riskier setting on Opus 5 (it can leak
             # internal tags into the response); low effort is the safer default
             # and is what stage 01 ships with.
-            p["output_config"]["effort"] = "high"
+            if supports_effort:
+                output_config["effort"] = "high"
             p["thinking"] = {"type": "disabled"}
         if schema:
-            p["output_config"]["format"] = {"type": "json_schema", "schema": schema}
+            output_config["format"] = {"type": "json_schema", "schema": schema}
+        if output_config:
+            p["output_config"] = output_config
         return p
 
     def _track(self, usage):
@@ -273,21 +305,36 @@ class Client:
 
     # ---------------------------------------------------------------- costing
 
-    def count(self, system, prompt) -> int:
-        return self.client.messages.count_tokens(
-            model=self.model, system=system, messages=[{"role": "user", "content": prompt}]
-        ).input_tokens
+    def count(self, system, prompt, schema=None, effort=None) -> int:
+        """Use Anthropic's native counter with the real inference input shape.
+
+        ``count_tokens`` accepts the same system/messages/thinking/output-config
+        inputs as ``messages.create`` but does not accept ``max_tokens``. Build
+        through ``_params`` so estimation cannot drift from inference, remove
+        only that output-only field, and omit ``system`` entirely when absent.
+        """
+        params = self._params(system, prompt, 1, schema, effort)
+        params.pop("max_tokens")
+        return self.client.messages.count_tokens(**params).input_tokens
 
     def estimate(self, corpus, preamble, jobs, batched=False) -> Estimate:
         """Price a stage before running it. Counts the corpus once and each job's
         instruction separately, so the cached/uncached split is real rather than
         a guess."""
         system = self._system(corpus, preamble)
-        corpus_tokens = self.count(system, "x")
+        # Isolate the shared system contribution using two valid native counts.
+        # The no-system baseline is omitted from the request rather than encoded
+        # as the invalid [{"type": "text", "text": ""}] placeholder.
+        baseline_tokens = self.count(None, "x")
+        corpus_tokens = max(self.count(system, "x") - baseline_tokens, 0)
         est = Estimate(jobs=len(jobs), cached_tokens=corpus_tokens,
                        batched=batched, model=self.model)
         for j in jobs:
-            est.uncached_in += max(self.count([{"type": "text", "text": ""}], j.prompt), 0)
+            # Count the exact system + prompt + schema + effort structure the
+            # inference request will use, then allocate the stable prefix to the
+            # cached side of the estimate.
+            full_tokens = self.count(system, j.prompt, j.schema, j.effort)
+            est.uncached_in += max(full_tokens - corpus_tokens, 0)
             # Assume jobs run to ~55% of their cap; extraction output is verbose.
             est.est_out += int(j.max_tokens * 0.55)
         if corpus_tokens < CACHE_MIN_TOKENS:
@@ -301,8 +348,13 @@ class Client:
         """Write the cache entry before a fan-out. Parallel requests can't read a
         cache entry that is still being written, so without this every job in a
         batch pays the full corpus price."""
-        params = {"model": self.model, "max_tokens": 0,
-                  "system": self._system(corpus, preamble),
+        system = self._system(corpus, preamble)
+        if system is None:
+            if self.verbose:
+                print("  no non-empty system prefix — skipping cache warm-up")
+            return
+        params = {"model": self.model, "max_tokens": 1,
+                  "system": system,
                   "messages": [{"role": "user", "content": "warmup"}]}
         audit = auditlog.start("anthropic", self.model, "cache_prewarm", params,
                                job_id="warmup")
