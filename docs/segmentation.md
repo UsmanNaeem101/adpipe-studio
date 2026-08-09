@@ -103,7 +103,6 @@ Optional `project.json` settings live under `segmentation`:
     "03c_chunk_tokens": 8000,
     "03c_max_tokens": 12000,
     "03c_effort": "high",
-    "04_max_tokens": 16000,
     "04_effort": "high",
     "05_chunk_tokens": 8000,
     "05_effort": "high"
@@ -118,6 +117,12 @@ Stage 03B uses a separate `64,000 → 128,000` output-ceiling ladder because it 
 the complete canonical candidate catalogue in one response. The setting above controls
 its starting ceiling; only an actual `length`/`max_tokens` stop advances it. This does
 not change 03A's 12,000-token rolling-wave ceiling or any stage's reasoning policy.
+
+Stage 04 uses its own fixed `64,000 → 128,000 → 256,000` output-ceiling
+ladder. It starts at 64,000 and advances only after an actual
+`length`/`max_tokens` stop. The CLI reports completion, reasoning, and answer-token
+usage for every attempt. At 256,000, another budget stop is a handled terminal
+failure with diagnostics; no partial validation catalogue is accepted.
 
 Each 03B request receives a dynamic schema whose `source_candidate_ids` enum contains
 the exact code-owned IDs in the current 03A catalogue. Semantic keys, slugs, names, and

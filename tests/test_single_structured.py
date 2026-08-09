@@ -139,10 +139,75 @@ class SingleStructuredRecoveryTests(unittest.TestCase):
                     token_tiers=cli.STAGE03B_TOKEN_TIERS)
         self.assertEqual([call["max_tokens"] for call in client.calls], [128000])
 
+    def test_stage04_64k_length_promotes_to_128k(self):
+        client = ScriptedSingleClient([
+            llm.BatchResult("partial", "length", 60000, 64000),
+            llm.BatchResult('{"items":[1]}', "stop", 20000, 30000),
+        ])
+        stream = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(stream):
+            value = cli._run_single_structured(
+                client, "corpus", "preamble", job(64000), tmp,
+                token_tiers=cli.STAGE04_TOKEN_TIERS,
+                attempt_reporter=cli._report_stage04_attempt)
+        self.assertEqual(value, {"items": [1]})
+        self.assertEqual([call["max_tokens"] for call in client.calls],
+                         [64000, 128000])
+        self.assertIn("64k → 128k", stream.getvalue())
+        self.assertIn("60,000 reasoning, 4,000 answer", stream.getvalue())
+
+    def test_stage04_128k_length_promotes_to_256k(self):
+        client = ScriptedSingleClient([
+            llm.BatchResult("partial", "max_tokens", 120000, 128000),
+            llm.BatchResult('{"items":[2]}', "stop", 30000, 50000),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            value = cli._run_single_structured(
+                client, "corpus", "preamble", job(128000), tmp,
+                token_tiers=cli.STAGE04_TOKEN_TIERS)
+        self.assertEqual(value, {"items": [2]})
+        self.assertEqual([call["max_tokens"] for call in client.calls],
+                         [128000, 256000])
+
+    def test_stage04_256k_length_is_a_diagnostic_hard_failure(self):
+        client = ScriptedSingleClient([
+            llm.BatchResult("partial", "length", 240000, 256000),
+        ])
+        stream = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(stream):
+            with self.assertRaises(cli.BatchOutputError) as ctx:
+                cli._run_single_structured(
+                    client, "corpus", "preamble", job(256000), tmp,
+                    token_tiers=cli.STAGE04_TOKEN_TIERS,
+                    attempt_reporter=cli._report_stage04_attempt)
+        self.assertEqual([call["max_tokens"] for call in client.calls], [256000])
+        self.assertIn("maximum 256k ceiling", stream.getvalue())
+        self.assertIn("240,000 reasoning, 16,000 answer", stream.getvalue())
+        self.assertIn("finish_reason='length'", str(ctx.exception))
+
+    def test_stage04_accepts_a_valid_response_at_every_tier(self):
+        for tier in cli.STAGE04_TOKEN_TIERS:
+            with self.subTest(tier=tier):
+                client = ScriptedSingleClient([
+                    llm.BatchResult('{"items":[3]}', "stop", 1000, 2000),
+                ])
+                with tempfile.TemporaryDirectory() as tmp:
+                    value = cli._run_single_structured(
+                        client, "corpus", "preamble", job(tier), tmp,
+                        token_tiers=cli.STAGE04_TOKEN_TIERS)
+                self.assertEqual(value, {"items": [3]})
+                self.assertEqual([call["max_tokens"] for call in client.calls],
+                                 [tier])
+
     def test_single_call_tiers_are_stage_specific(self):
         self.assertEqual(cli._single_call_tiers(64000, cli.STAGE03B_TOKEN_TIERS),
                          (64000, 128000))
+        self.assertEqual(cli._single_call_tiers(64000, cli.STAGE04_TOKEN_TIERS),
+                         (64000, 128000, 256000))
         self.assertEqual(cli._single_call_tiers(16000), (16000, 24000, 32000))
+        self.assertEqual(cli.ADAPTIVE_TOKEN_TIERS,
+                         (12000, 16000, 24000, 32000))
+        self.assertEqual(cli.STAGE03B_TOKEN_TIERS, (64000, 128000))
 
     def test_03b_invalid_lineage_repairs_the_completed_response(self):
         completed = llm.BatchResult(json.dumps(

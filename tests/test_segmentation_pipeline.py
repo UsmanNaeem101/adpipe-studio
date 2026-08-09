@@ -1131,6 +1131,7 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
             self.assertEqual(candidates[0]["context_evidence_count"], 1)
             self.assertTrue(candidates[0]["representative_evidence_ids"])
             self.assertEqual(first.max_tokens_by_job["03b_consolidate"], 64000)
+            self.assertEqual(first.max_tokens_by_job["04_validate"], 64000)
             self.assertTrue(all(
                 ceiling == 12000 for job_id, ceiling in
                 first.max_tokens_by_job.items() if job_id.startswith("03a_")))

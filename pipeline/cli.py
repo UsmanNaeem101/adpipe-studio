@@ -407,6 +407,11 @@ ADAPTIVE_TOKEN_TIERS = (12000, 16000, 24000, 32000)
 # its legitimate answer shape—not reasoning—is larger than the general recovery
 # tiers. Keep this policy local to 03B's two consolidation calls.
 STAGE03B_TOKEN_TIERS = (64000, 128000)
+# Stage 04 asks DeepSeek for one complete validation decision catalogue. Live
+# telemetry showed its former 16k ceiling consumed 15,708 reasoning tokens and
+# left only 292 answer tokens, so this stage needs a substantially wider,
+# independently bounded ladder. Do not share it with the surrounding stages.
+STAGE04_TOKEN_TIERS = (64000, 128000, 256000)
 ADAPTIVE_OPENROUTER_WAVE_SIZE = 4
 ADAPTIVE_PROGRESS_WIDTH = 20
 
@@ -878,7 +883,7 @@ def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
                            token_tiers=ADAPTIVE_TOKEN_TIERS,
                            response_validator=None, repair_guidance=None,
                            validation_error_handler=None, initial_result=None,
-                           repair_merger=None):
+                           repair_merger=None, attempt_reporter=None):
     """Run one structured Job with failure-aware, bounded recovery.
 
     Budget stops retry the identical Job at the next coarse ceiling. Refusals,
@@ -903,6 +908,9 @@ def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
         else:
             result = _single_call_result(
                 client_, corpus, preamble, current, operation)
+
+        if attempt_reporter is not None:
+            attempt_reporter(current, result, repairing)
 
         if result.out_of_budget:
             reason = _failure_reason(result, "output budget exhausted")
@@ -1008,6 +1016,15 @@ def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
         else:
             print(f"  ! {job.id} returned malformed/schema-invalid JSON; "
                   "running one structured shape repair")
+
+
+def _report_stage04_attempt(job, result, repairing=False):
+    """Print the Stage 04 budget split for every inference attempt."""
+    phase = "repair" if repairing else "validation"
+    stop = result.stop_reason or "unknown"
+    usage = result.budget_note or "usage metadata unavailable"
+    print(f"  Stage 04 {phase} attempt at {_token_tier_label(job.max_tokens)}: "
+          f"finish_reason={stop} · {usage}")
 
 
 def _schema_issue(value, schema, path="$"):
@@ -2890,16 +2907,22 @@ def cmd_segment(cfg, args):
                     "metrics were computed in code and the evidence excerpts are a "
                     "bounded representative sample, not the whole corpus. Give every "
                     "candidate exactly one decision.\n\n" + packet),
-            max_tokens=int(_segment_setting(cfg, "04_max_tokens", 16000)),
+            max_tokens=STAGE04_TOKEN_TIERS[0],
             schema=validation_schema(
                 [row["segment_id"] for row in candidates]),
             effort=_segment_setting(cfg, "04_effort", None))
+        print(f"  Stage 04 starting ceiling: "
+              f"{_token_tier_label(STAGE04_TOKEN_TIERS[0])}")
+        print("  Stage 04 retry ladder: " + " → ".join(
+            _token_tier_label(tier) for tier in STAGE04_TOKEN_TIERS))
         if not confirm(c.estimate(s04, SEGMENT_PREAMBLE, [validation_job]),
                        getattr(args, "yes", False)):
             return
         decisions = _run_single_structured(
             c, s04, SEGMENT_PREAMBLE, validation_job,
-            os.path.join(diagnostics, "04_validate"))["decisions"]
+            os.path.join(diagnostics, "04_validate"),
+            token_tiers=STAGE04_TOKEN_TIERS,
+            attempt_reporter=_report_stage04_attempt)["decisions"]
         _validate_decision_coverage(decisions, candidates)
         _json_atomic(val_p, decisions)
         _json_atomic(val_meta, {"input_fingerprint": candidate_fingerprint})
