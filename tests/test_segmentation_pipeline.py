@@ -168,6 +168,105 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         self.assertIn("2 candidates; repeated per request", rendered)
         self.assertIn("1/2/3 min/median/max", rendered)
 
+    def test_03e_none_strength_invariant_is_normalized_locally(self):
+        valid_none = {
+            "evidence_id": 1, "segment_ids": [], "match_strength": "none"}
+        contradictory = {
+            "evidence_id": 2, "segment_ids": ["seg_001"],
+            "match_strength": "none", "untouched": "preserve me"}
+        rows = [valid_none, contradictory]
+
+        events = segmentation.normalize_expansion_matches(
+            rows, chunk_id="03e_0000")
+
+        self.assertEqual(valid_none, {
+            "evidence_id": 1, "segment_ids": [], "match_strength": "none"})
+        self.assertEqual(contradictory, {
+            "evidence_id": 2, "segment_ids": [], "match_strength": "none",
+            "untouched": "preserve me"})
+        self.assertEqual(events, [{
+            "chunk_id": "03e_0000", "evidence_id": 2,
+            "removed_segment_ids": ["seg_001"],
+        }])
+        segmentation.validate_match_rows(rows, ["seg_001"])
+
+    def test_03e_strong_or_corroborating_empty_keeps_existing_contract(self):
+        rows = [
+            {"evidence_id": 1, "segment_ids": [], "match_strength": "strong"},
+            {"evidence_id": 2, "segment_ids": [],
+             "match_strength": "corroborating"},
+        ]
+        self.assertEqual(segmentation.normalize_expansion_matches(rows), [])
+        segmentation.validate_match_rows(rows, ["seg_001"])
+
+    def test_53_cached_03e_batches_normalize_without_model_calls(self):
+        chunks = [{
+            "chunk_id": f"03e_{index:04d}", "evidence_ids": [index + 1],
+            "estimated_tokens": 4, "records": [record(index + 1)],
+        } for index in range(53)]
+        schema = segmentation.expansion_schema(["seg_001"])
+        jobs = [Job(
+            id=chunk["chunk_id"], prompt="match evidence", max_tokens=12000,
+            schema=schema, expected_ids=tuple(chunk["evidence_ids"]))
+            for chunk in chunks]
+        events = []
+
+        def cleaner(current_job, rows):
+            cleaned = segmentation.normalize_expansion_matches(
+                rows, chunk_id=current_job.id)
+            events.extend(cleaned)
+            return cleaned
+
+        with tempfile.TemporaryDirectory() as tmp:
+            before = {}
+            for index, (job, chunk) in enumerate(zip(jobs, chunks)):
+                row = {
+                    "evidence_id": index + 1,
+                    "segment_ids": (["seg_001"] if index == 22 else []),
+                    "match_strength": "none",
+                }
+                saved = {
+                    "chunk_id": job.id, "evidence_ids": chunk["evidence_ids"],
+                    "estimated_input_tokens": 4,
+                    "fingerprint": cli._job_fingerprint(
+                        job, chunk["evidence_ids"], "03e skill"),
+                    "matches": [row],
+                }
+                path = os.path.join(tmp, job.id + ".json")
+                cli._json_atomic(path, saved)
+                with open(path, "rb") as fh:
+                    before[job.id] = fh.read()
+
+            client = mock.Mock()
+            results = cli._run_persisted_segment_jobs(
+                client, "03e skill", jobs, chunks, "matches", tmp,
+                os.path.join(tmp, "failures"), SimpleNamespace(yes=True), "03E",
+                row_cleaner=cleaner,
+                local_cleanup_key="deterministic_normalization")
+
+            client.estimate.assert_not_called()
+            client.prewarm.assert_not_called()
+            client.batch.assert_not_called()
+            self.assertEqual(len(results), 53)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(results[22]["matches"][0]["segment_ids"], [])
+            for job in jobs:
+                path = os.path.join(tmp, job.id + ".json")
+                with open(path, "rb") as fh:
+                    after = fh.read()
+                if job.id == "03e_0022":
+                    self.assertNotEqual(after, before[job.id])
+                    with open(path, encoding="utf-8") as fh:
+                        migrated = json.load(fh)
+                    self.assertEqual(
+                        migrated["deterministic_normalization"][0]
+                        ["removed_segment_ids"], ["seg_001"])
+                else:
+                    self.assertEqual(after, before[job.id])
+
+            all_rows = [row for result in results for row in result["matches"]]
+            segmentation.validate_match_rows(all_rows, ["seg_001"])
+
     def test_supporting_and_context_do_not_enter_initial_discovery(self):
         rows = [record(1, "core"), record(2, "supporting"), record(3, "context")]
         self.assertEqual(

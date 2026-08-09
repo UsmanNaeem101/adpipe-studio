@@ -1136,6 +1136,7 @@ def _as_result(value):
 # 3x the budget. Batched stages use the same factor so a stage behaves the same
 # whether it ran as one call or eighty.
 BUDGET_RETRY_FACTOR = 3
+MAX_BATCH_REPAIR_ATTEMPTS = 1
 
 
 def _failure_reason(result, parse_error):
@@ -1403,12 +1404,14 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
             failures = [f for f in failures if not f[1].retryable] + still_bad
 
     # ---- wrong-shape replies: ask the model to fix the shape ----------------
-    if failures and repair is not None:
+    repair_attempts = 0
+    if failures and repair is not None and MAX_BATCH_REPAIR_ATTEMPTS:
         # Only replies that actually contain text. An empty one has no shape to
         # repair — that was the original failure, and sending "" to the repair
         # prompt just pays for a second helping of it.
         fixable = [f for f in failures if f[1].repairable]
         if fixable:
+            repair_attempts += 1
             if adaptive_stats is not None:
                 adaptive_stats.json_repairs += len(fixable)
             print(f"  ! repairing {len(fixable)} malformed {key} response(s) "
@@ -1457,7 +1460,9 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
         breakdown = ", ".join(f"{n} {name}" for name, n in modes.most_common())
         raise BatchOutputError(
             f"{len(descriptions)}/{len(jobs)} batch response(s) could not be used "
-            f"after recovery — {breakdown} ({sample}). Original, re-run and repaired "
+            f"after recovery (bounded repair attempts: {repair_attempts}/"
+            f"{MAX_BATCH_REPAIR_ATTEMPTS}) — {breakdown} ({sample}). Original, "
+            "re-run and repaired "
             f"responses were saved to {diagnostics_dir}. No stage output was written.")
     return [row for jid in sorted(decoded) for row in decoded[jid]]
 
@@ -2125,7 +2130,8 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                                 repair_guidance=None,
                                 contract_version="", compatible_jobs=None,
                                 compatible_fingerprints=None,
-                                cached_migrator=None):
+                                cached_migrator=None,
+                                local_cleanup_key="provenance_cleanup"):
     """Run missing chunk jobs with adaptive budgets and persist each result."""
     from llm import confirm
 
@@ -2175,7 +2181,7 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                     if (saved.get("fingerprint") != fingerprint or locally_cleaned
                             or locally_migrated):
                         if locally_cleaned:
-                            saved["provenance_cleanup"] = locally_cleaned
+                            saved[local_cleanup_key] = locally_cleaned
                         if saved.get("fingerprint") != fingerprint:
                             saved["migrated_from_fingerprint"] = saved.get("fingerprint")
                         saved["fingerprint"] = fingerprint
@@ -2701,15 +2707,35 @@ def cmd_segment(cfg, args):
         expected_ids=tuple(chunk["evidence_ids"]),
         effort=_segment_setting(cfg, "03e_effort", None))
         for chunk, evidence_payload in zip(chunks03e, evidence03e)]
+    normalization_events03e = {}
+
+    def clean03e(job, rows):
+        events = segmentation.normalize_expansion_matches(rows, chunk_id=job.id)
+        for event in events:
+            signature = (event["chunk_id"], event["evidence_id"],
+                         tuple(event["removed_segment_ids"]))
+            normalization_events03e[signature] = event
+        return events
+
     _print_stage03e_prompt_composition(_stage03e_prompt_composition(
         skill03e, catalogue03e, jobs03e, evidence03e))
     results03e = _run_persisted_segment_jobs(
         c, s03e, jobs03e, chunks03e, "matches",
         os.path.join(discovery, "03e_chunk_matches"),
         os.path.join(diagnostics, "03e"), args, "03E",
-        force=_segment_force(args, "03b"))
+        force=_segment_force(args, "03b"), row_cleaner=clean03e,
+        local_cleanup_key="deterministic_normalization")
     if results03e is None:
         return
+    if normalization_events03e:
+        events = list(normalization_events03e.values())
+        print("\n  03E deterministic normalization:")
+        print(f"    {len(events)} rows had match_strength=\"none\" with "
+              "segment_ids present")
+        print("    segment_ids cleared")
+        print(f"    {len({event['chunk_id'] for event in events})} batch "
+              "artifact(s) normalized")
+        print("    0 model calls made")
     matches = [row for result in results03e for row in result["matches"]]
     _require_exact_ids(matches, {row["id"] for row in items}, "03E evidence expansion")
     segmentation.validate_match_rows(matches, [row["segment_id"] for row in initial])

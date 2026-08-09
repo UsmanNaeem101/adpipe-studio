@@ -268,6 +268,14 @@ class BatchRecoveryTests(unittest.TestCase):
         self.assertEqual(rec.rerun_calls, [])
         self.assertIn("1 missing", rec.repair_calls[0][0][1])
 
+    def test_malformed_repair_is_bounded_to_one_paid_attempt(self):
+        rec = Recorder({("repair", "a"): '{"records": ['})
+        with self.assertRaises(cli.BatchOutputError) as ctx:
+            self.run_rows(
+                {"a": llm.BatchResult("not json", "end_turn")}, [job("a")], rec)
+        self.assertEqual(len(rec.repair_calls), 1)
+        self.assertIn("bounded repair attempts: 1/1", str(ctx.exception))
+
     def test_refusal_is_neither_rerun_nor_repaired(self):
         rec = Recorder()
         with self.assertRaises(cli.BatchOutputError) as ctx:

@@ -274,6 +274,30 @@ def expansion_schema(segment_ids):
         "segment_ids"]["items"]["enum"] = list(segment_ids)
     return schema
 
+
+def normalize_expansion_matches(rows, chunk_id=None):
+    """Clear impossible candidate references from explicit non-matches.
+
+    This is a state invariant, not a semantic judgement: `none` means that the
+    evidence supports no canonical candidate. Only `segment_ids` changes; row
+    order, evidence identity, strength, and every unrelated field are retained.
+    """
+    events = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("match_strength") != "none":
+            continue
+        segment_ids = row.get("segment_ids")
+        if not isinstance(segment_ids, list) or not segment_ids:
+            continue
+        removed = list(segment_ids)
+        row["segment_ids"] = []
+        events.append({
+            "chunk_id": chunk_id,
+            "evidence_id": row.get("evidence_id"),
+            "removed_segment_ids": removed,
+        })
+    return events
+
 NOVELTY_SCHEMA = {
     "type": "object",
     "properties": {"audits": {"type": "array", "items": {
@@ -718,8 +742,10 @@ def validate_match_rows(rows, segment_ids):
         unknown = set(matches) - allowed
         if unknown:
             raise ValueError(f"evidence {row.get('evidence_id')} matched unknown candidate")
-        if row.get("match_strength") == "none" and matches:
-            raise ValueError("a none-strength expansion match cannot name candidates")
+        strength = row.get("match_strength")
+        if matches and strength not in ("strong", "corroborating"):
+            raise ValueError(
+                "an expansion match with candidates must be strong or corroborating")
 
 
 def assemble_candidate_evidence(candidates, match_rows, records):
