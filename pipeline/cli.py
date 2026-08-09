@@ -20,6 +20,7 @@ skip the prompt. -p/--project selects the project (default: montisella).
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import datetime
 import hashlib
@@ -50,6 +51,10 @@ EXTRACTORS = list(range(7, 27))
 EMPTY_EXTRACTION_RETRIES = 3
 PRODUCTION_VOC_FILE = "production_voc.jsonl"
 AUDIT_VOC_FILE = "audit_voc.jsonl"
+STAGE03E_CATALOGUE_MARKER = "\n\nCANONICAL CANDIDATES:\n"
+STAGE03E_EVIDENCE_PREFIX = (
+    "Return exactly one match row per evidence item.\n\nEVIDENCE:\n"
+)
 
 # Extraction depth presets. Keep these definitions as the single source of truth
 # for both the CLI and Studio so the selected label always matches the jobs run.
@@ -467,6 +472,91 @@ def _token_distribution(values):
 
 def _format_token_value(value):
     return f"{value:,.0f}" if float(value).is_integer() else f"{value:,.1f}"
+
+
+def _approx_prompt_tokens(text):
+    """Match the OpenRouter planning estimate used elsewhere in the CLI."""
+    return max(len(text) // 4, 1)
+
+
+def _stage03e_prompt_composition(skill_text, catalogue_json, jobs,
+                                 evidence_payloads):
+    """Estimate rendered 03E prompt components without changing the request.
+
+    Providers expose an actual token count only for the complete prompt, not for
+    individual prompt regions. This diagnostic therefore uses the same labelled
+    ~4-characters/token estimate as the OpenRouter cost preview, but measures the
+    exact strings that Stage 03E is about to send.
+    """
+    if not jobs or len(jobs) != len(evidence_payloads):
+        raise ValueError("03E composition requires one evidence payload per job")
+
+    instructions = _approx_prompt_tokens(
+        SEGMENT_PREAMBLE + "\n\n" + skill_text +
+        STAGE03E_EVIDENCE_PREFIX.removesuffix("EVIDENCE:\n"))
+    catalogue = _approx_prompt_tokens(catalogue_json)
+    evidence_tokens = [_approx_prompt_tokens(text) for text in evidence_payloads]
+    item_counts = [len(job.expected_ids or ()) for job in jobs]
+
+    schema_other = []
+    for job in jobs:
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {"name": "result", "strict": True,
+                            "schema": job.schema},
+        }
+        rendered = (STAGE03E_CATALOGUE_MARKER + "EVIDENCE:\n" +
+                    json.dumps(response_format, ensure_ascii=False,
+                               separators=(",", ":")))
+        schema_other.append(_approx_prompt_tokens(rendered))
+
+    median_evidence = statistics.median(evidence_tokens)
+    representative = min(
+        range(len(jobs)),
+        key=lambda index: (abs(evidence_tokens[index] - median_evidence), index))
+    totals = [instructions + catalogue + evidence_tokens[index] +
+              schema_other[index] for index in range(len(jobs))]
+    return {
+        "job_id": jobs[representative].id,
+        "instructions": instructions,
+        "candidate_catalogue": catalogue,
+        "evidence_batch": evidence_tokens[representative],
+        "schema_other": schema_other[representative],
+        "total": totals[representative],
+        "candidate_count": len(json.loads(catalogue_json)),
+        "batch_count": len(jobs),
+        "evidence_items": item_counts[representative],
+        "evidence_item_range": (min(item_counts), statistics.median(item_counts),
+                                max(item_counts)),
+        "evidence_token_range": (min(evidence_tokens),
+                                 statistics.median(evidence_tokens),
+                                 max(evidence_tokens)),
+        "total_token_range": (min(totals), statistics.median(totals), max(totals)),
+    }
+
+
+def _print_stage03e_prompt_composition(composition):
+    low_items, median_items, high_items = composition["evidence_item_range"]
+    low_tokens, median_tokens, high_tokens = composition["evidence_token_range"]
+    low_total, median_total, high_total = composition["total_token_range"]
+    candidate_label = ("candidate" if composition["candidate_count"] == 1
+                       else "candidates")
+    print("\n  03E prompt composition per request (~4 chars/token):")
+    print(f"    representative:      {composition['job_id']} "
+          f"({composition['evidence_items']} evidence items)")
+    print(f"    instructions:        {composition['instructions']:,} tokens")
+    print(f"    candidate catalogue: {composition['candidate_catalogue']:,} tokens "
+          f"({composition['candidate_count']} {candidate_label}; repeated per request)")
+    print(f"    evidence batch:      {composition['evidence_batch']:,} tokens")
+    print(f"    schema/other:        {composition['schema_other']:,} tokens")
+    print(f"    total:               {composition['total']:,} tokens")
+    print(f"    requests:            {composition['batch_count']}")
+    print(f"    evidence items:      {low_items}/{_format_token_value(median_items)}/"
+          f"{high_items} min/median/max")
+    print(f"    evidence tokens:     {low_tokens:,}/"
+          f"{_format_token_value(median_tokens)}/{high_tokens:,} min/median/max")
+    print(f"    total tokens:        {low_total:,}/"
+          f"{_format_token_value(median_total)}/{high_total:,} min/median/max")
 
 
 def _print_token_distribution(label, values, total):
@@ -1719,7 +1809,7 @@ VALIDATION_SCHEMA = {
     "properties": {"decisions": {"type": "array", "items": {
         "type": "object",
         "properties": {
-            "slug": {"type": "string"},
+            "segment_id": {"type": "string"},
             "status": {"type": "string",
                        "enum": ["validated", "merged", "split_required",
                                 "needs_more_research", "rejected"]},
@@ -1727,10 +1817,17 @@ VALIDATION_SCHEMA = {
             "merged_into": {"type": "string"},
             "split_into": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["slug", "status", "rationale", "merged_into", "split_into"],
+        "required": ["segment_id", "status", "rationale", "merged_into", "split_into"],
         "additionalProperties": False}}},
     "required": ["decisions"], "additionalProperties": False,
 }
+
+
+def validation_schema(segment_ids):
+    schema = copy.deepcopy(VALIDATION_SCHEMA)
+    schema["properties"]["decisions"]["items"]["properties"][
+        "segment_id"]["enum"] = list(segment_ids)
+    return schema
 
 ASSIGN_SCHEMA = {
     "type": "object",
@@ -1756,6 +1853,14 @@ ASSIGN_SCHEMA = {
         "additionalProperties": False}}},
     "required": ["assignments"], "additionalProperties": False,
 }
+
+
+def assignment_schema(evidence_ids, segment_ids):
+    schema = copy.deepcopy(ASSIGN_SCHEMA)
+    row = schema["properties"]["assignments"]["items"]["properties"]
+    row["evidence_id"]["enum"] = list(evidence_ids)
+    row["primary_segment_id"]["enum"] = [""] + list(segment_ids)
+    return schema
 
 
 def _stage03_corpus_text(items, limit=None):
@@ -2018,10 +2123,12 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                         compatible, chunk["evidence_ids"], corpus,
                         contract_version))
                 if saved.get("fingerprint") in acceptable:
-                    if (saved.get("fingerprint") != fingerprint
-                            and cached_migrator is not None):
-                        saved[key] = cached_migrator(
+                    locally_migrated = False
+                    if cached_migrator is not None:
+                        migrated_rows = cached_migrator(
                             job, saved.get(key, []), saved.get("fingerprint"))
+                        locally_migrated = migrated_rows != saved.get(key, [])
+                        saved[key] = migrated_rows
                     locally_cleaned = []
                     if row_cleaner is not None:
                         try:
@@ -2039,7 +2146,8 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                                 cached_repairs.append((job, chunk, saved, error))
                                 continue
                             raise
-                    if saved.get("fingerprint") != fingerprint or locally_cleaned:
+                    if (saved.get("fingerprint") != fingerprint or locally_cleaned
+                            or locally_migrated):
                         if locally_cleaned:
                             saved["provenance_cleanup"] = locally_cleaned
                         if saved.get("fingerprint") != fingerprint:
@@ -2090,6 +2198,8 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                     rerun=lambda failed, factor: _rerun_batch(
                         c, corpus, SEGMENT_PREAMBLE, failed, factor),
                     row_validator=row_validator, row_cleaner=row_cleaner)
+                if cached_migrator is not None:
+                    rows = cached_migrator(original, rows, None)
                 chunk = chunks_by_id[job.id]
                 saved = {
                     "chunk_id": job.id,
@@ -2137,7 +2247,8 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
             repaired["fingerprint"] = _job_fingerprint(
                 job, chunk["evidence_ids"], corpus, contract_version)
             repaired["contract_repaired"] = True
-            repaired[key] = rows
+            repaired[key] = (cached_migrator(job, rows, None)
+                             if cached_migrator is not None else rows)
             _json_atomic(os.path.join(artifact_dir, f"{job.id}.json"), repaired)
             complete[job.id] = repaired
     else:
@@ -2146,8 +2257,8 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
 
 
 def _validate_decision_coverage(decisions, candidates):
-    expected = [row["slug"] for row in candidates]
-    got = [row.get("slug") for row in decisions]
+    expected = [row["segment_id"] for row in candidates]
+    got = [row.get("segment_id") for row in decisions]
     if Counter(expected) != Counter(got):
         raise BatchOutputError(
             "Stage 04 did not return exactly one decision per discovered candidate")
@@ -2155,19 +2266,19 @@ def _validate_decision_coverage(decisions, candidates):
 
 def _remap_expansion_matches(matches, initial, final):
     """Carry 03E matches through the one allowed novelty consolidation cycle."""
-    initial_keys = {row["candidate_id"]: set(row["merged_candidate_keys"])
-                    for row in initial}
-    final_keys = {row["candidate_id"]: set(row["merged_candidate_keys"])
-                  for row in final}
+    initial_sources = {row["segment_id"]: set(row["source_candidate_ids"])
+                       for row in initial}
+    final_sources = {row["segment_id"]: set(row["source_candidate_ids"])
+                     for row in final}
     output = []
     for row in matches:
         mapped = set()
-        for old_id in row["candidate_ids"]:
-            for new_id, keys in final_keys.items():
-                if keys.intersection(initial_keys.get(old_id, set())):
+        for old_id in row["segment_ids"]:
+            for new_id, source_ids in final_sources.items():
+                if source_ids.intersection(initial_sources.get(old_id, set())):
                     mapped.add(new_id)
         item = dict(row)
-        item["candidate_ids"] = sorted(mapped)
+        item["segment_ids"] = sorted(mapped)
         if not mapped:
             item["match_strength"] = "none"
         output.append(item)
@@ -2178,13 +2289,10 @@ def _print_03b_contract_error(error, *, repairing=False, diagnostics_dir=None):
     title = "03B CONTRACT REPAIR FAILED" if repairing else "03B CONTRACT ERROR"
     print(f"\n  {title}")
     for violation in error.invalid_references:
-        identity = violation.get("candidate_id") or violation.get("slug") or "unknown"
-        print(f"  candidate: {identity}")
-        if violation.get("slug") and violation.get("slug") != identity:
-            print(f"  canonical slug: {violation['slug']}")
-        print("  invalid provisional keys: " +
-              json.dumps(violation["invalid_keys"], ensure_ascii=False))
-    print("  Source lineage must use exact candidate_key values from Stage 03A.")
+        print(f"  canonical slug: {violation.get('slug') or 'unknown'}")
+        print("  invalid source candidate IDs: " +
+              json.dumps(violation["invalid_ids"], ensure_ascii=False))
+    print("  Source lineage must use exact machine candidate_id values from Stage 03A.")
     if diagnostics_dir:
         print(f"  Diagnostics saved to: {diagnostics_dir}")
     if not repairing:
@@ -2204,14 +2312,12 @@ def _run_03b_consolidation(client_, corpus, preamble, job, catalogue,
         token_tiers=STAGE03B_TOKEN_TIERS,
         response_validator=validate,
         repair_guidance=(
-            "Return a repair row for every candidate identified by the contract "
-            "error; do not omit any affected candidate. The pipeline will merge "
-            "those rows into the complete original collection by candidate_id. "
-            "Correct only merged_candidate_keys, replacing invented or rewritten "
-            "source keys with exact candidate_key values from the supplied 03A "
-            "catalogue that the candidate genuinely merged. Preserve candidate_id "
-            "exactly. Do not change a canonical slug, name, definition, or other "
-            "valid content; non-lineage changes will be ignored."),
+            "Act as a bounded reconciliation reviewer. Return the COMPLETE original "
+            "candidate collection in the same order and with the same row count. "
+            "Correct only invalid source_candidate_ids by selecting exact machine "
+            "candidate_id values from the supplied 03A catalogue. Preserve every "
+            "slug, name, definition, criterion, status, alias, and already-valid "
+            "source ID exactly. A partial collection is invalid."),
         validation_error_handler=lambda error, **context:
             _print_03b_contract_error(error, **context)
             if isinstance(error, segmentation.ConsolidationContractError) else None,
@@ -2391,6 +2497,9 @@ def cmd_segment(cfg, args):
     # while genuinely structural/semantic failures alone enter model repair.
     legacy_jobs03a = [dataclasses.replace(
         job, schema=segmentation.HARVEST_SCHEMA) for job in jobs03a]
+    legacy_v2_jobs03a = [dataclasses.replace(
+        job, schema=segmentation.legacy_harvest_schema_v2(
+            chunk["evidence_ids"])) for job, chunk in zip(jobs03a, chunks03a)]
     legacy_v1_jobs03a = [dataclasses.replace(
         job, prompt=segmentation.legacy_harvest_prompt_v1(chunk["records"]),
         schema=segmentation.legacy_harvest_schema_v1())
@@ -2400,11 +2509,19 @@ def cmd_segment(cfg, args):
             job, chunk["evidence_ids"], segmentation.LEGACY_HARVEST_SKILL_V1)}
         for job, chunk in zip(legacy_v1_jobs03a, chunks03a)
     }
+    compatible_03a_fingerprints = {
+        job.id: legacy_v1_fingerprints[job.id] | {
+            _job_fingerprint(
+                legacy_v2, chunk["evidence_ids"],
+                segmentation.LEGACY_HARVEST_SKILL_V2,
+                segmentation.HARVEST_CONTRACT_VERSION)}
+        for job, legacy_v2, chunk in zip(jobs03a, legacy_v2_jobs03a, chunks03a)
+    }
     repair03a = (
         "Preserve every discovered candidate and every valid supporting evidence "
         "ID from the previous response. Correct only contract violations: "
-        "deduplicate repeated IDs and repair invalid keys, invalid enum values, "
-        "or empty required fields. If a candidate has no valid supporting ID, cite "
+        "deduplicate repeated IDs and repair invalid enum values or empty required "
+        "fields. If a candidate has no valid supporting ID, cite "
         "only supplied IDs that genuinely support it, or omit that candidate when "
         "none do. Do not merge, add, or reinterpret candidates. Input evidence may "
         "remain unassigned.")
@@ -2419,9 +2536,10 @@ def cmd_segment(cfg, args):
             repair_guidance=repair03a,
             contract_version=segmentation.HARVEST_CONTRACT_VERSION,
             compatible_jobs=legacy_jobs03a,
-            compatible_fingerprints=legacy_v1_fingerprints,
-            cached_migrator=lambda _job, rows, _fingerprint:
-                segmentation.migrate_legacy_harvest_rows(rows))
+            compatible_fingerprints=compatible_03a_fingerprints,
+            cached_migrator=lambda job, rows, _fingerprint:
+                segmentation.assign_harvest_candidate_ids(
+                    segmentation.migrate_legacy_harvest_rows(rows), job.id))
 
     results03a = run03a()
     if results03a is None:
@@ -2465,9 +2583,11 @@ def cmd_segment(cfg, args):
                 f"Diagnostics: {os.path.join(diagnostics, '03a')}. Resume with: "
                 f"./adpipe -p {project} segment") from final_error
     catalogue_p = os.path.join(discovery, "03a_candidate_catalogue.json")
+    legacy_catalogue = (_load_json(catalogue_p)
+                        if os.path.isfile(catalogue_p) else None)
     _json_atomic(catalogue_p, catalogue)
-    print(f"  03A harvest: {len(chunks03a)} chunks · {len(catalogue)} recurring "
-          f"provisional candidates -> {catalogue_p}")
+    print(f"  03A harvest: {len(chunks03a)} chunks · {len(catalogue)} provisional "
+          f"candidates -> {catalogue_p}")
     if not catalogue:
         sys.exit("Stage 03A found no recurring candidate with at least two Core IDs.")
 
@@ -2476,26 +2596,43 @@ def cmd_segment(cfg, args):
     initial_p = os.path.join(discovery, "03b_initial_consolidated_candidates.json")
     initial_meta = initial_p + ".meta.json"
     catalogue_fingerprint = _value_fingerprint(catalogue)
-    if (os.path.isfile(initial_p) and not _segment_force(args, "03b")
+    initial = None
+    force03b = _segment_force(args, "03b")
+    if (os.path.isfile(initial_p) and not force03b
             and _meta_matches(initial_meta, catalogue_fingerprint)):
         initial = _load_json(initial_p)
         print(f"  03B consolidate: reusing {len(initial)} candidates")
-    else:
+    elif os.path.isfile(initial_p) and legacy_catalogue and not force03b:
+        try:
+            initial = segmentation.migrate_legacy_consolidated(
+                _load_json(initial_p), legacy_catalogue, catalogue)
+        except (KeyError, TypeError, ValueError) as migration_error:
+            print("  03B machine-lineage migration could not prove every old join: "
+                  f"{migration_error}")
+            print("  Only Stage 03B will be rerun; completed Stage 03A work is safe.")
+        else:
+            _json_atomic(initial_p, initial)
+            _json_atomic(initial_meta, {"input_fingerprint": catalogue_fingerprint})
+            print(f"  03B lineage migration: recovered all {len(initial)} canonical "
+                  "segments from exact saved 03A provenance")
+            print("  0 model calls made; Stage 03A and 03B semantic work preserved")
+    if initial is None:
         schema03b = segmentation.consolidate_schema(
-            row["candidate_key"] for row in catalogue)
+            row["candidate_id"] for row in catalogue)
         job03b = Job(
             id="03b_consolidate",
             prompt=("Consolidate this complete provisional catalogue globally. "
-                    "Canonical candidate IDs, slugs, and names may be new. Every "
-                    "merged_candidate_keys value is source lineage and must be "
-                    "copied exactly from a candidate_key in this catalogue; never "
-                    "invent or rewrite one. Do not output a validation status."
+                    "Rename, merge, and split semantic concepts freely. Return "
+                    "source_candidate_ids by selecting exact machine candidate_id "
+                    "values from this catalogue. Do not create a canonical machine "
+                    "ID; code assigns segment_id after parsing. Do not output a "
+                    "validation status."
                     "\n\nCATALOGUE:\n" +
                     json.dumps(catalogue, ensure_ascii=False, indent=2)),
             max_tokens=int(_segment_setting(cfg, "03b_max_tokens", 64000)),
             schema=schema03b,
             effort=_segment_setting(cfg, "03b_effort", None))
-        audit_recovery = (None if _segment_force(args, "03b") else
+        audit_recovery = (None if force03b else
                           _03b_audit_recovery(
                               cfg["_dir"], job03b.id, catalogue))
         if audit_recovery:
@@ -2518,22 +2655,28 @@ def cmd_segment(cfg, args):
 
     # ------------------------------------------------------- evidence expansion
     defs = [{k: row[k] for k in
-             ("candidate_id", "slug", "name", "definition",
+             ("segment_id", "slug", "name", "definition",
               "commercial_distinction", "inclusion_criteria", "exclusion_criteria")}
             for row in initial]
-    s03e = (skill_named("03e_expand_segment_evidence.md") +
-            "\n\nCANONICAL CANDIDATES:\n" + json.dumps(defs, ensure_ascii=False, indent=2))
+    skill03e = skill_named("03e_expand_segment_evidence.md")
+    catalogue03e = json.dumps(defs, ensure_ascii=False, indent=2)
+    s03e = skill03e + STAGE03E_CATALOGUE_MARKER + catalogue03e
     chunks03e = segmentation.chunk_by_tokens(
         items, int(_segment_setting(cfg, "03e_chunk_tokens", 8000)), "03e")
     segmentation.assert_exact_chunk_coverage(chunks03e, [row["id"] for row in items])
+    evidence03e = [segmentation.evidence_text(chunk["records"], include_tier=True)
+                   for chunk in chunks03e]
     jobs03e = [Job(
         id=chunk["chunk_id"],
-        prompt=("Return exactly one match row per evidence item.\n\nEVIDENCE:\n" +
-                segmentation.evidence_text(chunk["records"], include_tier=True)),
+        prompt=STAGE03E_EVIDENCE_PREFIX + evidence_payload,
         max_tokens=int(_segment_setting(cfg, "03e_max_tokens", 12000)),
-        schema=segmentation.EXPANSION_SCHEMA,
+        schema=segmentation.expansion_schema(
+            [row["segment_id"] for row in initial]),
         expected_ids=tuple(chunk["evidence_ids"]),
-        effort=_segment_setting(cfg, "03e_effort", None)) for chunk in chunks03e]
+        effort=_segment_setting(cfg, "03e_effort", None))
+        for chunk, evidence_payload in zip(chunks03e, evidence03e)]
+    _print_stage03e_prompt_composition(_stage03e_prompt_composition(
+        skill03e, catalogue03e, jobs03e, evidence03e))
     results03e = _run_persisted_segment_jobs(
         c, s03e, jobs03e, chunks03e, "matches",
         os.path.join(discovery, "03e_chunk_matches"),
@@ -2543,12 +2686,12 @@ def cmd_segment(cfg, args):
         return
     matches = [row for result in results03e for row in result["matches"]]
     _require_exact_ids(matches, {row["id"] for row in items}, "03E evidence expansion")
-    segmentation.validate_match_rows(matches, [row["candidate_id"] for row in initial])
+    segmentation.validate_match_rows(matches, [row["segment_id"] for row in initial])
     meter_03e = _model_meter(c)
 
     # -------------------------------------------------------- 03C novelty audit
     strongly_covered = {row["evidence_id"] for row in matches
-                        if row["match_strength"] == "strong" and row["candidate_ids"]}
+                        if row["match_strength"] == "strong" and row["segment_ids"]}
     novelty_items = [row for row in core_items if row["id"] not in strongly_covered]
     if getattr(args, "novelty_supporting", False):
         novelty_items += [row for row in items if row["tier"] == "supporting"]
@@ -2594,14 +2737,15 @@ def cmd_segment(cfg, args):
     elif novelty:
         combined = catalogue + novelty
         schema03b = segmentation.consolidate_schema(
-            row["candidate_key"] for row in combined)
+            row["candidate_id"] for row in combined)
         job03b2 = Job(
             id="03b_novelty_consolidate",
             prompt=("Run one final consolidation cycle. Preserve existing canonical "
                     "audiences where possible and incorporate only defensible recurring "
-                    "novelty proposals. Canonical IDs, slugs, and names may be new, "
-                    "but every merged_candidate_keys value must be copied exactly "
-                    "from a candidate_key in this catalogue.\n\nCATALOGUE:\n" +
+                    "novelty proposals. Rename semantic slugs and names freely. "
+                    "Select every source_candidate_ids value exactly from the "
+                    "machine candidate_id values in this catalogue; code will "
+                    "assign canonical segment IDs.\n\nCATALOGUE:\n" +
                     json.dumps(combined, ensure_ascii=False, indent=2)),
             max_tokens=int(_segment_setting(cfg, "03b_max_tokens", 64000)),
             schema=schema03b,
@@ -2695,7 +2839,8 @@ def cmd_segment(cfg, args):
                     "bounded representative sample, not the whole corpus. Give every "
                     "candidate exactly one decision.\n\n" + packet),
             max_tokens=int(_segment_setting(cfg, "04_max_tokens", 16000)),
-            schema=VALIDATION_SCHEMA,
+            schema=validation_schema(
+                [row["segment_id"] for row in candidates]),
             effort=_segment_setting(cfg, "04_effort", None))
         if not confirm(c.estimate(s04, SEGMENT_PREAMBLE, [validation_job]),
                        getattr(args, "yes", False)):
@@ -2710,9 +2855,11 @@ def cmd_segment(cfg, args):
         print("  04 validate: " + " · ".join(
             f"{key} {value}" for key, value in tally.most_common()) + f" -> {val_p}")
 
-    by_slug = {candidate["slug"]: candidate for candidate in candidates}
-    validated = [by_slug[row["slug"]] for row in decisions
-                 if row["status"] == "validated" and row["slug"] in by_slug]
+    by_segment_id = {candidate["segment_id"]: candidate
+                     for candidate in candidates}
+    validated = [by_segment_id[row["segment_id"]] for row in decisions
+                 if (row["status"] == "validated"
+                     and row["segment_id"] in by_segment_id)]
     if not validated:
         sys.exit("  No segment survived validation. Nothing to build.\n"
                  f"  Review {val_p} — every candidate has a written rationale.")
@@ -2734,7 +2881,7 @@ def cmd_segment(cfg, args):
     else:
         _, s05 = skill(5)
         seg_defs = json.dumps(
-            [{key: row[key] for key in ("slug", "name", "definition",
+            [{key: row[key] for key in ("segment_id", "slug", "name", "definition",
                                         "inclusion_criteria", "exclusion_criteria")}
              for row in validated], ensure_ascii=False, indent=2)
         prefix = f"{s05}\n\n---\n\nTHE VALIDATED SEGMENTS:\n\n{seg_defs}\n"
@@ -2747,7 +2894,9 @@ def cmd_segment(cfg, args):
                     "correct unassigned status. Tier is evidence strength, not "
                     "membership. Return exactly one row per ID.\n\nEVIDENCE:\n" +
                     _stage05_evidence_text(chunk["records"])),
-            max_tokens=16000, schema=ASSIGN_SCHEMA,
+            max_tokens=16000, schema=assignment_schema(
+                chunk["evidence_ids"],
+                [row["segment_id"] for row in validated]),
             expected_ids=tuple(chunk["evidence_ids"]),
             effort=_segment_setting(cfg, "05_effort", None)) for chunk in chunks05]
         print(f"  05 assign: {len(items):,} items in {len(jobs05)} batched chunks")
@@ -2791,7 +2940,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
     seen, conflicts, missing = {}, [], []
     grouped = defaultdict(list)
     unassigned = []
-    valid_slugs = {s["slug"] for s in validated}
+    valid_segment_ids = {s["segment_id"] for s in validated}
 
     for r in rows:
         eid = r["evidence_id"]
@@ -2803,7 +2952,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
             conflicts.append({"evidence_id": eid,
                               "assignments": [seen[eid], r["primary_segment_id"]]})
             continue
-        if r["primary_segment_id"] not in valid_slugs:
+        if r["primary_segment_id"] not in valid_segment_ids:
             missing.append({**r, "_reason": "unknown segment"}); continue
         seen[eid] = r["primary_segment_id"]
         grouped[r["primary_segment_id"]].append(r)
@@ -2818,10 +2967,10 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
 
     report = []
     for s in validated:
-        rs = grouped.get(s["slug"], [])
+        rs = grouped.get(s["segment_id"], [])
         if not rs:
             print(f"  ! {s['slug']}: zero assigned evidence (validated but empty)")
-            report.append((s["slug"], 0, 0,
+            report.append((s["segment_id"], s["slug"], 0, 0,
                            {tier: 0 for tier in segmentation.EVIDENCE_TIERS}))
             continue
         # Deterministic: score desc, then margin desc, then evidence id asc.
@@ -2838,7 +2987,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
         p = os.path.join(ev, f"{s['slug']}.txt")
         with open(p, "w", encoding="utf-8") as fh:
             fh.write(f"{s['name'].upper()}\n{'=' * 72}\n\n")
-            fh.write(f"Segment ID: {s['slug']}\nSegment slug: {s['slug']}\n")
+            fh.write(f"Segment ID: {s['segment_id']}\nSegment slug: {s['slug']}\n")
             fh.write("Validation status: validated\n")
             fh.write(f"Evidence items: {len(rs)}\nUnique threads: {len(threads)}\n\n")
             fh.write(f"SEGMENT DEFINITION\n{'-' * 72}\n{s['definition']}\n\n")
@@ -2861,7 +3010,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
         print(f"  {s['slug']:38} {len(rs):>6,} items -> {p}")
         record_provenance(cfg, s["slug"], "pipeline",
                           f"skills 01-06, {len(rs)} assigned items")
-        report.append((s["slug"], len(rs), len(threads), {
+        report.append((s["segment_id"], s["slug"], len(rs), len(threads), {
             tier: tiers[tier] for tier in segmentation.EVIDENCE_TIERS}))
 
     # ------------------------------------------------------------- audit set
@@ -2884,8 +3033,9 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
     with open(os.path.join(voc, "segment_evidence_manifest.yaml"), "w",
               encoding="utf-8") as fh:
         fh.write("segments:\n")
-        for slug, n, t, tier_counts in report:
-            fh.write(f"  - slug: {slug}\n    evidence_file: evidence/{slug}.txt\n")
+        for segment_id, slug, n, t, tier_counts in report:
+            fh.write(f"  - segment_id: {segment_id}\n    slug: {slug}\n"
+                     f"    evidence_file: evidence/{slug}.txt\n")
             fh.write(f"    evidence_count: {n}\n    thread_count: {t}\n")
             fh.write(f"    core_count: {tier_counts['core']}\n")
             fh.write(f"    supporting_count: {tier_counts['supporting']}\n")
@@ -2893,7 +3043,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
         fh.write(f"unassigned_count: {len(unassigned)}\n")
         fh.write(f"missing_count: {len(missing)}\n")
 
-    total = sum(n for _, n, _, _ in report)
+    total = sum(n for _, _, n, _, _ in report)
     print(f"\n  06 build: {total:,} assigned · {len(unassigned):,} unassigned"
           + (f" · {len(missing)} missing" if missing else ""))
     print(f"  audit set -> {voc}/")

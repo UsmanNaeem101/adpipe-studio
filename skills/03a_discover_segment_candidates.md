@@ -15,9 +15,9 @@ Return zero or more provisional candidates. A chunk may contain multiple audienc
 unrelated evidence, and evidence supporting no recurring candidate. Input evidence
 does **not** need to be assigned in 03A. For each candidate:
 
-- `candidate_key` is a meaningful lowercase `snake_case` audience slug, such as
-  `desk_bound_knowledge_workers`; it is never `candidate`, `segment`, `audience`, an
-  instruction phrase, or a description of this task.
+- `candidate_key` is a compact, meaningful semantic audience label, such as
+  `desk_bound_knowledge_workers`; code assigns the immutable machine candidate ID
+  after your response, so do not invent one.
 - `provisional_name` names the people or their defining situation in plain language,
   such as `Desk-bound knowledge workers`; it is never a schema field name.
 - `evidence_ids` contains only IDs whose individual text genuinely supports that

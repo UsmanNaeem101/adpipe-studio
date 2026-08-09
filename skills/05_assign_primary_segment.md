@@ -11,7 +11,8 @@ comment, one segment — or unassigned.**
 
 ## The core discipline
 
-Every evidence item gets at most one **primary** segment, chosen by its *dominant*
+Every evidence item gets at most one **primary** segment ID selected exactly from the
+supplied validated definitions, chosen by its *dominant*
 customer context — not by incidental keywords. "I'm an accountant and my shoulder kills
 from sitting all day, and it wrecks my sleep" belongs to `desk_workers` if that's the
 dominant context; the sleep mention is a secondary attribute, recorded separately, and

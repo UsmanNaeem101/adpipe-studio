@@ -6,10 +6,11 @@ corroborate more than one candidate.
 
 Use `strong` only when the item's dominant audience context clearly fits a candidate;
 use `corroborating` for useful enrichment that supports its worldview, mechanism,
-solution history, or constraints; otherwise use `none` and return no candidate IDs.
+solution history, or constraints; otherwise use `none` and return no segment IDs.
 Evidence strength (`core`, `supporting`, `context`) is not membership: judge fit from
 the text, while respecting that Supporting and Context evidence cannot create a
 candidate by themselves.
 
-Return exactly one result for every input evidence ID. Never invent candidate or
-evidence IDs. Return only the supplied structured output.
+Return exactly one result for every input evidence ID. Select only supplied
+`segment_ids`; never invent segment or evidence IDs. Return only the supplied
+structured output.

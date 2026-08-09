@@ -46,21 +46,22 @@ def job(max_tokens=16000):
 
 def provisional_catalogue():
     return [{
+        "candidate_id": "03a_0000_c000",
         "candidate_key": "validation_gaslit", "evidence_ids": [1, 2],
         "chunk_ids": ["03a_0000"], "aliases": ["Validation seekers"],
     }]
 
 
-def consolidated_payload(lineage_key):
+def consolidated_payload(source_id):
     return {"candidates": [{
-        "candidate_id": "seg_001", "slug": "new_canonical_slug",
+        "slug": "new_canonical_slug",
         "name": "Validation-seeking patients",
         "definition": "People dismissed by clinicians",
         "commercial_distinction": "Recognition-led messaging",
         "inclusion_criteria": ["dismissed symptoms"],
         "exclusion_criteria": ["ordinary uncertainty"],
-        "merged_candidate_keys": [lineage_key], "merged_aliases": [],
-        "core_evidence_ids": [1], "discovery_status": "strong_candidate",
+        "source_candidate_ids": [source_id], "merged_aliases": [],
+        "discovery_status": "strong_candidate",
     }]}
 
 
@@ -68,7 +69,7 @@ def consolidation_job():
     return llm.Job(
         id="03b_consolidate", prompt="consolidate this catalogue",
         max_tokens=64000,
-        schema=segmentation.consolidate_schema(["validation_gaslit"]),
+        schema=segmentation.consolidate_schema(["03a_0000_c000"]),
         effort="high")
 
 
@@ -145,10 +146,10 @@ class SingleStructuredRecoveryTests(unittest.TestCase):
 
     def test_03b_invalid_lineage_repairs_the_completed_response(self):
         completed = llm.BatchResult(json.dumps(
-            consolidated_payload("validation_gaslighted")), "stop")
+            consolidated_payload("03a_9999_c999")), "stop")
         client = ScriptedSingleClient([
             llm.BatchResult(json.dumps(
-                consolidated_payload("validation_gaslit")), "stop"),
+                consolidated_payload("03a_0000_c000")), "stop"),
         ])
         stream = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(stream):
@@ -157,8 +158,9 @@ class SingleStructuredRecoveryTests(unittest.TestCase):
                 provisional_catalogue(), tmp, initial_result=completed)
             saved = sorted(os.listdir(tmp))
         self.assertEqual(final[0]["slug"], "new_canonical_slug")
-        self.assertEqual(final[0]["merged_candidate_keys"],
-                         ["validation_gaslit"])
+        self.assertEqual(final[0]["segment_id"], "seg_001")
+        self.assertEqual(final[0]["source_candidate_ids"],
+                         ["03a_0000_c000"])
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0]["operation"], "single_structured_repair")
         self.assertIn("PREVIOUS RESPONSE", client.calls[0]["prompt"])
@@ -167,7 +169,7 @@ class SingleStructuredRecoveryTests(unittest.TestCase):
         self.assertEqual(saved, ["03b_consolidate.contract.txt"])
 
     def test_03b_invalid_lineage_fails_cleanly_after_one_repair(self):
-        bad = json.dumps(consolidated_payload("invented_source_key"))
+        bad = json.dumps(consolidated_payload("03a_9999_c999"))
         client = ScriptedSingleClient([llm.BatchResult(bad, "stop")])
         stream = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(stream):
@@ -192,7 +194,7 @@ class SingleStructuredRecoveryTests(unittest.TestCase):
                     "Consolidate.\nCATALOGUE:\n" + json.dumps(catalogue)}]},
             }
             response = {
-                "text": json.dumps(consolidated_payload("validation_gaslighted")),
+                "text": json.dumps(consolidated_payload("03a_9999_c999")),
                 "metadata": {"finish_reason": "stop", "usage": {
                     "completion_tokens": 54336,
                     "completion_tokens_details": {"reasoning_tokens": 3629}}},
@@ -209,6 +211,7 @@ class SingleStructuredRecoveryTests(unittest.TestCase):
                 tmp, "03b_consolidate", catalogue)
             mismatch = cli._03b_audit_recovery(
                 tmp, "03b_consolidate", provisional_catalogue() + [{
+                    "candidate_id": "03a_0001_c000",
                     "candidate_key": "other", "evidence_ids": [3],
                     "chunk_ids": ["03a_0001"], "aliases": ["Other"]}])
 

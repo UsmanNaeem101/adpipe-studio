@@ -42,7 +42,8 @@ Reject              evidence is weak, the context is incidental, or there's no r
 Needs More Research  promising but currently insufficient evidence
 ```
 
-Record every decision with a rationale, and preserve evidence lineage — a merged
+Record every decision against the supplied immutable `segment_id`, with a rationale,
+and preserve evidence lineage — a merged
 candidate keeps its aliases, a rejected one stays auditable rather than vanishing.
 Use the status set: `validated · merged · split_required · needs_more_research ·
 rejected`.

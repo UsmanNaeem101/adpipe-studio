@@ -35,8 +35,9 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         }
 
     @staticmethod
-    def provisional(key="desk", evidence_ids=None):
+    def provisional(key="desk", evidence_ids=None, candidate_id=None):
         return {
+            "candidate_id": candidate_id or f"03a_0000_c{key[-1:] if key[-1:].isdigit() else '000'}",
             "candidate_key": key,
             "evidence_ids": list(evidence_ids or [1, 2]),
             "chunk_ids": ["03a_0000"],
@@ -44,15 +45,15 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         }
 
     @staticmethod
-    def consolidated(keys=None, slug="new_canonical_segment"):
+    def consolidated(source_ids=None, slug="new_canonical_segment"):
         return {
-            "candidate_id": "cand_new", "slug": slug,
+            "slug": slug,
             "name": "New canonical segment", "definition": "A merged audience",
             "commercial_distinction": "Distinct messaging",
             "inclusion_criteria": ["relevant context"],
             "exclusion_criteria": ["incidental mention"],
-            "merged_candidate_keys": list(keys or ["desk"]),
-            "merged_aliases": [], "core_evidence_ids": [999],
+            "source_candidate_ids": list(source_ids or ["03a_0000_c000"]),
+            "merged_aliases": [],
             "discovery_status": "strong_candidate",
         }
 
@@ -131,6 +132,42 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         self.assertEqual([eid for chunk in chunks for eid in chunk["evidence_ids"]],
                          list(range(1, 20)))
 
+    def test_03e_prompt_composition_reports_exact_rendered_regions(self):
+        catalogue = json.dumps([
+            {"segment_id": "seg_0001", "name": "Desk workers"},
+            {"segment_id": "seg_0002", "name": "Lifters"},
+        ], indent=2)
+        schema = segmentation.expansion_schema(["seg_0001", "seg_0002"])
+        payloads = ["x" * 80, "y" * 160, "z" * 240]
+        jobs = [Job(
+            id=f"03e_{index:04d}", prompt=cli.STAGE03E_EVIDENCE_PREFIX + payload,
+            max_tokens=12000, schema=schema,
+            expected_ids=tuple(range(index)))
+            for index, payload in enumerate(payloads, 1)]
+
+        composition = cli._stage03e_prompt_composition(
+            "expand skill", catalogue, jobs, payloads)
+
+        self.assertEqual(composition["job_id"], "03e_0002")
+        self.assertEqual(composition["candidate_count"], 2)
+        self.assertEqual(composition["batch_count"], 3)
+        self.assertEqual(composition["candidate_catalogue"], len(catalogue) // 4)
+        self.assertEqual(composition["evidence_batch"], 40)
+        self.assertEqual(composition["evidence_item_range"], (1, 2, 3))
+        self.assertEqual(composition["evidence_token_range"], (20, 40, 60))
+        self.assertEqual(
+            composition["total"],
+            composition["instructions"] + composition["candidate_catalogue"] +
+            composition["evidence_batch"] + composition["schema_other"])
+
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            cli._print_stage03e_prompt_composition(composition)
+        rendered = output.getvalue()
+        self.assertIn("03E prompt composition per request", rendered)
+        self.assertIn("2 candidates; repeated per request", rendered)
+        self.assertIn("1/2/3 min/median/max", rendered)
+
     def test_supporting_and_context_do_not_enter_initial_discovery(self):
         rows = [record(1, "core"), record(2, "supporting"), record(3, "context")]
         self.assertEqual(
@@ -139,7 +176,7 @@ class SegmentationBookkeepingTests(unittest.TestCase):
             [row["id"] for row in segmentation.initial_discovery_records(
                 rows, include_supporting=True)], [1, 2])
 
-    def test_03a_exact_aggregation_preserves_lineage_and_order(self):
+    def test_03a_machine_ids_preserve_each_discovery_and_stable_order(self):
         chunks = [{
             "chunk_id": "03a_0001", "evidence_ids": [3, 4], "candidates": [{
                 "candidate_key": "desk_workers", "provisional_name": "Desk workers",
@@ -154,26 +191,34 @@ class SegmentationBookkeepingTests(unittest.TestCase):
 
         catalogue = segmentation.aggregate_harvest(chunks)
 
-        self.assertEqual(len(catalogue), 1)
-        self.assertEqual(catalogue[0]["evidence_ids"], [1, 2, 3, 4])
-        self.assertEqual(catalogue[0]["chunk_ids"], ["03a_0000", "03a_0001"])
-        self.assertEqual(catalogue[0]["unique_evidence_count"], 4)
-        self.assertEqual(len(catalogue[0]["provenance"]), 2)
+        self.assertEqual(len(catalogue), 2)
+        self.assertEqual([row["candidate_id"] for row in catalogue],
+                         ["03a_0000_c000", "03a_0001_c000"])
+        self.assertEqual([row["candidate_key"] for row in catalogue],
+                         ["desk_workers", "desk_workers"])
+        self.assertEqual(catalogue[0]["evidence_ids"], [1, 2])
+        renamed = json.loads(json.dumps(chunks))
+        renamed[0]["candidates"][0]["candidate_key"] = "renamed freely"
+        self.assertEqual(
+            [row["candidate_id"] for row in segmentation.aggregate_harvest(renamed)],
+            ["03a_0000_c000", "03a_0001_c000"])
 
     def test_03b_merges_aliases_and_code_restores_complete_evidence_union(self):
         provisional = [{
-            "candidate_key": "desk", "evidence_ids": [1, 2],
+            "candidate_id": "03a_0000_c000", "candidate_key": "desk",
+            "evidence_ids": [1, 2],
             "chunk_ids": ["03a_0000"], "aliases": ["Desk workers"]}, {
-            "candidate_key": "wfh", "evidence_ids": [3, 4],
+            "candidate_id": "03a_0001_c000", "candidate_key": "wfh",
+            "evidence_ids": [3, 4],
             "chunk_ids": ["03a_0001"], "aliases": ["Remote workers"]}]
         model_row = {
-            "candidate_id": "cand_desk", "slug": "desk_workers", "name": "Desk workers",
+            "slug": "desk_workers", "name": "Desk workers",
             "definition": "People whose workday context dominates the problem",
             "commercial_distinction": "Workday ergonomic messaging",
             "inclusion_criteria": ["desk work"], "exclusion_criteria": ["incidental desk"],
-            "merged_candidate_keys": ["desk", "wfh"], "merged_aliases": ["Office staff"],
-            # Deliberately incomplete: code, not model memory, owns the union.
-            "core_evidence_ids": [1], "discovery_status": "strong_candidate"}
+            "source_candidate_ids": ["03a_0000_c000", "03a_0001_c000"],
+            "merged_aliases": ["Office staff"],
+            "discovery_status": "strong_candidate"}
 
         final = segmentation.finalize_consolidated([model_row], provisional)
 
@@ -185,45 +230,87 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         self.assertNotIn("Validated", statuses)
         self.assertNotIn("validated", statuses)
 
-    def test_dynamic_03b_schema_enum_is_exactly_the_provisional_keys(self):
-        schema = segmentation.consolidate_schema(["desk", "validation_gaslit"])
+    def test_dynamic_03b_schema_enum_is_exactly_the_machine_candidate_ids(self):
+        ids = ["03a_0000_c000", "03a_0001_c000"]
+        schema = segmentation.consolidate_schema(ids)
         candidate = schema["properties"]["candidates"]["items"]["properties"]
-        lineage = candidate["merged_candidate_keys"]
-        self.assertEqual(lineage["items"]["enum"],
-                         ["desk", "validation_gaslit"])
+        lineage = candidate["source_candidate_ids"]
+        self.assertEqual(lineage["items"]["enum"], ids)
         self.assertEqual(lineage["minItems"], 1)
         self.assertTrue(lineage["uniqueItems"])
         self.assertNotIn("enum", candidate["slug"])
         self.assertNotIn(
             "enum", segmentation.CONSOLIDATE_SCHEMA["properties"]["candidates"]
-            ["items"]["properties"]["merged_candidate_keys"]["items"])
+            ["items"]["properties"]["source_candidate_ids"]["items"])
+
+    def test_stage05_schema_uses_machine_segment_ids_not_semantic_slugs(self):
+        schema = cli.assignment_schema([101, 102], ["seg_001", "seg_002"])
+        fields = schema["properties"]["assignments"]["items"]["properties"]
+        self.assertEqual(fields["evidence_id"]["enum"], [101, 102])
+        self.assertEqual(fields["primary_segment_id"]["enum"],
+                         ["", "seg_001", "seg_002"])
+        self.assertNotIn("desk_workers", fields["primary_segment_id"]["enum"])
 
     def test_03b_accepts_exact_lineage_while_canonical_slug_may_be_new(self):
-        provisional = [self.provisional("desk"), self.provisional("wfh", [3, 4])]
+        provisional = [self.provisional("desk", candidate_id="03a_0000_c000"),
+                       self.provisional("wfh", [3, 4], "03a_0001_c000")]
         final = segmentation.finalize_consolidated(
-            [self.consolidated(["desk", "wfh"], "remote_desk_professionals")],
+            [self.consolidated(
+                ["03a_0000_c000", "03a_0001_c000"],
+                "remote_desk_professionals")],
             provisional)
         self.assertEqual(final[0]["slug"], "remote_desk_professionals")
-        self.assertEqual(final[0]["merged_candidate_keys"], ["desk", "wfh"])
+        self.assertEqual(final[0]["segment_id"], "seg_001")
+        self.assertEqual(final[0]["source_candidate_ids"],
+                         ["03a_0000_c000", "03a_0001_c000"])
         self.assertEqual(final[0]["core_evidence_ids"], [1, 2, 3, 4])
 
-    def test_03b_reports_one_or_several_invented_lineage_keys(self):
-        provisional = [self.provisional("desk"), self.provisional("wfh")]
-        for keys, expected in ((["desk", "renamed_desk"], ["renamed_desk"]),
-                               (["invented_one", "invented_two"],
-                                ["invented_one", "invented_two"])):
-            with self.subTest(keys=keys), self.assertRaises(
+    def test_03b_reports_one_or_several_invalid_machine_ids(self):
+        provisional = [self.provisional("desk", candidate_id="03a_0000_c000")]
+        for ids, expected in ((["03a_0000_c000", "invented"], ["invented"]),
+                              (["invented_one", "invented_two"],
+                               ["invented_one", "invented_two"])):
+            with self.subTest(ids=ids), self.assertRaises(
                     segmentation.ConsolidationContractError) as ctx:
                 segmentation.finalize_consolidated(
-                    [self.consolidated(keys)], provisional)
-            self.assertEqual(ctx.exception.invalid_references[0]["invalid_keys"],
+                    [self.consolidated(ids)], provisional)
+            self.assertEqual(ctx.exception.invalid_references[0]["invalid_ids"],
                              expected)
 
-    def test_03b_does_not_silently_canonicalize_a_renamed_source_key(self):
-        provisional = [self.provisional("validation_gaslit")]
-        with self.assertRaises(segmentation.ConsolidationContractError):
-            segmentation.finalize_consolidated(
-                [self.consolidated(["Validation Gaslit"])], provisional)
+    def test_semantic_candidate_key_rename_does_not_break_machine_lineage(self):
+        provisional = [self.provisional(
+            "validation_gaslit", candidate_id="03a_0000_c000")]
+        renamed = json.loads(json.dumps(provisional))
+        renamed[0]["candidate_key"] = "people seeking clinical validation"
+        final = segmentation.finalize_consolidated(
+            [self.consolidated(["03a_0000_c000"])], renamed)
+        self.assertEqual(final[0]["source_candidate_ids"], ["03a_0000_c000"])
+
+    def test_legacy_03b_is_recovered_from_exact_saved_provenance(self):
+        provisional = [
+            self.provisional("same_semantic_key", [1, 2], "03a_0000_c000"),
+            self.provisional("same_semantic_key", [3, 4], "03a_0007_c003"),
+        ]
+        legacy_catalogue = [{
+            "candidate_key": "same_semantic_key",
+            "provenance": [
+                {"chunk_id": "03a_0000", "result_index": 0},
+                {"chunk_id": "03a_0007", "result_index": 3},
+            ],
+        }]
+        legacy = self.consolidated(["unused"], "renamed_canonical_slug")
+        legacy["candidate_id"] = "seg_001"
+        legacy["merged_candidate_keys"] = ["same_semantic_key"]
+        legacy.pop("source_candidate_ids")
+
+        recovered = segmentation.migrate_legacy_consolidated(
+            [legacy], legacy_catalogue, provisional)
+
+        self.assertEqual(recovered[0]["segment_id"], "seg_001")
+        self.assertEqual(recovered[0]["slug"], "renamed_canonical_slug")
+        self.assertEqual(recovered[0]["source_candidate_ids"],
+                         ["03a_0000_c000", "03a_0007_c003"])
+        self.assertEqual(recovered[0]["core_evidence_ids"], [1, 2, 3, 4])
 
     def test_03b_post_validation_catches_provider_schema_drift(self):
         # Even if a provider ignores the enum in response_format, the local
@@ -231,28 +318,26 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         with self.assertRaises(segmentation.ConsolidationContractError):
             segmentation.validate_consolidated_lineage(
                 [self.consolidated(["provider_invented_key"])],
-                [self.provisional("desk")])
+                [self.provisional("desk", candidate_id="03a_0000_c000")])
 
-    def test_03b_partial_repair_is_merged_into_complete_100_row_catalogue(self):
-        provisional = [self.provisional(f"source_{index}", [index + 1])
-                       for index in range(100)]
+    def test_03b_complete_reviewer_preserves_100_row_catalogue(self):
+        provisional = [self.provisional(
+            f"source_{index}", [index + 1], f"03a_0000_c{index:03d}")
+            for index in range(100)]
         original_rows = []
         for index in range(100):
             row = self.consolidated(
-                [f"source_{index}"], f"canonical_slug_{index}")
-            row["candidate_id"] = f"seg_{index:03d}"
+                [f"03a_0000_c{index:03d}"], f"canonical_slug_{index}")
             row["name"] = f"Canonical audience {index}"
             original_rows.append(row)
-        original_rows[2]["merged_candidate_keys"] = ["invented_two"]
-        original_rows[77]["merged_candidate_keys"] = ["invented_seventy_seven"]
+        original_rows[2]["source_candidate_ids"] = ["invented_two"]
+        original_rows[77]["source_candidate_ids"] = ["invented_seventy_seven"]
         original = {"candidates": original_rows}
         untouched_before = json.loads(json.dumps(original_rows[50]))
-        repair = {"candidates": []}
+        repair = json.loads(json.dumps(original))
         for index in (2, 77):
-            row = json.loads(json.dumps(original_rows[index]))
-            row["merged_candidate_keys"] = [f"source_{index}"]
-            row["slug"] = "attempted_unrelated_change"
-            repair["candidates"].append(row)
+            repair["candidates"][index]["source_candidate_ids"] = [
+                f"03a_0000_c{index:03d}"]
 
         merged = segmentation.merge_consolidation_repair(original, repair)
         segmentation.validate_consolidated_lineage(
@@ -260,36 +345,27 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         final = segmentation.finalize_consolidated(
             merged["candidates"], provisional)
 
-        self.assertEqual(len(repair["candidates"]), 2)
+        self.assertEqual(len(repair["candidates"]), 100)
         self.assertEqual(len(merged["candidates"]), 100)
         self.assertEqual(len(final), 100)
         self.assertEqual(merged["candidates"][50], untouched_before)
         self.assertEqual(merged["candidates"][2]["slug"], "canonical_slug_2")
         self.assertEqual(merged["candidates"][77]["slug"],
                          "canonical_slug_77")
-        self.assertEqual(merged["candidates"][2]["merged_candidate_keys"],
-                         ["source_2"])
-        self.assertEqual(merged["candidates"][77]["merged_candidate_keys"],
-                         ["source_77"])
+        self.assertEqual(merged["candidates"][2]["source_candidate_ids"],
+                         ["03a_0000_c002"])
+        self.assertEqual(merged["candidates"][77]["source_candidate_ids"],
+                         ["03a_0000_c077"])
 
-    def test_03b_partial_repair_missing_an_invalid_row_is_rejected(self):
-        provisional = [self.provisional("source_one"),
-                       self.provisional("source_two")]
+    def test_03b_partial_reviewer_output_cannot_replace_collection(self):
         first = self.consolidated(["invalid_one"], "first")
-        first["candidate_id"] = "seg_001"
         second = self.consolidated(["invalid_two"], "second")
-        second["candidate_id"] = "seg_002"
         repair = json.loads(json.dumps(first))
-        repair["merged_candidate_keys"] = ["source_one"]
+        repair["source_candidate_ids"] = ["03a_0000_c000"]
 
-        merged = segmentation.merge_consolidation_repair(
-            {"candidates": [first, second]}, {"candidates": [repair]})
-
-        with self.assertRaises(segmentation.ConsolidationContractError) as ctx:
-            segmentation.validate_consolidated_lineage(
-                merged["candidates"], provisional)
-        self.assertEqual(ctx.exception.invalid_references[0]["candidate_id"],
-                         "seg_002")
+        with self.assertRaisesRegex(ValueError, "CATASTROPHIC DROP"):
+            segmentation.merge_consolidation_repair(
+                {"candidates": [first, second]}, {"candidates": [repair]})
 
     def test_03c_keeps_recurring_novelty_and_ignores_isolated_proposal(self):
         audits = [
@@ -298,7 +374,7 @@ class SegmentationBookkeepingTests(unittest.TestCase):
              "audience_cue": "clinical posture", "commercial_distinction": "chairside work",
              "origin_chunk": "03c_0000"},
             {"evidence_id": 2, "status": "possible_new_candidate",
-             "candidate_key": "dental professionals", "provisional_name": "Dental staff",
+             "candidate_key": "dental_professionals", "provisional_name": "Dental staff",
              "audience_cue": "clinical posture", "commercial_distinction": "chairside work",
              "origin_chunk": "03c_0001"},
             {"evidence_id": 3, "status": "possible_new_candidate",
@@ -308,26 +384,27 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         ]
         novelty = segmentation.novelty_catalogue(audits)
         self.assertEqual([row["candidate_key"] for row in novelty],
-                         ["novel_dental_professionals"])
+                         ["dental_professionals"])
+        self.assertEqual(novelty[0]["candidate_id"], "03c_novel_c000")
         self.assertEqual(novelty[0]["evidence_ids"], [1, 2])
 
     def test_counts_and_representatives_are_computed_deterministically(self):
         candidates = [{
-            "candidate_id": "desk", "slug": "desk", "name": "Desk",
+            "segment_id": "seg_001", "slug": "desk", "name": "Desk",
             "definition": "desk", "commercial_distinction": "work",
             "inclusion_criteria": [], "exclusion_criteria": [],
-            "merged_candidate_keys": ["desk"], "merged_aliases": [],
+            "source_candidate_ids": ["03a_0000_c000"], "merged_aliases": [],
             "core_evidence_ids": [2, 1], "discovery_status": "strong_candidate"}]
         rows = [record(1, "core", thread="t1", subreddit="a"),
                 record(2, "core", thread="t2", subreddit="a"),
                 record(3, "supporting", thread="t2", subreddit="b"),
                 record(4, "context")]
         matches = [
-            {"evidence_id": 1, "candidate_ids": ["desk"], "match_strength": "strong"},
-            {"evidence_id": 2, "candidate_ids": ["desk"], "match_strength": "strong"},
-            {"evidence_id": 3, "candidate_ids": ["desk"],
+            {"evidence_id": 1, "segment_ids": ["seg_001"], "match_strength": "strong"},
+            {"evidence_id": 2, "segment_ids": ["seg_001"], "match_strength": "strong"},
+            {"evidence_id": 3, "segment_ids": ["seg_001"],
              "match_strength": "corroborating"},
-            {"evidence_id": 4, "candidate_ids": ["desk"],
+            {"evidence_id": 4, "segment_ids": ["seg_001"],
              "match_strength": "corroborating"},
         ]
         first = segmentation.assemble_candidate_evidence(candidates, matches, rows)
@@ -367,20 +444,20 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         self.assertIn("[1] [core] desk worker", prompt)
         self.assertIn("[2] [core] unrelated parcel", prompt)
 
-    def test_03a_semantic_guard_rejects_generic_labels(self):
+    def test_03a_code_does_not_interpret_semantic_labels(self):
         base = {
             "candidate_key": "desk_workers", "provisional_name": "Desk workers",
             "audience_cue": "desk work", "why_commercially_distinct": "workday",
             "evidence_ids": [1], "cue_terms": ["desk"],
             "discovery_strength": "probable",
         }
-        for key in ("harvest_candidates_from_core", "candidate", "segment", "audience"):
-            with self.subTest(candidate_key=key), self.assertRaises(ValueError):
-                segmentation.validate_harvest_rows([{**base, "candidate_key": key}], [1])
-        for name in ("candidate", "segment", "audience"):
-            with self.subTest(provisional_name=name), self.assertRaises(ValueError):
-                segmentation.validate_harvest_rows(
-                    [{**base, "provisional_name": name}], [1])
+        for key in ("candidate", "renamed semantic concept", "Desk Workers"):
+            with self.subTest(candidate_key=key):
+                row = {**base, "candidate_key": key}
+                segmentation.validate_harvest_rows([row], [1])
+                assigned = segmentation.assign_harvest_candidate_ids(
+                    [row], "03a_0007")
+                self.assertEqual(assigned[0]["candidate_id"], "03a_0007_c000")
 
     def test_03a_evidence_invariants_allow_overlap_and_no_total_coverage(self):
         rows = [{
@@ -431,7 +508,7 @@ class SegmentationBookkeepingTests(unittest.TestCase):
         rows = [record(n, text=("REP" if n == 1 else f"RAW_SECRET_{n}"))
                 for n in range(1, 20)]
         candidate = {
-            "candidate_id": "c", "representative_evidence_ids": [1],
+            "segment_id": "seg_001", "representative_evidence_ids": [1],
             "core_evidence_count": 19, "supporting_evidence_count": 0,
             "context_evidence_count": 0, "unique_thread_count": 0,
             "unique_subreddit_count": 0}
@@ -537,7 +614,7 @@ class SegmentationArtifactTests(unittest.TestCase):
         self.assertEqual(client.calls, 2)
         self.assertEqual(result[0]["candidates"], [])
 
-    def test_03a_semantic_failure_is_regenerated_before_persistence(self):
+    def test_03a_semantic_label_is_not_rewritten_by_local_code(self):
         chunk = {"chunk_id": "03a_0000", "evidence_ids": [1, 2, 3],
                  "estimated_tokens": 4,
                  "records": [record(1), record(2), record(3)]}
@@ -582,9 +659,9 @@ class SegmentationArtifactTests(unittest.TestCase):
                 contract_version=segmentation.HARVEST_CONTRACT_VERSION)
             with open(os.path.join(tmp, "03a_0000.json"), encoding="utf-8") as fh:
                 saved = json.load(fh)
-        self.assertEqual(client.calls, 2)
-        self.assertEqual(result[0]["candidates"], good["candidates"])
-        self.assertEqual(saved["candidates"], good["candidates"])
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(result[0]["candidates"], bad["candidates"])
+        self.assertEqual(saved["candidates"], bad["candidates"])
 
     def test_fresh_provenance_only_violation_adds_no_repair_model_call(self):
         chunk = {"chunk_id": "03a_0000", "evidence_ids": [1, 2],
@@ -711,11 +788,19 @@ class SegmentationArtifactTests(unittest.TestCase):
             job, prompt=segmentation.legacy_harvest_prompt_v1(chunk["records"]),
             schema=segmentation.legacy_harvest_schema_v1())
             for job, chunk in zip(jobs, chunks)]
+        legacy_v2_jobs = [dataclasses.replace(
+            job, schema=segmentation.legacy_harvest_schema_v2(
+                chunk["evidence_ids"])) for job, chunk in zip(jobs, chunks)]
         compatible_fingerprints = {
             job.id: {cli._legacy_job_fingerprint_v1(
                 job, chunk["evidence_ids"],
-                segmentation.LEGACY_HARVEST_SKILL_V1)}
-            for job, chunk in zip(legacy_jobs, chunks)}
+                segmentation.LEGACY_HARVEST_SKILL_V1),
+                cli._job_fingerprint(
+                    legacy_v2, chunk["evidence_ids"],
+                    segmentation.LEGACY_HARVEST_SKILL_V2,
+                    segmentation.HARVEST_CONTRACT_VERSION)}
+            for job, legacy_v2, chunk in zip(
+                legacy_jobs, legacy_v2_jobs, chunks)}
         allowed = {chunk["chunk_id"]: chunk["evidence_ids"] for chunk in chunks}
 
         def candidate(evidence_ids):
@@ -745,7 +830,16 @@ class SegmentationArtifactTests(unittest.TestCase):
                     "chunk_id": job.id,
                     "evidence_ids": chunk["evidence_ids"],
                     "estimated_input_tokens": 4,
-                    "fingerprint": next(iter(compatible_fingerprints[job.id])),
+                    "fingerprint": (
+                        cli._legacy_job_fingerprint_v1(
+                            legacy_jobs[0], chunk["evidence_ids"],
+                            segmentation.LEGACY_HARVEST_SKILL_V1)
+                        if job.id == "03a_0000" else
+                        cli._job_fingerprint(
+                            legacy_v2_jobs[int(job.id[-4:])],
+                            chunk["evidence_ids"],
+                            segmentation.LEGACY_HARVEST_SKILL_V2,
+                            segmentation.HARVEST_CONTRACT_VERSION)),
                     "candidates": [candidate(evidence_ids)],
                 }
                 if job.id == "03a_0000":
@@ -764,8 +858,9 @@ class SegmentationArtifactTests(unittest.TestCase):
                     repair_guidance="preserve candidates and valid IDs",
                     contract_version=segmentation.HARVEST_CONTRACT_VERSION,
                     compatible_fingerprints=compatible_fingerprints,
-                    cached_migrator=lambda _job, rows, _fingerprint:
-                        segmentation.migrate_legacy_harvest_rows(rows))
+                    cached_migrator=lambda job, rows, _fingerprint:
+                        segmentation.assign_harvest_candidate_ids(
+                            segmentation.migrate_legacy_harvest_rows(rows), job.id))
 
             client.estimate.assert_not_called()
             client.prewarm.assert_not_called()
@@ -776,18 +871,25 @@ class SegmentationArtifactTests(unittest.TestCase):
                 with open(os.path.join(tmp, job.id + ".json"),
                           encoding="utf-8") as fh:
                     migrated = json.load(fh)
-                self.assertEqual(migrated["candidates"], [candidate([n + 1])])
+                expected = candidate([n + 1])
+                if n == 0:
+                    expected["candidate_key"] = "DESK_WORKERS"
+                expected["candidate_id"] = f"03a_{n:04d}_c000"
+                self.assertEqual(migrated["candidates"], [expected])
                 self.assertIn("migrated_from_fingerprint", migrated)
             with open(os.path.join(tmp, "03a_0026.json"), encoding="utf-8") as fh:
                 cleaned = json.load(fh)
-            self.assertEqual(cleaned["candidates"], [candidate([27])])
+            expected = candidate([27])
+            expected["candidate_id"] = "03a_0026_c000"
+            self.assertEqual(cleaned["candidates"], [expected])
             self.assertEqual(
                 cleaned["provenance_cleanup"][0]["removed_evidence_ids"], [999])
 
     def test_stage06_preserves_evidence_tier_in_file_and_manifest(self):
-        segment = {"slug": "desk", "name": "Desk", "definition": "desk context",
+        segment = {"segment_id": "seg_001", "slug": "desk", "name": "Desk",
+                   "definition": "desk context",
                    "inclusion_criteria": ["desk"], "exclusion_criteria": []}
-        assignment = {"evidence_id": 1, "primary_segment_id": "desk", "score": 8,
+        assignment = {"evidence_id": 1, "primary_segment_id": "seg_001", "score": 8,
                       "winning_margin": 3, "cue_types": ["dominant_context_match"],
                       "primary_cues": ["desk"], "rationale": "dominant",
                       "assignment_status": "assigned", "secondary_attributes": []}
@@ -806,6 +908,7 @@ class SegmentationArtifactTests(unittest.TestCase):
                       encoding="utf-8") as fh:
                 manifest = fh.read()
         self.assertIn("EVIDENCE TIER: supporting", evidence)
+        self.assertIn("Segment ID: seg_001", evidence)
         self.assertIn("supporting_count: 1", manifest)
         self.assertIn("core_count: 0", manifest)
 
@@ -842,14 +945,14 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
                         "evidence_ids": list(job.expected_ids or (1, 2, 3)),
                         "cue_terms": ["desk", "computer"],
                         "discovery_strength": "strong"}]}
-                elif job.schema is segmentation.EXPANSION_SCHEMA:
+                elif job.id.startswith("03e_"):
                     payload = {"matches": [{
-                        "evidence_id": eid, "candidate_ids": ["cand_desk"],
+                        "evidence_id": eid, "segment_ids": ["seg_001"],
                         "match_strength": "strong" if eid in (1, 2, 3)
                         else "corroborating"} for eid in job.expected_ids]}
-                elif job.schema is cli.ASSIGN_SCHEMA:
+                elif job.id.startswith("05_"):
                     payload = {"assignments": [{
-                        "evidence_id": eid, "primary_segment_id": "desk_workers",
+                        "evidence_id": eid, "primary_segment_id": "seg_001",
                         "score": 8, "winning_margin": 3,
                         "cue_types": ["dominant_context_match"],
                         "primary_cues": ["desk"], "rationale": "dominant context",
@@ -868,17 +971,17 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
             self.max_tokens_by_job[job_id] = max_tokens
             if job_id in ("03b_consolidate", "03b_novelty_consolidate"):
                 payload = {"candidates": [{
-                    "candidate_id": "cand_desk", "slug": "desk_workers",
+                    "slug": "desk_workers",
                     "name": "Desk workers", "definition": "Desk work is dominant",
                     "commercial_distinction": "workday ergonomic messaging",
                     "inclusion_criteria": ["desk work is dominant"],
                     "exclusion_criteria": ["incidental desk mention"],
-                    "merged_candidate_keys": ["desk_workers"],
-                    "merged_aliases": [], "core_evidence_ids": [1],
+                    "source_candidate_ids": ["03a_0000_c000"],
+                    "merged_aliases": [],
                     "discovery_status": "strong_candidate"}]}
-            elif schema is cli.VALIDATION_SCHEMA:
+            elif job_id == "04_validate":
                 payload = {"decisions": [{
-                    "slug": "desk_workers", "status": "validated",
+                    "segment_id": "seg_001", "status": "validated",
                     "rationale": "independent recurring context",
                     "merged_into": "", "split_into": []}]}
             else:

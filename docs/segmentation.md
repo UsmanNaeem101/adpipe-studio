@@ -79,10 +79,10 @@ does not pin provider routing.
 
 The first persisted 03A contract has a narrow compatibility migration. Its exact
 legacy fingerprints are recognized and revalidated locally: valid chunks are migrated
-without a model call, legacy key casing is normalized deterministically, and impossible
-out-of-chunk evidence IDs are removed locally when valid in-chunk support remains. Only
-substantive contract violations—or candidates left with no valid evidence—enter
-structured repair.
+without a model call, semantic labels are preserved, and code assigns immutable
+`<chunk_id>_c<ordinal>` candidate IDs from saved row order. Impossible out-of-chunk
+evidence IDs are removed locally when valid in-chunk support remains. Only structural
+contract violations—or candidates left with no valid evidence—enter structured repair.
 
 ## Per-project settings
 
@@ -119,14 +119,15 @@ the complete canonical candidate catalogue in one response. The setting above co
 its starting ceiling; only an actual `length`/`max_tokens` stop advances it. This does
 not change 03A's 12,000-token rolling-wave ceiling or any stage's reasoning policy.
 
-Each 03B request also receives a dynamic schema whose `merged_candidate_keys` enum is
-the exact current 03A catalogue. Canonical IDs, slugs and names remain open for 03B to
-create; source-lineage keys do not. Local post-validation enforces the same contract if
-a provider ignores the schema. An otherwise complete response with invalid lineage is
-saved to diagnostics and gets one bounded repair using that response—03A is not rerun.
+Each 03B request receives a dynamic schema whose `source_candidate_ids` enum contains
+the exact code-owned IDs in the current 03A catalogue. Semantic keys, slugs, names, and
+definitions remain open for 03B to reinterpret; code assigns canonical `segment_id`
+values after parsing. Local post-validation enforces machine lineage if a provider
+ignores the schema. An otherwise complete response with invalid lineage is saved to
+diagnostics and gets one bounded full-catalogue reviewer pass—03A is not rerun.
 If an older run was audited but crashed before persisting its 03B artifact, the resume
 path reuses it only when its embedded catalogue exactly fingerprints the current one.
-Lineage repair rows are patches keyed by the existing canonical `candidate_id`, never a
-replacement catalogue: code copies only `merged_candidate_keys` into the complete
-original response, preserves every other field, requires the original candidate count,
-and revalidates the reconstructed full collection before writing the 03B artifact.
+The reviewer must return the same complete collection in the same order. Code accepts
+only `source_candidate_ids` corrections, rejects partial/catalogue-shrinking responses,
+and revalidates the full collection before writing. Stage 04 and Stage 05 likewise join
+by `segment_id`; semantic slugs are used only for human-readable labels and filenames.

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import copy
 import json
-import re
 from collections import Counter, defaultdict
 
 
@@ -20,6 +19,51 @@ EVIDENCE_TIERS = ("core", "supporting", "context")
 # version also invalidates cached work when only the code-side quality gate
 # changes.
 HARVEST_CONTRACT_VERSION = "03a-semantic-contract-v2"
+
+# Exact immediately-previous 03A skill text. Machine-ID migration deliberately
+# changed semantic-label guidance and its schema, so this authenticated contract
+# lets completed Haiku results move forward without replaying discovery calls.
+LEGACY_HARVEST_SKILL_V2 = """# Harvest Segment Candidates
+
+You are the high-recall harvester in a customer-segmentation pipeline. Search one
+deterministic chunk of **Core** VOC for every plausible recurring audience pattern.
+The chunk is a heterogeneous search space, not an audience and not an assignment
+unit. **Do not name or summarise the chunk.** Missing a real minority audience is
+worse than returning an extra provisional candidate.
+
+A segment is an audience whose context, constraint, job-to-be-done, buying situation,
+or behaviour would justify different messaging, positioning, targeting, offer, or
+product decisions. A symptom, incidental attribute, arbitrary demographic, or one
+isolated comment is not a segment.
+
+Return zero or more provisional candidates. A chunk may contain multiple audiences,
+unrelated evidence, and evidence supporting no recurring candidate. Input evidence
+does **not** need to be assigned in 03A. For each candidate:
+
+- `candidate_key` is a meaningful lowercase `snake_case` audience slug, such as
+  `desk_bound_knowledge_workers`; it is never `candidate`, `segment`, `audience`, an
+  instruction phrase, or a description of this task.
+- `provisional_name` names the people or their defining situation in plain language,
+  such as `Desk-bound knowledge workers`; it is never a schema field name.
+- `evidence_ids` contains only IDs whose individual text genuinely supports that
+  candidate. It is nonempty, contains no duplicates, and may overlap another
+  candidate's evidence when both patterns are genuinely present.
+- Leave unrelated or non-recurring evidence unassigned. Never include an ID merely
+  because it appeared in the supplied chunk.
+
+Returning every chunk ID for one candidate is valid only in the unusual case where
+every item independently expresses the same audience pattern. Re-check every cited ID
+before doing this. Do not collapse distinct groups into a generic umbrella audience.
+
+For each plausible recurring pattern also return a specific audience cue, commercial
+distinction, short cue terms, and an honest discovery strength. Preserve potentially
+valuable minority audiences and avoid aggressive merging; global semantic merging is
+Stage 03B's job.
+
+Do not validate, force coverage, write polished segment cards, invent evidence, or
+cite an ID outside this chunk. Return only the supplied structured output. An empty
+`candidates` array is correct when the chunk contains no recurring audience pattern.
+"""
 
 # One-time compatibility contract for the first persisted 03A release.  It is
 # kept exact so completed model work can be authenticated by its old fingerprint,
@@ -102,8 +146,7 @@ HARVEST_SCHEMA = {
         "type": "object",
         "properties": {
             "candidate_key": {
-                "type": "string", "minLength": 3,
-                "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$",
+                "type": "string", "minLength": 1,
             },
             "provisional_name": {"type": "string", "minLength": 3},
             "audience_cue": {"type": "string", "minLength": 3},
@@ -155,32 +198,42 @@ def legacy_harvest_schema_v1():
     cues["items"].pop("minLength", None)
     return schema
 
+
+def legacy_harvest_schema_v2(chunk_ids):
+    """Reconstruct the exact dynamic schema used by completed Haiku caches."""
+    schema = copy.deepcopy(HARVEST_SCHEMA)
+    key = schema["properties"]["candidates"]["items"]["properties"][
+        "candidate_key"]
+    key["minLength"] = 3
+    key["pattern"] = "^[a-z0-9]+(?:_[a-z0-9]+)*$"
+    schema["properties"]["candidates"]["items"]["properties"][
+        "evidence_ids"]["items"]["enum"] = list(chunk_ids)
+    return schema
+
 CONSOLIDATE_SCHEMA = {
     "type": "object",
     "properties": {"candidates": {"type": "array", "items": {
         "type": "object",
         "properties": {
-            "candidate_id": {"type": "string"},
             "slug": {"type": "string"},
             "name": {"type": "string"},
             "definition": {"type": "string"},
             "commercial_distinction": {"type": "string"},
             "inclusion_criteria": {"type": "array", "items": {"type": "string"}},
             "exclusion_criteria": {"type": "array", "items": {"type": "string"}},
-            "merged_candidate_keys": {
+            "source_candidate_ids": {
                 "type": "array", "minItems": 1, "uniqueItems": True,
                 "items": {"type": "string"},
             },
             "merged_aliases": {"type": "array", "items": {"type": "string"}},
-            "core_evidence_ids": {"type": "array", "items": {"type": "integer"}},
             "discovery_status": {"type": "string",
                                  "enum": ["strong_candidate", "probable_candidate",
                                           "emerging_candidate", "weak_candidate"]},
         },
-        "required": ["candidate_id", "slug", "name", "definition",
+        "required": ["slug", "name", "definition",
                      "commercial_distinction", "inclusion_criteria",
-                     "exclusion_criteria", "merged_candidate_keys",
-                     "merged_aliases", "core_evidence_ids", "discovery_status"],
+                     "exclusion_criteria", "source_candidate_ids",
+                     "merged_aliases", "discovery_status"],
         "additionalProperties": False,
     }}},
     "required": ["candidates"],
@@ -188,18 +241,12 @@ CONSOLIDATE_SCHEMA = {
 }
 
 
-def consolidate_schema(provisional_keys):
-    """Return the 03B schema constrained to exact source-catalogue keys.
-
-    Canonical IDs, slugs and names deliberately remain model-created. Only the
-    lineage field is closed: it identifies existing 03A records and therefore
-    must copy their keys verbatim rather than paraphrasing or canonicalizing
-    them.
-    """
+def consolidate_schema(candidate_ids):
+    """Return 03B's semantic schema with exact machine lineage references."""
     schema = copy.deepcopy(CONSOLIDATE_SCHEMA)
     lineage = schema["properties"]["candidates"]["items"][
-        "properties"]["merged_candidate_keys"]
-    lineage["items"]["enum"] = list(provisional_keys)
+        "properties"]["source_candidate_ids"]
+    lineage["items"]["enum"] = list(candidate_ids)
     return schema
 
 EXPANSION_SCHEMA = {
@@ -208,16 +255,24 @@ EXPANSION_SCHEMA = {
         "type": "object",
         "properties": {
             "evidence_id": {"type": "integer"},
-            "candidate_ids": {"type": "array", "items": {"type": "string"}},
+            "segment_ids": {"type": "array", "items": {"type": "string"}},
             "match_strength": {"type": "string",
                                "enum": ["strong", "corroborating", "none"]},
         },
-        "required": ["evidence_id", "candidate_ids", "match_strength"],
+        "required": ["evidence_id", "segment_ids", "match_strength"],
         "additionalProperties": False,
     }}},
     "required": ["matches"],
     "additionalProperties": False,
 }
+
+
+def expansion_schema(segment_ids):
+    """Constrain 03E references to code-owned canonical segment IDs."""
+    schema = copy.deepcopy(EXPANSION_SCHEMA)
+    schema["properties"]["matches"]["items"]["properties"][
+        "segment_ids"]["items"]["enum"] = list(segment_ids)
+    return schema
 
 NOVELTY_SCHEMA = {
     "type": "object",
@@ -272,13 +327,8 @@ def legacy_harvest_prompt_v1(records):
 
 
 def migrate_legacy_harvest_rows(rows):
-    """Apply only the normalization aggregation already applied to V1 keys."""
-    migrated = []
-    for row in rows:
-        item = dict(row)
-        item["candidate_key"] = _key(item.get("candidate_key"))
-        migrated.append(item)
-    return migrated
+    """Preserve legacy semantic fields; machine identity is assigned separately."""
+    return [dict(row) for row in rows]
 
 
 def chunk_by_tokens(records, target_tokens, prefix="chunk"):
@@ -313,17 +363,6 @@ def assert_exact_chunk_coverage(chunks, expected_ids):
         raise ValueError(
             f"chunk coverage failed: {len(missing)} missing, {len(extra)} unknown, "
             f"{len(repeated)} repeated")
-
-
-def _key(value):
-    return re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
-
-
-_GENERIC_HARVEST_KEYS = frozenset({
-    "audience", "candidate", "segment", "harvest_candidates_from_core",
-})
-_GENERIC_HARVEST_NAMES = frozenset({"audience", "candidate", "segment"})
-_CLEAN_CANDIDATE_KEY = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
 
 
 class HarvestContractError(ValueError):
@@ -397,33 +436,42 @@ def validate_harvest_rows(rows, chunk_ids, chunk_id=None):
     Evidence may overlap between candidates and input IDs may remain unassigned.
     """
     allowed = set(chunk_ids)
-    seen_keys = set()
     for row in rows:
+        if not isinstance(row, dict):
+            raise HarvestContractError(
+                "03A candidate row is not an object", chunk_id=chunk_id)
         raw_key = str(row.get("candidate_key") or "").strip()
-        key = _key(raw_key)
-        name = str(row.get("provisional_name") or "").strip()
-        if not _CLEAN_CANDIDATE_KEY.fullmatch(raw_key):
+        for field in ("candidate_key", "provisional_name", "audience_cue",
+                      "why_commercially_distinct"):
+            if not isinstance(row.get(field), str) or not row[field].strip():
+                raise HarvestContractError(
+                    f"03A candidate has an empty or non-string {field}",
+                    chunk_id=chunk_id, candidate=raw_key)
+        if row.get("discovery_strength") not in {
+                "strong", "probable", "emerging", "weak"}:
             raise HarvestContractError(
-                f"03A candidate key {raw_key!r} must be a lowercase snake_case "
-                "audience slug", chunk_id=chunk_id, candidate=raw_key)
-        if key in _GENERIC_HARVEST_KEYS:
-            raise HarvestContractError(
-                f"03A candidate key {raw_key!r} is a generic task label",
+                "03A candidate has an invalid discovery_strength",
                 chunk_id=chunk_id, candidate=raw_key)
-        if _key(name) in _GENERIC_HARVEST_NAMES:
+        cue_terms = row.get("cue_terms")
+        if (not isinstance(cue_terms, list) or not cue_terms
+                or any(not isinstance(term, str) or not term.strip()
+                       for term in cue_terms)
+                or len(cue_terms) != len(set(cue_terms))):
             raise HarvestContractError(
-                f"03A provisional name {name!r} is not an audience label",
+                "03A candidate has invalid or duplicate cue_terms",
                 chunk_id=chunk_id, candidate=raw_key)
-        if key in seen_keys:
+        evidence_ids = row.get("evidence_ids")
+        if not isinstance(evidence_ids, list):
             raise HarvestContractError(
-                f"03A returned duplicate candidate key {raw_key!r}",
+                f"03A candidate {raw_key!r} has a non-array evidence_ids field",
                 chunk_id=chunk_id, candidate=raw_key)
-        seen_keys.add(key)
-
-        evidence_ids = row.get("evidence_ids") or []
         if not evidence_ids:
             raise HarvestContractError(
                 f"03A candidate {raw_key!r} has no supporting evidence",
+                chunk_id=chunk_id, candidate=raw_key)
+        if any(type(evidence_id) is not int for evidence_id in evidence_ids):
+            raise HarvestContractError(
+                f"03A candidate {raw_key!r} cites a non-integer evidence ID",
                 chunk_id=chunk_id, candidate=raw_key)
         if len(evidence_ids) != len(set(evidence_ids)):
             raise HarvestContractError(
@@ -437,6 +485,20 @@ def validate_harvest_rows(rows, chunk_ids, chunk_id=None):
                 f"{len(unknown)} evidence ID(s) outside its chunk",
                 chunk_id=chunk_id, candidate=raw_key,
                 invalid_evidence_ids=unknown)
+
+
+def assign_harvest_candidate_ids(rows, chunk_id):
+    """Assign immutable 03A identities from chunk identity and saved row order.
+
+    The semantic fields are deliberately ignored. Replaying the same saved
+    artifact therefore yields the same IDs even if a label is later renamed.
+    """
+    output = []
+    for ordinal, row in enumerate(rows):
+        item = dict(row)
+        item["candidate_id"] = f"{chunk_id}_c{ordinal:03d}"
+        output.append(item)
+    return output
 
 
 def harvest_full_chunk_claims(chunk_results):
@@ -461,168 +523,198 @@ def harvest_full_chunk_claims(chunk_results):
 
 
 def aggregate_harvest(chunk_results, minimum_evidence=2):
-    """Merge only exact candidate keys; semantic merging belongs to 03B."""
-    grouped = {}
+    """Build one provisional card per 03A discovery; 03B owns semantic merging."""
+    output = []
+    seen_ids = set()
     for result in sorted(chunk_results, key=lambda row: row["chunk_id"]):
         chunk_id = result["chunk_id"]
         validate_harvest_rows(
             result["candidates"], result["evidence_ids"], chunk_id=chunk_id)
-        for index, row in enumerate(result["candidates"]):
-            key = _key(row["candidate_key"])
-            if not key:
-                raise ValueError("03A returned an empty candidate key")
-            item = grouped.setdefault(key, {
-                "candidate_key": key, "occurrence_count": 0,
-                "evidence_ids": set(), "chunk_ids": set(), "aliases": set(),
-                "audience_cues": set(), "commercial_cues": set(),
-                "cue_terms": set(), "strengths": [], "provenance": [],
+        assigned = assign_harvest_candidate_ids(result["candidates"], chunk_id)
+        for index, row in enumerate(assigned):
+            evidence = sorted(set(row["evidence_ids"]))
+            if len(evidence) < minimum_evidence:
+                continue
+            if row["candidate_id"] in seen_ids:
+                raise ValueError(f"duplicate 03A candidate ID {row['candidate_id']!r}")
+            seen_ids.add(row["candidate_id"])
+            output.append({
+                "candidate_id": row["candidate_id"],
+                "candidate_key": row["candidate_key"],
+                "occurrence_count": 1,
+                "unique_evidence_count": len(evidence),
+                "unique_chunk_count": 1,
+                "evidence_ids": evidence,
+                "chunk_ids": [chunk_id],
+                "aliases": [row["provisional_name"]],
+                "audience_cues": [row["audience_cue"]],
+                "commercial_cues": [row["why_commercially_distinct"]],
+                "cue_terms": list(row["cue_terms"]),
+                "strengths": [row["discovery_strength"]],
+                "provenance": [{"chunk_id": chunk_id, "result_index": index}],
             })
-            item["occurrence_count"] += 1
-            item["evidence_ids"].update(row["evidence_ids"])
-            item["chunk_ids"].add(chunk_id)
-            item["aliases"].add(row["provisional_name"])
-            item["audience_cues"].add(row["audience_cue"])
-            item["commercial_cues"].add(row["why_commercially_distinct"])
-            item["cue_terms"].update(row["cue_terms"])
-            item["strengths"].append(row["discovery_strength"])
-            item["provenance"].append({"chunk_id": chunk_id, "result_index": index})
-    output = []
-    for key in sorted(grouped):
-        item = grouped[key]
-        if len(item["evidence_ids"]) < minimum_evidence:
-            continue
-        output.append({
-            "candidate_key": key,
-            "occurrence_count": item["occurrence_count"],
-            "unique_evidence_count": len(item["evidence_ids"]),
-            "unique_chunk_count": len(item["chunk_ids"]),
-            "evidence_ids": sorted(item["evidence_ids"]),
-            "chunk_ids": sorted(item["chunk_ids"]),
-            "aliases": sorted(item["aliases"]),
-            "audience_cues": sorted(item["audience_cues"]),
-            "commercial_cues": sorted(item["commercial_cues"]),
-            "cue_terms": sorted(item["cue_terms"]),
-            "strengths": item["strengths"],
-            "provenance": item["provenance"],
-        })
     return output
 
 
 class ConsolidationContractError(ValueError):
-    """A 03B result invented or rewrote one or more 03A lineage keys."""
+    """A 03B result cited a nonexistent machine candidate ID."""
 
     def __init__(self, invalid_references):
         self.invalid_references = invalid_references
-        count = sum(len(row["invalid_keys"]) for row in invalid_references)
+        count = sum(len(row["invalid_ids"]) for row in invalid_references)
         super().__init__(
-            f"03B referenced {count} unknown provisional key(s) across "
+            f"03B referenced {count} unknown source candidate ID(s) across "
             f"{len(invalid_references)} canonical candidate(s)")
 
 
 def validate_consolidated_lineage(rows, provisional_catalogue):
-    """Require exact, nonempty, unique 03A keys in every 03B lineage list."""
-    allowed = {row["candidate_key"] for row in provisional_catalogue}
+    """Require exact, nonempty, unique machine IDs in every 03B lineage list."""
+    allowed = {row["candidate_id"] for row in provisional_catalogue}
     invalid_references = []
     for row in rows:
         if not isinstance(row, dict):
             continue  # The JSON-schema validator reports the broader shape error.
-        keys = row.get("merged_candidate_keys")
-        if not isinstance(keys, list):
+        source_ids = row.get("source_candidate_ids")
+        if not isinstance(source_ids, list):
             continue
-        if not keys:
-            raise ValueError("03B returned an empty merged_candidate_keys list")
-        if any(not isinstance(key, str) for key in keys):
-            raise ValueError("03B returned a non-string provisional key")
-        if len(keys) != len(set(keys)):
-            raise ValueError("03B returned duplicate merged provisional keys")
-        invalid = list(dict.fromkeys(key for key in keys if key not in allowed))
+        if not source_ids:
+            raise ValueError("03B returned an empty source_candidate_ids list")
+        if any(not isinstance(candidate_id, str) for candidate_id in source_ids):
+            raise ValueError("03B returned a non-string source candidate ID")
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("03B returned duplicate source candidate IDs")
+        invalid = list(dict.fromkeys(
+            candidate_id for candidate_id in source_ids
+            if candidate_id not in allowed))
         if invalid:
             invalid_references.append({
-                "candidate_id": row.get("candidate_id"),
                 "slug": row.get("slug"),
-                "invalid_keys": invalid,
+                "invalid_ids": invalid,
             })
     if invalid_references:
         raise ConsolidationContractError(invalid_references)
 
 
 def merge_consolidation_repair(original_payload, repaired_payload):
-    """Patch only 03B lineage fields into the complete original collection.
+    """Accept only a complete reviewer artifact and copy its lineage corrections.
 
-    A repair response may contain only the affected candidates. Treating that
-    response as a replacement silently collapsed a 208-row catalogue to two
-    rows. Candidate identity and every non-lineage field are therefore owned by
-    the original completed response; repair may change only
-    `merged_candidate_keys`, keyed by an existing `candidate_id`.
+    Row order is the pre-ID stable identity during this bounded review. Every
+    semantic field must remain byte-equivalent; the reviewer may correct only
+    `source_candidate_ids`. A partial response can never replace the catalogue.
     """
     original_rows = original_payload.get("candidates")
     repaired_rows = repaired_payload.get("candidates")
     if not isinstance(original_rows, list) or not isinstance(repaired_rows, list):
         raise ValueError("03B collection repair requires candidate arrays")
-    original_ids = [row.get("candidate_id") for row in original_rows
-                    if isinstance(row, dict)]
-    if len(original_ids) != len(original_rows) or len(set(original_ids)) != len(
-            original_ids):
-        raise ValueError("03B original collection has invalid candidate identity")
-    repaired_ids = [row.get("candidate_id") for row in repaired_rows
-                    if isinstance(row, dict)]
-    if len(repaired_ids) != len(repaired_rows) or len(set(repaired_ids)) != len(
-            repaired_ids):
-        raise ValueError("03B repair has invalid or duplicate candidate identity")
-    unknown = [candidate_id for candidate_id in repaired_ids
-               if candidate_id not in set(original_ids)]
-    if unknown:
-        raise ValueError(
-            f"03B repair introduced unknown candidate ID {unknown[0]!r}")
-
-    merged = copy.deepcopy(original_payload)
-    by_id = {row["candidate_id"]: row for row in merged["candidates"]}
-    for repaired in repaired_rows:
-        if "merged_candidate_keys" not in repaired:
-            raise ValueError(
-                f"03B repair omitted lineage for {repaired['candidate_id']!r}")
-        by_id[repaired["candidate_id"]]["merged_candidate_keys"] = copy.deepcopy(
-            repaired["merged_candidate_keys"])
-
-    if len(merged["candidates"]) != len(original_rows):
+    if len(repaired_rows) != len(original_rows):
         raise ValueError(
             "03B CONTRACT REPAIR CATASTROPHIC DROP: candidate count changed "
-            f"from {len(original_rows)} to {len(merged['candidates'])}")
+            f"from {len(original_rows)} to {len(repaired_rows)}")
+    merged = copy.deepcopy(original_payload)
+    for index, (original, repaired) in enumerate(zip(original_rows, repaired_rows)):
+        if not isinstance(original, dict) or not isinstance(repaired, dict):
+            raise ValueError("03B collection repair requires candidate objects")
+        original_semantics = {key: value for key, value in original.items()
+                              if key != "source_candidate_ids"}
+        repaired_semantics = {key: value for key, value in repaired.items()
+                              if key != "source_candidate_ids"}
+        if original_semantics != repaired_semantics:
+            raise ValueError(
+                f"03B reviewer changed semantic content at row {index}; only "
+                "source_candidate_ids may change during contract reconciliation")
+        if "source_candidate_ids" not in repaired:
+            raise ValueError(f"03B reviewer omitted lineage at row {index}")
+        merged["candidates"][index]["source_candidate_ids"] = copy.deepcopy(
+            repaired["source_candidate_ids"])
     return merged
 
 
 def finalize_consolidated(rows, provisional_catalogue):
     """Replace model-estimated evidence lineage with exact deterministic unions."""
     validate_consolidated_lineage(rows, provisional_catalogue)
-    provisional = {row["candidate_key"]: row for row in provisional_catalogue}
-    seen_ids, seen_slugs, output = set(), set(), []
-    for row in rows:
-        if row["candidate_id"] in seen_ids or row["slug"] in seen_slugs:
-            raise ValueError("03B returned duplicate candidate IDs or slugs")
-        keys = list(row["merged_candidate_keys"])
-        evidence = sorted({eid for key in keys for eid in provisional[key]["evidence_ids"]})
+    provisional = {row["candidate_id"]: row for row in provisional_catalogue}
+    seen_slugs, output = set(), []
+    for ordinal, row in enumerate(rows, 1):
+        if row["slug"] in seen_slugs:
+            raise ValueError("03B returned duplicate canonical slugs")
+        source_ids = list(row["source_candidate_ids"])
+        evidence = sorted({
+            eid for candidate_id in source_ids
+            for eid in provisional[candidate_id]["evidence_ids"]})
+        segment_id = f"seg_{ordinal:03d}"
         if not evidence:
-            raise ValueError(f"03B candidate {row['candidate_id']!r} has no Core lineage")
-        chunks = sorted({chunk for key in keys for chunk in provisional[key]["chunk_ids"]})
+            raise ValueError(f"03B segment {segment_id!r} has no Core lineage")
+        chunks = sorted({
+            chunk for candidate_id in source_ids
+            for chunk in provisional[candidate_id]["chunk_ids"]})
         aliases = sorted(set(row["merged_aliases"]) |
-                         {alias for key in keys for alias in provisional[key]["aliases"]})
+                         {alias for candidate_id in source_ids
+                          for alias in provisional[candidate_id]["aliases"]})
         item = dict(row)
-        item["merged_candidate_keys"] = keys
+        item["segment_id"] = segment_id
+        item["source_candidate_ids"] = source_ids
         item["merged_aliases"] = aliases
         item["core_evidence_ids"] = evidence
         item["unique_evidence_count"] = len(evidence)
         item["unique_03a_chunk_count"] = len(chunks)
         item["source_03a_chunks"] = chunks
         output.append(item)
-        seen_ids.add(row["candidate_id"])
         seen_slugs.add(row["slug"])
-    return sorted(output, key=lambda row: row["candidate_id"])
+    return output
 
 
-def validate_match_rows(rows, candidate_ids):
-    allowed = set(candidate_ids)
+def migrate_legacy_consolidated(rows, legacy_catalogue, provisional_catalogue):
+    """Recover a key-lineage 03B artifact using exact saved 03A provenance.
+
+    This is a one-time deterministic migration, not semantic matching. Each old
+    aggregate key points to the exact `(chunk_id, result_index)` rows that formed
+    it, which in turn determine the new code-owned candidate IDs.
+    """
+    available = {row["candidate_id"] for row in provisional_catalogue}
+    ids_by_legacy_key = {}
+    for card in legacy_catalogue:
+        source_ids = []
+        for provenance in card.get("provenance") or []:
+            chunk_id = provenance.get("chunk_id")
+            result_index = provenance.get("result_index")
+            if not isinstance(chunk_id, str) or type(result_index) is not int:
+                continue
+            candidate_id = f"{chunk_id}_c{result_index:03d}"
+            if candidate_id in available:
+                source_ids.append(candidate_id)
+        if source_ids:
+            ids_by_legacy_key[card.get("candidate_key")] = list(
+                dict.fromkeys(source_ids))
+
+    semantic_rows = []
+    for ordinal, row in enumerate(rows, 1):
+        expected_segment_id = f"seg_{ordinal:03d}"
+        old_segment_id = row.get("segment_id", row.get("candidate_id"))
+        if old_segment_id not in (None, expected_segment_id):
+            raise ValueError(
+                f"legacy 03B row {ordinal} has unstable ID {old_segment_id!r}")
+        source_ids = []
+        for key in row.get("merged_candidate_keys") or []:
+            mapped = ids_by_legacy_key.get(key)
+            if not mapped:
+                raise ValueError(
+                    f"legacy 03B lineage {key!r} has no exact saved provenance")
+            source_ids.extend(mapped)
+        if not source_ids:
+            raise ValueError(f"legacy 03B row {ordinal} has no recoverable lineage")
+        semantic_rows.append({
+            key: copy.deepcopy(row[key]) for key in
+            ("slug", "name", "definition", "commercial_distinction",
+             "inclusion_criteria", "exclusion_criteria", "merged_aliases",
+             "discovery_status")
+        } | {"source_candidate_ids": list(dict.fromkeys(source_ids))})
+    return finalize_consolidated(semantic_rows, provisional_catalogue)
+
+
+def validate_match_rows(rows, segment_ids):
+    allowed = set(segment_ids)
     for row in rows:
-        matches = row.get("candidate_ids") or []
+        matches = row.get("segment_ids") or []
         unknown = set(matches) - allowed
         if unknown:
             raise ValueError(f"evidence {row.get('evidence_id')} matched unknown candidate")
@@ -632,25 +724,25 @@ def validate_match_rows(rows, candidate_ids):
 
 def assemble_candidate_evidence(candidates, match_rows, records):
     """Union model matches, then compute every count and sample in code."""
-    candidate_ids = [row["candidate_id"] for row in candidates]
-    validate_match_rows(match_rows, candidate_ids)
+    segment_ids = [row["segment_id"] for row in candidates]
+    validate_match_rows(match_rows, segment_ids)
     by_id = {row["id"]: row for row in records}
     order = {row["id"]: n for n, row in enumerate(records)}
-    sets = {cid: {tier: set() for tier in EVIDENCE_TIERS} for cid in candidate_ids}
+    sets = {sid: {tier: set() for tier in EVIDENCE_TIERS} for sid in segment_ids}
     for candidate in candidates:
-        sets[candidate["candidate_id"]]["core"].update(candidate["core_evidence_ids"])
+        sets[candidate["segment_id"]]["core"].update(candidate["core_evidence_ids"])
     for row in match_rows:
         evidence = by_id.get(row["evidence_id"])
         if evidence is None or row["match_strength"] == "none":
             continue
         tier = evidence.get("tier", "context")
-        for candidate_id in row["candidate_ids"]:
-            sets[candidate_id][tier].add(row["evidence_id"])
+        for segment_id in row["segment_ids"]:
+            sets[segment_id][tier].add(row["evidence_id"])
 
     output = []
     for candidate in candidates:
         item = dict(candidate)
-        tier_sets = sets[candidate["candidate_id"]]
+        tier_sets = sets[candidate["segment_id"]]
         for tier in EVIDENCE_TIERS:
             ids = sorted(tier_sets[tier], key=lambda eid: order.get(eid, 10**12))
             item[f"{tier}_evidence_ids"] = ids
@@ -668,7 +760,7 @@ def assemble_candidate_evidence(candidates, match_rows, records):
                            + item["context_evidence_ids"][:1])
         item["representative_evidence_ids"] = list(dict.fromkeys(representatives))
         if not item["representative_evidence_ids"]:
-            raise ValueError(f"candidate {item['candidate_id']!r} has no evidence")
+            raise ValueError(f"segment {item['segment_id']!r} has no evidence")
         output.append(item)
     return output
 
@@ -677,7 +769,8 @@ def novelty_catalogue(audits, minimum_evidence=2):
     grouped = defaultdict(list)
     for row in audits:
         if row.get("status") == "possible_new_candidate":
-            grouped[_key(row.get("candidate_key"))].append(row)
+            key = str(row.get("candidate_key") or "").strip()
+            grouped[key].append(row)
     output = []
     for key in sorted(grouped):
         rows = grouped[key]
@@ -687,7 +780,8 @@ def novelty_catalogue(audits, minimum_evidence=2):
         chunks = sorted({row.get("origin_chunk") for row in rows
                          if row.get("origin_chunk")})
         output.append({
-            "candidate_key": "novel_" + key,
+            "candidate_id": f"03c_novel_c{len(output):03d}",
+            "candidate_key": key,
             "occurrence_count": len(rows),
             "unique_evidence_count": len(evidence),
             "unique_chunk_count": len(chunks),
