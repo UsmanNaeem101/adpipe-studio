@@ -124,6 +124,16 @@ ladder. It starts at 64,000 and advances only after an actual
 usage for every attempt. At 256,000, another budget stop is a handled terminal
 failure with diagnostics; no partial validation catalogue is accepted.
 
+Stage 05 uses a separate `16,000 → 24,000 → 32,000` ladder. With native
+Anthropic it submits at most 10 structured requests per Message Batch and keeps
+at least 65 seconds between submissions, retaining Batch pricing and the shared
+cached segment-definition prefix. Anthropic grammar-compilation capacity errors
+retry only the affected requests, at most twice, in later paced batches. Every
+valid chunk is checkpointed under
+`research/segments/assignments/05_chunk_assignments/`; interrupted runs reuse
+those artifacts and do not rerun Stage 04. Legacy paid successes are migrated
+from exact-matching model audit logs without another model call.
+
 Each 03B request receives a dynamic schema whose `source_candidate_ids` enum contains
 the exact code-owned IDs in the current 03A catalogue. Semantic keys, slugs, names, and
 definitions remain open for 03B to reinterpret; code assigns canonical `segment_id`

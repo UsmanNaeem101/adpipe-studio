@@ -412,6 +412,12 @@ STAGE03B_TOKEN_TIERS = (64000, 128000)
 # left only 292 answer tokens, so this stage needs a substantially wider,
 # independently bounded ladder. Do not share it with the surrounding stages.
 STAGE04_TOKEN_TIERS = (64000, 128000, 256000)
+# Stage 05 emits one assignment row per evidence item. Its answer can exceed
+# 16k, but it does not need Stage 04's catalogue-sized 64k+ ladder.
+STAGE05_TOKEN_TIERS = (16000, 24000, 32000)
+STAGE05_ANTHROPIC_WAVE_SIZE = 10
+STAGE05_ANTHROPIC_BATCH_INTERVAL_SECONDS = 65
+STAGE05_GRAMMAR_RETRY_ATTEMPTS = 2
 ADAPTIVE_OPENROUTER_WAVE_SIZE = 4
 ADAPTIVE_PROGRESS_WIDTH = 20
 
@@ -426,6 +432,7 @@ class AdaptiveStageStats:
     budget_retries: int = 0
     json_repairs: int = 0
     terminal_failures: int = 0
+    terminal_failure_ids: set[str] = dataclasses.field(default_factory=set)
     budget_promotions: int = 0
     starting_ceiling: int = ADAPTIVE_TOKEN_TIERS[0]
     final_ceiling: int = ADAPTIVE_TOKEN_TIERS[0]
@@ -665,7 +672,9 @@ def _adaptive_validation_error(job, result, key, row_validator=None,
 
 def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
                         stage, key, wave_size=1, stats=None, debug=False,
-                        row_validator=None, row_cleaner=None):
+                        row_validator=None, row_cleaner=None,
+                        token_tiers=ADAPTIVE_TOKEN_TIERS, batch_runner=None,
+                        success_callback=None, first_pass_exclusions=None):
     """Run one structured stage with a live, persistent output-token floor.
 
     New work is launched in rolling waves. A wave is wholly in flight before any
@@ -685,6 +694,8 @@ def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
     if wave_size < 1:
         raise ValueError(f"Stage {stage} wave_size must be at least 1")
     stats = stats or AdaptiveStageStats(stage=stage, total=len(jobs))
+    if first_pass_exclusions is None:
+        first_pass_exclusions = set()
     if stats.total != len(jobs):
         raise ValueError(f"Stage {stage} stats total does not match the job count")
     if stats.stage != stage:
@@ -692,14 +703,14 @@ def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
 
     requested_start = max(job.max_tokens for job in jobs)
     tier_index = next(
-        (index for index, tier in enumerate(ADAPTIVE_TOKEN_TIERS)
-         if tier >= requested_start), len(ADAPTIVE_TOKEN_TIERS) - 1)
+        (index for index, tier in enumerate(token_tiers)
+         if tier >= requested_start), len(token_tiers) - 1)
     pending = list(jobs)
     retrying = []
     results = {}
     final_jobs = {}
     attempts = defaultdict(list)
-    stats.starting_ceiling = ADAPTIVE_TOKEN_TIERS[tier_index]
+    stats.starting_ceiling = token_tiers[tier_index]
     stats.final_ceiling = stats.starting_ceiling
     start = _token_tier_label(stats.starting_ceiling)
     print(f"  Stage {stage} starting ceiling: {start}")
@@ -713,14 +724,14 @@ def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
         queue = retrying if retrying else pending
         originals = queue[:wave_size]
         del queue[:wave_size]
-        ceiling = ADAPTIVE_TOKEN_TIERS[tier_index]
+        ceiling = token_tiers[tier_index]
         wave = [dataclasses.replace(job, max_tokens=ceiling) for job in originals]
         print(f"  Current wave: {_adaptive_wave_label(wave)}")
         if debug:
             kind = "budget retry" if is_retry_wave else "untouched work"
             print(f"  Scheduler: launching {kind} at {_token_tier_label(ceiling)}; "
                   f"{len(retrying)} retry and {len(pending)} untouched queued")
-        replies = client_.batch(corpus, preamble, wave)
+        replies = ((batch_runner or client_.batch)(corpus, preamble, wave))
 
         exhausted = []
         for job in wave:
@@ -754,7 +765,8 @@ def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
                     print(f"      stop_reason={result.stop_reason!r}; ceiling={label}")
                 continue
 
-            if len(attempts[job.id]) == 1:
+            if (len(attempts[job.id]) == 1
+                    and job.id not in first_pass_exclusions):
                 stats.first_pass_successes += 1
             usage = result.completion_tokens
             utilisation = usage / job.max_tokens if usage else 0
@@ -766,33 +778,42 @@ def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
                 print(f"    ✓ {job.id}  success  usage metadata unavailable")
             if result.reasoning_tokens:
                 stats.reasoning_tokens.append(result.reasoning_tokens)
+            if success_callback is not None:
+                success_callback(job, result)
             if debug:
                 answer = max(result.completion_tokens - result.reasoning_tokens, 0)
                 print(f"      stop_reason={result.stop_reason!r}; reasoning="
                       f"{result.reasoning_tokens:,}; answer={answer:,}; provider="
                       f"{result.provider or 'unreported'}")
 
-        if exhausted and tier_index == len(ADAPTIVE_TOKEN_TIERS) - 1:
+        if exhausted and tier_index == len(token_tiers) - 1:
             stats.terminal_failures += len(exhausted)
+            stats.terminal_failure_ids.update(job.id for job in exhausted)
             failed = ", ".join(job.id for job in exhausted)
             detail = "; ".join(
                 f"{job.id}: {attempts[job.id][-1][1].budget_note or 'usage not reported'}"
                 for job in exhausted)
             print(f"\n  STAGE {stage} FAILED")
             for job in exhausted:
-                print(f"  {job.id} exhausted the maximum 32k ceiling")
-            print(f"  No Stage {stage} output was written.")
+                print(f"  {job.id} exhausted the maximum "
+                      f"{_token_tier_label(token_tiers[-1])} ceiling")
+            if success_callback is None:
+                print(f"  No Stage {stage} output was written.")
+            else:
+                print(f"  Completed Stage {stage} chunk artifacts remain reusable.")
             print(f"  Diagnostics saved to: {diagnostics_dir}")
             raise BatchOutputError(
                 f"Stage {stage} hard ceiling exhausted: {failed} reached "
                 f"{_token_tier_label(ceiling)} and still ended for output budget "
                 f"({detail}). Attempts and truncated replies were saved to "
-                f"{diagnostics_dir}. No stage output was written.")
+                f"{diagnostics_dir}. " +
+                ("No stage output was written." if success_callback is None else
+                 "Completed chunk artifacts were preserved for resume."))
 
         if exhausted:
             old = ceiling
             tier_index += 1
-            new = ADAPTIVE_TOKEN_TIERS[tier_index]
+            new = token_tiers[tier_index]
             stats.budget_promotions += 1
             stats.final_ceiling = new
             stats.budget_retries += len(exhausted)
@@ -2133,10 +2154,12 @@ def _print_03a_contract_error(error, fallback_chunk=None):
 
 
 def _prewarm_segment_stage(client_, corpus, preamble, stage):
-    """Warm where useful; let serial Anthropic 03E Batches seed themselves."""
-    if stage == "03E" and getattr(client_, "batch_cache_self_seeds", False):
-        print("  Anthropic Batch cache: first 03E request seeds the shared prefix; "
-              "later requests read it")
+    """Warm where useful; let native Anthropic Batch waves seed themselves."""
+    if (stage in ("03E", "05")
+            and getattr(client_, "batch_cache_self_seeds", False)):
+        unit = "request" if stage == "03E" else "wave"
+        print(f"  Anthropic Batch cache: first {stage} {unit} seeds the shared "
+              "prefix; later {unit}s read it")
         return
     client_.prewarm(corpus, preamble)
 
@@ -2428,6 +2451,364 @@ def _03b_audit_recovery(project_dir, job_id, catalogue):
         except (OSError, ValueError, TypeError, AttributeError):
             continue
     return None
+
+
+@dataclasses.dataclass
+class Stage05ExecutionStats:
+    """Stage-05-only recovery counters and first-pass provenance."""
+    reusable: int = 0
+    grammar_rate_limit_retries: int = 0
+    grammar_retried_ids: set[str] = dataclasses.field(default_factory=set)
+    budget_retried_ids: set[str] = dataclasses.field(default_factory=set)
+    successful_ids: set[str] = dataclasses.field(default_factory=set)
+    repaired_ids: set[str] = dataclasses.field(default_factory=set)
+    hard_failure_ids: set[str] = dataclasses.field(default_factory=set)
+
+
+def _stage05_grammar_rate_limited(result):
+    """True only for Anthropic's transient structured-grammar capacity limit."""
+    error = result.provider_error or {}
+    message = str(error.get("message") or "").lower()
+    return (error.get("type") == "invalid_request_error"
+            and "grammar compilation rate limit exceeded" in message)
+
+
+class _Stage05BatchRunner:
+    """Paced native-Anthropic Message Batch transport for Stage 05 only."""
+
+    def __init__(self, client_, stats, *,
+                 wave_size=STAGE05_ANTHROPIC_WAVE_SIZE,
+                 interval_seconds=STAGE05_ANTHROPIC_BATCH_INTERVAL_SECONDS,
+                 grammar_retry_attempts=STAGE05_GRAMMAR_RETRY_ATTEMPTS,
+                 sleep_fn=time.sleep, clock_fn=time.monotonic,
+                 success_callback=None):
+        self.client = client_
+        self.stats = stats
+        self.native_anthropic = bool(getattr(
+            client_, "native_anthropic_batches", False))
+        self.wave_size = wave_size
+        self.interval_seconds = interval_seconds
+        self.grammar_retry_attempts = grammar_retry_attempts
+        self.sleep_fn = sleep_fn
+        self.clock_fn = clock_fn
+        self.success_callback = success_callback
+        self.last_submission_at = None
+
+    def _pace(self):
+        if self.last_submission_at is None:
+            return
+        remaining = (self.last_submission_at + self.interval_seconds
+                     - self.clock_fn())
+        if remaining > 0:
+            print(f"  Stage 05 Anthropic capacity backoff: waiting "
+                  f"{remaining:.0f}s before the next Message Batch")
+            self.sleep_fn(remaining)
+
+    def _submit(self, corpus, preamble, jobs):
+        self._pace()
+        self.last_submission_at = self.clock_fn()
+        return self.client.batch(corpus, preamble, jobs)
+
+    def _persist_completed(self, jobs, replies):
+        """Checkpoint valid rows before any capacity backoff can be interrupted."""
+        if self.success_callback is None:
+            return
+        for job in jobs:
+            result = _as_result(replies.get(job.id, ""))
+            if result.out_of_budget or result.provider_error:
+                continue
+            try:
+                _decode_job_rows(job, result.text, "assignments")
+            except (ValueError, TypeError):
+                continue
+            self.success_callback(job, result)
+
+    def _wave(self, corpus, preamble, jobs):
+        replies = self._submit(corpus, preamble, jobs)
+        self._persist_completed(jobs, replies)
+        by_id = {job.id: job for job in jobs}
+        limited = [job for job in jobs if _stage05_grammar_rate_limited(
+            _as_result(replies.get(job.id, "")))]
+        attempt = 0
+        while limited and attempt < self.grammar_retry_attempts:
+            attempt += 1
+            self.stats.grammar_rate_limit_retries += len(limited)
+            self.stats.grammar_retried_ids.update(job.id for job in limited)
+            print("\n  STAGE 05 GRAMMAR CAPACITY RETRY")
+            print(f"  {len(limited)} request(s) hit Anthropic's grammar "
+                  "compilation rate limit")
+            print(f"  Retry attempt: {attempt}/{self.grammar_retry_attempts}")
+            print("  Retrying only those requests in a later paced Message Batch")
+            retried = self._submit(corpus, preamble, limited)
+            self._persist_completed(limited, retried)
+            for job in limited:
+                replies[job.id] = _as_result(retried.get(job.id, ""))
+            limited = [by_id[job.id] for job in limited
+                       if _stage05_grammar_rate_limited(
+                           _as_result(replies.get(job.id, "")))]
+        return replies
+
+    def __call__(self, corpus, preamble, jobs):
+        if not self.native_anthropic:
+            return self.client.batch(corpus, preamble, jobs)
+        replies = {}
+        for start in range(0, len(jobs), self.wave_size):
+            wave = jobs[start:start + self.wave_size]
+            replies.update(self._wave(corpus, preamble, wave))
+        return replies
+
+
+class _Stage05BatchProxy:
+    """Give existing bounded repair helpers the paced Stage 05 transport."""
+
+    def __init__(self, runner):
+        self.runner = runner
+
+    def batch(self, corpus, preamble, jobs):
+        return self.runner(corpus, preamble, jobs)
+
+
+def _stage05_audit_recoveries(project_dir, jobs, corpus, preamble):
+    """Recover paid, exact-contract Stage 05 successes from durable audit logs.
+
+    The interrupted legacy path audited every provider response but had no
+    per-chunk artifacts. Exact prompt, cached system prefix, schema and ID
+    coverage checks make this a local migration, not a fuzzy cache lookup.
+    """
+    wanted = {job.id: job for job in jobs}
+    if not wanted:
+        return {}
+    log_root = os.path.join(project_dir, "logs", "model")
+    if not os.path.isdir(log_root):
+        return {}
+    roots = []
+    for root, _dirs, files in os.walk(log_root):
+        if ("request.json" in files and "response.json" in files
+                and "pipeline_batch_job_05_" in os.path.basename(root)):
+            roots.append(root)
+    expected_system = [text for text in (preamble, corpus)
+                       if isinstance(text, str) and text.strip()]
+    recovered = {}
+    for root in sorted(roots, key=os.path.getmtime, reverse=True):
+        try:
+            request = _load_json(os.path.join(root, "request.json"))
+            job = wanted.get(request.get("job_id"))
+            if job is None or job.id in recovered:
+                continue
+            body = request.get("request") or {}
+            messages = body.get("messages") or []
+            prompt = messages[-1].get("content") if messages else None
+            schema = (((body.get("output_config") or {}).get("format") or {})
+                      .get("schema"))
+            system = body.get("system") or []
+            system_text = ([block.get("text") for block in system
+                            if isinstance(block, dict)
+                            and block.get("type") == "text"]
+                           if isinstance(system, list) else [system])
+            if (prompt != job.prompt or schema != job.schema
+                    or system_text != expected_system):
+                continue
+            response = _load_json(os.path.join(root, "response.json"))
+            metadata = response.get("metadata") or {}
+            stop = metadata.get("stop_reason") or metadata.get("finish_reason")
+            if stop not in ("end_turn", "stop"):
+                continue
+            text = response.get("text") or ""
+            rows = _decode_job_rows(job, text, "assignments")
+            usage = metadata.get("usage") or {}
+            output_details = (usage.get("output_tokens_details") or
+                              usage.get("completion_tokens_details") or {})
+            result = BatchResult(
+                text=text, stop_reason=stop,
+                reasoning_tokens=int(
+                    output_details.get("thinking_tokens") or
+                    output_details.get("reasoning_tokens") or 0),
+                completion_tokens=int(
+                    usage.get("output_tokens") or
+                    usage.get("completion_tokens") or 0),
+                provider=request.get("provider"))
+            recovered[job.id] = (
+                result, rows, os.path.relpath(root, project_dir))
+        except (OSError, ValueError, TypeError, AttributeError, KeyError):
+            continue
+    return recovered
+
+
+def _stage05_artifact(original, chunk, corpus, rows, result, *,
+                      audit_source=None, repaired=False):
+    saved = {
+        "chunk_id": original.id,
+        "evidence_ids": chunk["evidence_ids"],
+        "estimated_input_tokens": chunk["estimated_tokens"],
+        "fingerprint": _job_fingerprint(
+            original, chunk["evidence_ids"], corpus, "stage05_assign_v1"),
+        "response_telemetry": {
+            "provider": result.provider,
+            "stop_reason": result.stop_reason,
+            "completion_tokens": result.completion_tokens,
+            "reasoning_tokens": result.reasoning_tokens,
+        },
+        "assignments": rows,
+    }
+    if audit_source:
+        saved["migrated_from_model_audit"] = audit_source
+    if repaired:
+        saved["structured_repair"] = True
+    return saved
+
+
+def _print_stage05_execution_summary(stats, adaptive_stats, total):
+    first_pass = len(
+        stats.successful_ids - stats.grammar_retried_ids
+        - stats.budget_retried_ids - stats.repaired_ids)
+    print("\n  Stage 05 execution summary")
+    print(f"  Chunks complete/reusable:       "
+          f"{stats.reusable + len(stats.successful_ids)}/{total}")
+    print(f"  First-pass successes:           {first_pass}")
+    print(f"  Grammar-rate-limit retries:     "
+          f"{stats.grammar_rate_limit_retries}")
+    print(f"  Output-budget retries:          {adaptive_stats.budget_retries}")
+    print(f"  Malformed-response repairs:     {adaptive_stats.json_repairs}")
+    print(f"  Hard failures:                  {len(stats.hard_failure_ids)}")
+
+
+def _run_stage05_assignments(c, corpus, jobs, chunks, artifact_dir,
+                             diagnostics_dir, args, project_dir, force=False):
+    """Run Stage 05 with resumable artifacts and Anthropic-safe Batch waves."""
+    from llm import confirm
+
+    os.makedirs(artifact_dir, exist_ok=True)
+    originals = {job.id: job for job in jobs}
+    chunks_by_id = {job.id: chunk for job, chunk in zip(jobs, chunks)}
+    complete = {}
+    stats = Stage05ExecutionStats()
+    for job in jobs:
+        path = os.path.join(artifact_dir, f"{job.id}.json")
+        expected_fingerprint = _job_fingerprint(
+            job, chunks_by_id[job.id]["evidence_ids"], corpus,
+            "stage05_assign_v1")
+        if os.path.isfile(path) and not force:
+            try:
+                saved = _load_json(path)
+                if saved.get("fingerprint") != expected_fingerprint:
+                    continue
+                _decode_job_rows(
+                    job, json.dumps({"assignments": saved.get("assignments")}),
+                    "assignments")
+                complete[job.id] = saved
+            except (OSError, ValueError, TypeError):
+                continue
+
+    missing = [job for job in jobs if job.id not in complete]
+    if missing and not force:
+        audited = _stage05_audit_recoveries(
+            project_dir, missing, corpus, SEGMENT_PREAMBLE)
+        for job in missing:
+            if job.id not in audited:
+                continue
+            result, rows, source = audited[job.id]
+            saved = _stage05_artifact(
+                job, chunks_by_id[job.id], corpus, rows, result,
+                audit_source=source)
+            _json_atomic(os.path.join(artifact_dir, f"{job.id}.json"), saved)
+            complete[job.id] = saved
+        if audited:
+            print(f"  Stage 05 audit migration: preserved {len(audited)} "
+                  "completed paid response(s); 0 model calls made")
+
+    stats.reusable = len(complete)
+    missing = [job for job in jobs if job.id not in complete]
+    if not missing:
+        print(f"  05 assign: reusing all {len(jobs)} completed chunk artifact(s)")
+        return [complete[job.id] for job in jobs]
+
+    native_anthropic = bool(getattr(c, "native_anthropic_batches", False))
+    wave_size = (STAGE05_ANTHROPIC_WAVE_SIZE if native_anthropic
+                 else len(missing))
+    print(f"  05 assign: {len(missing)} unfinished; {len(complete)} reusable")
+    if native_anthropic:
+        print(f"  Stage 05 Anthropic waves: up to {wave_size} requests · "
+              f"{STAGE05_ANTHROPIC_BATCH_INTERVAL_SECONDS}s minimum interval")
+        print(f"  Grammar-capacity retries: at most "
+              f"{STAGE05_GRAMMAR_RETRY_ATTEMPTS} per affected request")
+    print("  Stage 05 output ladder: " + " → ".join(
+        _token_tier_label(tier) for tier in STAGE05_TOKEN_TIERS))
+    if not confirm(c.estimate(corpus, SEGMENT_PREAMBLE, missing, batched=True),
+                   getattr(args, "yes", False)):
+        return None
+    _prewarm_segment_stage(c, corpus, SEGMENT_PREAMBLE, "05")
+
+    runner = _Stage05BatchRunner(c, stats)
+    proxy = _Stage05BatchProxy(runner)
+    adaptive_stats = AdaptiveStageStats(stage="05", total=len(missing))
+
+    def persist_success(final_job, result):
+        original = originals[final_job.id]
+        rows = _decode_job_rows(original, result.text, "assignments")
+        saved = _stage05_artifact(
+            original, chunks_by_id[original.id], corpus, rows, result)
+        _json_atomic(os.path.join(artifact_dir, f"{original.id}.json"), saved)
+        complete[original.id] = saved
+        stats.successful_ids.add(original.id)
+        if final_job.max_tokens != STAGE05_TOKEN_TIERS[0]:
+            stats.budget_retried_ids.add(original.id)
+
+    # Native Batch capacity retries can wait for a minute. Checkpoint every
+    # valid response as soon as its Batch result is available, before waiting,
+    # so an interrupted backoff never discards completed paid work.
+    runner.success_callback = persist_success
+
+    try:
+        results, final_jobs = _run_adaptive_stage(
+            c, corpus, SEGMENT_PREAMBLE, missing, diagnostics_dir,
+            stage="05", key="assignments", wave_size=wave_size,
+            stats=adaptive_stats, debug=getattr(args, "segment_debug", False),
+            token_tiers=STAGE05_TOKEN_TIERS, batch_runner=runner,
+            success_callback=persist_success,
+            first_pass_exclusions=stats.grammar_retried_ids)
+    except BatchOutputError:
+        stats.hard_failure_ids.update(adaptive_stats.terminal_failure_ids)
+        _print_stage05_execution_summary(stats, adaptive_stats, len(jobs))
+        raise
+
+    final_by_id = {job.id: job for job in final_jobs}
+    errors = []
+    for original in missing:
+        if original.id in complete:
+            continue
+        final_job = final_by_id[original.id]
+        result = results[original.id]
+        repairs_before = adaptive_stats.json_repairs
+        try:
+            rows = _batch_rows(
+                {original.id: result}, [final_job], "assignments",
+                diagnostics_dir,
+                repair=lambda failed: _repair_batch(
+                    proxy, corpus, SEGMENT_PREAMBLE, failed, "assignments"),
+                rerun=lambda failed, factor: _rerun_batch(
+                    proxy, corpus, SEGMENT_PREAMBLE, failed, factor),
+                rerun_factor=1, adaptive_stats=adaptive_stats)
+            repaired = adaptive_stats.json_repairs > repairs_before
+            saved = _stage05_artifact(
+                original, chunks_by_id[original.id], corpus, rows, result,
+                repaired=repaired)
+            _json_atomic(os.path.join(
+                artifact_dir, f"{original.id}.json"), saved)
+            complete[original.id] = saved
+            stats.successful_ids.add(original.id)
+            if repaired:
+                stats.repaired_ids.add(original.id)
+        except BatchOutputError as error:
+            stats.hard_failure_ids.add(original.id)
+            errors.append((original.id, error))
+
+    _print_stage05_execution_summary(stats, adaptive_stats, len(jobs))
+    if errors:
+        sample = "; ".join(f"{job_id}: {error}" for job_id, error in errors[:3])
+        raise BatchOutputError(
+            f"Stage 05 could not complete {len(errors)} chunk(s). Successful "
+            f"chunk artifacts were preserved for resume. {sample}")
+    return [complete[job.id] for job in jobs]
 
 
 def cmd_segment(cfg, args):
@@ -2948,7 +3329,9 @@ def cmd_segment(cfg, args):
         "validated": validated,
         "evidence": [{"id": row["id"], "text": row["text"]} for row in items],
     })
-    redo_assign = (getattr(args, "reassign", False) or _segment_force(args, "05")
+    force_assign = (getattr(args, "reassign", False)
+                    or _segment_force(args, "05"))
+    redo_assign = (force_assign
                    or not _meta_matches(asg_meta, assignment_fingerprint))
     if os.path.exists(asg_p) and not redo_assign:
         rows = _read_jsonl(asg_p)
@@ -2969,23 +3352,22 @@ def cmd_segment(cfg, args):
                     "correct unassigned status. Tier is evidence strength, not "
                     "membership. Return exactly one row per ID.\n\nEVIDENCE:\n" +
                     _stage05_evidence_text(chunk["records"])),
-            max_tokens=16000, schema=assignment_schema(
+            max_tokens=STAGE05_TOKEN_TIERS[0], schema=assignment_schema(
                 chunk["evidence_ids"],
                 [row["segment_id"] for row in validated]),
             expected_ids=tuple(chunk["evidence_ids"]),
             effort=_segment_setting(cfg, "05_effort", None)) for chunk in chunks05]
         print(f"  05 assign: {len(items):,} items in {len(jobs05)} batched chunks")
-        if not confirm(c.estimate(prefix, SEGMENT_PREAMBLE, jobs05, batched=True),
-                       getattr(args, "yes", False)):
+        artifact_dir = paths.research(
+            cfg["_dir"], "segments", "assignments", "05_chunk_assignments")
+        artifacts05 = _run_stage05_assignments(
+            c, prefix, jobs05, chunks05, artifact_dir,
+            os.path.join(diagnostics, "05_assign"), args, cfg["_dir"],
+            force=force_assign)
+        if artifacts05 is None:
             return
-        c.prewarm(prefix, SEGMENT_PREAMBLE)
-        results = c.batch(prefix, SEGMENT_PREAMBLE, jobs05)
-        rows = _batch_rows(
-            results, jobs05, "assignments", os.path.join(diagnostics, "05_assign"),
-            repair=lambda failed: _repair_batch(
-                c, prefix, SEGMENT_PREAMBLE, failed, "assignments"),
-            rerun=lambda failed, factor: _rerun_batch(
-                c, prefix, SEGMENT_PREAMBLE, failed, factor))
+        rows = [row for artifact in artifacts05
+                for row in artifact["assignments"]]
         _require_exact_ids(rows, {row["id"] for row in items}, "skill 05 assignment")
         _write_jsonl_atomic(asg_p, rows)
         _json_atomic(asg_meta, {"input_fingerprint": assignment_fingerprint})

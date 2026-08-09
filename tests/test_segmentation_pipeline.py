@@ -1142,6 +1142,26 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
                 cli.cmd_segment(cfg, self.args())
             self.assertEqual(second.calls, [])
 
+    def test_interrupted_stage05_resume_reuses_chunks_without_rerunning_stage04(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.project(tmp)
+            first = self.FakeClient()
+            with mock.patch.object(cli, "client", return_value=first), \
+                    mock.patch.object(llm, "confirm", return_value=True), \
+                    mock.patch.object(cli, "record_provenance"):
+                cli.cmd_segment(cfg, self.args())
+
+            voc = os.path.join(tmp, "research", "voc")
+            os.unlink(os.path.join(voc, "segment_assignments.jsonl"))
+            os.unlink(os.path.join(voc, "segment_assignments.jsonl.meta.json"))
+
+            resume = self.FakeClient(fail_on_call=True)
+            with mock.patch.object(cli, "client", return_value=resume), \
+                    mock.patch.object(cli, "record_provenance"):
+                cli.cmd_segment(cfg, self.args())
+
+            self.assertEqual(resume.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

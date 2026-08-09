@@ -194,6 +194,11 @@ class Client:
     # the next starts. A synchronous prewarm did not populate that Batch cache
     # in the live proof and would only add a discarded paid generation.
     batch_cache_self_seeds = True
+    # Capability marker used only by Stage 05's scheduler. OpenRouter also has
+    # a ``batch`` method, but it is a local four-thread fan-out rather than one
+    # Anthropic Message Batch and therefore must not inherit Anthropic's grammar
+    # compilation pacing policy.
+    native_anthropic_batches = True
 
     def __init__(self, model=MODEL, effort="high", verbose=True):
         try:
