@@ -56,7 +56,7 @@ SIZES = {"4:5 portrait": "1024x1536", "1:1 square": "1024x1024",
          "1.91:1 landscape": "1536x1024"}
 
 # The deterministic refinement export is the lean ingest contract consumed by
-# skills 03-06. Rich audit and legacy files are visible as diagnostics only.
+# skills 03-09. Rich audit and legacy files are visible as diagnostics only.
 SEGMENT_VOC_FILES = ("production_voc.jsonl",)
 INGEST_ADDITIONAL_FILES = (
     ("audit_voc.jsonl", "audit_voc.jsonl · provenance and Stage 01/02 audit"),
@@ -79,7 +79,7 @@ def _credential_snapshot():
 STAGES = [
     ("ingest",   "Skills 01-02: filter + deduplicate",         True,  True),
     ("refine-voc", "Deterministic VOC refinement + export",    False, False),
-    ("segment",  "Skills 03-06: discover, validate, assign, build", True, False),
+    ("segment",  "Stages 03-09: research segments to commercial pack", True, False),
     ("extract",  "Skills 07-26: 20 dimensions, batched",       True,  False),
     ("picc",     "Skill 27 + PICC card + 5 angles",            True,  False),
     ("concepts", "10 concepts + hooks + layouts",             True,  False),
@@ -408,6 +408,19 @@ def project_outputs(project):
                     rel = os.path.relpath(path, discovery)
                     entry("segment", f"03 discovery · {rel}", path)
 
+    for folder, prefix in (("commercial", "07-08 commercial"),
+                           ("final", "09 research pack")):
+        stage_dir = paths.research(root, "segments", folder)
+        if os.path.isdir(stage_dir):
+            for base, _dirs, files in os.walk(stage_dir):
+                for f in sorted(files):
+                    if f.startswith(".") or f.endswith(".meta.json"):
+                        continue
+                    path = os.path.join(base, f)
+                    rel = os.path.relpath(path, stage_dir)
+                    entry("segment", f"{prefix} · {rel}", path,
+                          role="final" if folder == "final" else None)
+
     ed = paths.evidence(root)
     if os.path.isdir(ed):
         for f in sorted(os.listdir(ed)):
@@ -606,7 +619,7 @@ def export_logs(project, stage=""):
 
 
 def segment_voc_files(project):
-    """Only completed ingest contracts that skills 03-06 may consume."""
+    """Only completed ingest contracts that segmentation Stages 03-09 consume."""
     if project not in projects():
         return []
     voc_dir = paths.voc(os.path.join(ROOT, "projects", project))

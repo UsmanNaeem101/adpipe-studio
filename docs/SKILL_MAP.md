@@ -30,6 +30,9 @@ Nothing syncs automatically with an external SDK folder.
 | **04** validate_segments | `segment` | `cmd_segment()` | compact cards + metrics + representatives | `voc/validated_segments.json` |
 | **05** assign_primary_segment | `segment` | `cmd_segment()` | validated + corpus | `voc/segment_assignments.jsonl` |
 | **06** build_segment_evidence_files | `segment` | `build_evidence_files()` | assignments | `evidence/<slug>.txt` + audit set |
+| commercial **07** coalescing | `segment` | `_run_commercial_layers()` | validated research cards + Stage-05 metrics | `commercial/07_*.json` |
+| commercial **08A/08B** VOC synthesis | `segment` | `_run_commercial_layers()` | canonical evidence unions | `commercial/synthesis/cseg_*.json` |
+| commercial **09** research pack | `segment` | `render_research_pack()` | Stage-07/08 artifacts | `segments/final/` |
 | **07–26** the 20 extractors | `extract` | `cmd_extract()` via `EXTRACTORS` | one evidence file | `extractions/<segment>/<skill>.md` |
 | **27** rank_buying_barriers | `picc` | `cmd_picc()` | extractions 07–26 | `output/<segment>/01_picc_card.md` |
 
@@ -97,12 +100,14 @@ raw dump
                                              segment_evidence_manifest.yaml,
                                              assignment_conflicts.jsonl,
                                              missing_evidence.jsonl
+  → research/segments/commercial/  (commercial 07/08 catalogue + synthesis)
+  → research/segments/final/       (commercial 09 human research pack)
   → extractions/<segment>/*.md      (07–26)
   → output/<segment>/01_picc_card.md (27)
 ```
 
 Each segmentation chunk has an input fingerprint and skips completed work on rerun.
-Use `segment --from 03a|03b|03c|04|05|06` to rerun that substep and its downstream
+Use `segment --from 03a|03b|03c|04|05|06|07|08|09` to rerun that substep and its downstream
 steps; `--rediscover` remains an alias for restarting at 03A and `--reassign` redoes
 05. `--force` redoes extractions.
 

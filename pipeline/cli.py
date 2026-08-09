@@ -4,7 +4,7 @@ adpipe — raw Reddit VOC in, launch-ready static ads out.
 
     ./adpipe ingest  raw_voc.txt        filter + dedupe                (code)
     ./adpipe refine-voc                 lean production + rich audit   (code)
-    ./adpipe segment                    discover + assign + evidence   (code + model)
+    ./adpipe segment                    research + commercial segments (code + model)
     ./adpipe extract <segment>          skills 07-26, batched + cached (model)
     ./adpipe picc    <segment>          barriers, PICC card, 5 angles  (model)
     ./adpipe concepts <segment>         10 concepts + hooks + layouts  (model)
@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 import paths  # noqa: E402
 import presets  # noqa: E402
 import segmentation  # noqa: E402
+import commercial  # noqa: E402
 from llm import BatchResult, NO_RETRY_STOP_REASONS  # noqa: E402
 
 SKILLS = os.path.join(ROOT, "skills")
@@ -415,6 +416,12 @@ STAGE04_TOKEN_TIERS = (64000, 128000, 256000)
 # Stage 05 emits one assignment row per evidence item. Its answer can exceed
 # 16k, but it does not need Stage 04's catalogue-sized 64k+ ladder.
 STAGE05_TOKEN_TIERS = (16000, 24000, 32000)
+# Commercial coalescing is one global catalogue response; signal extraction is
+# chunk-local, and segment-local coalescing may legitimately be larger.  These
+# ladders are isolated from the established Stage 03--06 policies.
+STAGE07_TOKEN_TIERS = (64000, 128000)
+STAGE08A_TOKEN_TIERS = (12000, 16000, 24000, 32000)
+STAGE08B_TOKEN_TIERS = (24000, 32000, 64000)
 STAGE05_ANTHROPIC_WAVE_SIZE = 10
 STAGE05_ANTHROPIC_BATCH_INTERVAL_SECONDS = 65
 STAGE05_GRAMMAR_RETRY_ATTEMPTS = 2
@@ -1867,7 +1874,7 @@ def _write_jsonl(path, rows):
             fh.write(json.dumps(r) + "\n")
 
 
-# ------------------------------------------------------------------ 03-06
+# ------------------------------------------------------------------ segmentation 03-09
 
 VALIDATION_SCHEMA = {
     "type": "object",
@@ -2010,7 +2017,7 @@ SEGMENT_PREAMBLE = (
     "invent an ID, quote, count, source, or audience. Return only the requested "
     "structured data; deterministic code handles counting, joining and ordering."
 )
-SEGMENT_STEP_ORDER = ("03a", "03b", "03c", "04", "05", "06")
+SEGMENT_STEP_ORDER = ("03a", "03b", "03c", "04", "05", "06", "07", "08", "09")
 
 
 def _segment_setting(cfg, key, default):
@@ -3040,8 +3047,353 @@ def _run_stage05_assignments(c, corpus, jobs, chunks, artifact_dir,
     return [complete[job.id] for job in jobs]
 
 
+def _completed_segmentation_inputs(cfg, voc):
+    """Load authenticated Stage 04/05 outputs for a post-06-only resume."""
+    discovery = paths.research(cfg["_dir"], "segments", "discovery")
+    candidates_path = os.path.join(discovery, "discovered_segments.json")
+    decisions_path = os.path.join(voc, "validated_segments.json")
+    assignments_path = os.path.join(voc, "segment_assignments.jsonl")
+    missing = [path for path in (candidates_path, decisions_path, assignments_path)
+               if not os.path.isfile(path)]
+    if missing:
+        sys.exit("Cannot start the commercial synthesis layer: missing completed "
+                 "Stage 03--05 artifact(s):\n  " + "\n  ".join(missing))
+    candidates = _load_json(candidates_path)
+    decisions = _load_json(decisions_path)
+    by_segment_id = {row["segment_id"]: row for row in candidates}
+    validated = [by_segment_id[row["segment_id"]] for row in decisions
+                 if (row.get("status") == "validated"
+                     and row.get("segment_id") in by_segment_id)]
+    assignments = _read_jsonl(assignments_path)
+    if not validated:
+        sys.exit("Cannot start Stage 07: no validated Stage-04 segments found.")
+    return validated, decisions, assignments
+
+
+def _stage08_chunk_prompt(canonical, records):
+    card = {key: canonical[key] for key in (
+        "canonical_segment_id", "slug", "name", "definition",
+        "commercial_distinction", "subsegments", "attributes")}
+    return (
+        "Extract VOC signals from this bounded portion of the complete evidence "
+        "union for the canonical audience below. Do not reconsider the audience."
+        "\n\nCANONICAL AUDIENCE:\n" +
+        json.dumps(card, ensure_ascii=False, indent=2) +
+        "\n\nEVIDENCE CHUNK:\n" +
+        segmentation.evidence_text(records, include_tier=True))
+
+
+def _run_commercial_layers(c, cfg, args, items, by_id, validated, decisions,
+                           assignments):
+    """Run the resumable semantic Stages 07/08 and deterministic Stage 09."""
+    from llm import Job, confirm
+
+    commercial_dir = paths.research(cfg["_dir"], "segments", "commercial")
+    synthesis_dir = os.path.join(commercial_dir, "synthesis")
+    diagnostics = paths.voc(cfg["_dir"], "_model_failures", "commercial")
+    os.makedirs(commercial_dir, exist_ok=True)
+    os.makedirs(synthesis_dir, exist_ok=True)
+    stage_start = _model_meter(c) if c is not None else None
+
+    # --------------------------------------------------- 07 commercial grouping
+    s07 = skill_named("commercial_07_coalesce.md")
+    cards = commercial.build_stage07_cards(
+        validated, decisions, assignments, by_id)
+    schema07 = commercial.stage07_schema(row["segment_id"] for row in validated)
+    fingerprint07 = _value_fingerprint({
+        "cards": cards, "skill": s07, "schema": schema07,
+        "contract": commercial.COMMERCIAL_CONTRACT_VERSION,
+    })
+    catalogue_path = os.path.join(commercial_dir, "07_canonical_segments.json")
+    mapping_path = os.path.join(commercial_dir, "07_commercial_mapping.json")
+    model07_path = os.path.join(commercial_dir, "07_model_response.json")
+    meta07_path = os.path.join(commercial_dir, "07.meta.json")
+    catalogue = mapping = None
+    if (not _segment_force(args, "07") and _meta_matches(
+            meta07_path, fingerprint07)
+            and os.path.isfile(catalogue_path) and os.path.isfile(mapping_path)):
+        try:
+            catalogue = _load_json(catalogue_path)
+            mapping = _load_json(mapping_path)
+            commercial.validate_stage07_artifacts(
+                catalogue, mapping, validated, assignments)
+        except (OSError, TypeError, ValueError) as error:
+            print(f"  07 cached artifact failed validation: {error}")
+            catalogue = mapping = None
+        else:
+            print(f"  07 commercial coalescing: reusing "
+                  f"{catalogue['canonical_segment_count']} canonical audiences")
+    if catalogue is None:
+        if getattr(args, "from_stage", None) in ("08", "09"):
+            sys.exit("Stage 07 artifacts are missing or stale. Resume with: "
+                     f"./adpipe -p {cfg['name']} segment --from 07")
+        if c is None:
+            sys.exit("Stage 07 requires a model provider.")
+        prompt07 = (
+            "Coalesce this complete compact catalogue of validated research "
+            "segments. Metrics are deterministic; representative evidence is a "
+            "bounded sample. Map every supplied segment_id exactly once.\n\n"
+            "RESEARCH SEGMENT CARDS:\n" +
+            json.dumps(cards, ensure_ascii=False, indent=2))
+        job07 = Job(
+            id="07_commercial_coalesce", prompt=prompt07,
+            max_tokens=STAGE07_TOKEN_TIERS[0], schema=schema07,
+            effort=_segment_setting(cfg, "07_effort", None))
+        print("  Stage 07 retry ladder: " + " → ".join(
+            _token_tier_label(tier) for tier in STAGE07_TOKEN_TIERS))
+        if not confirm(c.estimate(s07, SEGMENT_PREAMBLE, [job07]),
+                       getattr(args, "yes", False)):
+            return False
+
+        def validate07(payload):
+            commercial.finalize_stage07(
+                payload, validated, assignments, by_id)
+
+        raw07 = _run_single_structured(
+            c, s07, SEGMENT_PREAMBLE, job07,
+            os.path.join(diagnostics, "07"), token_tiers=STAGE07_TOKEN_TIERS,
+            response_validator=validate07,
+            repair_guidance=(
+                "Return the COMPLETE catalogue and COMPLETE mapping. Correct only "
+                "the stated immutable-ID, exact-coverage, or shape violation. "
+                "Never return only the rows being repaired and do not make new "
+                "evidence assignments."))
+        catalogue, mapping = commercial.finalize_stage07(
+            raw07, validated, assignments, by_id)
+        _json_atomic(model07_path, raw07)
+        _json_atomic(catalogue_path, catalogue)
+        _json_atomic(mapping_path, mapping)
+        _json_atomic(meta07_path, {"input_fingerprint": fingerprint07})
+        print(f"  07 commercial coalescing: {len(validated)} research segments → "
+              f"{catalogue['canonical_segment_count']} canonical audiences")
+
+    # ------------------------------------------------------ 08 VOC synthesis
+    s08a = skill_named("commercial_08a_extract_signals.md")
+    s08b = skill_named("commercial_08b_coalesce_signals.md")
+    canonical_rows = catalogue["canonical_segments"]
+    synthesis_by_id = {}
+    pending = []
+    fingerprints08 = {}
+    for canonical in canonical_rows:
+        canonical_id = canonical["canonical_segment_id"]
+        evidence_input = [{
+            "id": evidence_id,
+            "tier": by_id[evidence_id].get("tier", "context"),
+            "text": by_id[evidence_id]["text"],
+        } for evidence_id in canonical["primary_evidence_ids"]]
+        fingerprint = _value_fingerprint({
+            "canonical_mapping": canonical,
+            "assigned_evidence": evidence_input,
+            "skills": {"08a": s08a, "08b": s08b},
+            "contract": commercial.COMMERCIAL_CONTRACT_VERSION,
+        })
+        fingerprints08[canonical_id] = fingerprint
+        output_path = os.path.join(synthesis_dir, canonical_id + ".json")
+        meta_path = output_path + ".meta.json"
+        if (not _segment_force(args, "08")
+                and _meta_matches(meta_path, fingerprint)
+                and os.path.isfile(output_path)):
+            try:
+                synthesis = _load_json(output_path)
+                commercial.validate_synthesis(synthesis, canonical)
+            except (OSError, TypeError, ValueError) as error:
+                print(f"  08 {canonical_id} cache failed validation: {error}")
+            else:
+                synthesis_by_id[canonical_id] = synthesis
+                continue
+        pending.append(canonical)
+
+    if pending and getattr(args, "from_stage", None) == "09":
+        sys.exit("Stage 08 artifacts are missing or stale. Resume with: "
+                 f"./adpipe -p {cfg['name']} segment --from 08")
+    if pending and c is None:
+        sys.exit("Stage 08 requires a model provider.")
+
+    chunks08a = []
+    jobs08a = []
+    canonical_for_job = {}
+    evidence_for_job = {}
+    target08 = int(_segment_setting(cfg, "08a_chunk_tokens", 8000))
+    for canonical in pending:
+        canonical_id = canonical["canonical_segment_id"]
+        records = [by_id[evidence_id]
+                   for evidence_id in canonical["primary_evidence_ids"]]
+        chunks = segmentation.chunk_by_tokens(
+            records, target08, f"08a_{canonical_id}")
+        segmentation.assert_exact_chunk_coverage(
+            chunks, canonical["primary_evidence_ids"])
+        for chunk in chunks:
+            job = Job(
+                id=chunk["chunk_id"],
+                prompt=_stage08_chunk_prompt(canonical, chunk["records"]),
+                max_tokens=STAGE08A_TOKEN_TIERS[0],
+                schema=commercial.stage08a_schema(chunk["evidence_ids"]),
+                effort=_segment_setting(cfg, "08a_effort", None))
+            chunks08a.append(chunk)
+            jobs08a.append(job)
+            canonical_for_job[job.id] = canonical_id
+            evidence_for_job[job.id] = {
+                evidence_id: by_id[evidence_id]
+                for evidence_id in chunk["evidence_ids"]}
+
+    if jobs08a:
+        def validate08a(job, rows):
+            commercial.validate_stage08a(
+                {"signals": rows}, evidence_for_job[job.id])
+
+        results08a = _run_persisted_segment_jobs(
+            c, s08a, jobs08a, chunks08a, "signals",
+            os.path.join(synthesis_dir, "_08a_chunks"),
+            os.path.join(diagnostics, "08a"), args, "08A",
+            force=_segment_force(args, "08"), row_validator=validate08a,
+            repair_guidance=(
+                "Return the complete signals array for this one evidence chunk. "
+                "Correct only structural/provenance violations, preserve valid "
+                "signals and verbatim quotes, and cite only supplied IDs."),
+            contract_version=commercial.COMMERCIAL_CONTRACT_VERSION)
+        if results08a is None:
+            return False
+    else:
+        results08a = []
+
+    results_by_canonical = defaultdict(list)
+    for result in results08a:
+        results_by_canonical[canonical_for_job[result["chunk_id"]]].append(result)
+
+    jobs08b = []
+    job08b_context = {}
+    for canonical in pending:
+        canonical_id = canonical["canonical_segment_id"]
+        signal_catalogue = commercial.catalogue_stage08a(
+            results_by_canonical[canonical_id])
+        if not signal_catalogue:
+            empty = {dimension: [] for dimension in commercial.SIGNAL_DIMENSIONS}
+            synthesis = {
+                "canonical_segment_id": canonical_id,
+                "slug": canonical["slug"], "name": canonical["name"],
+                "primary_evidence_count": canonical["primary_evidence_count"],
+                **empty,
+            }
+            synthesis_by_id[canonical_id] = synthesis
+            _json_atomic(os.path.join(synthesis_dir, canonical_id + ".json"), synthesis)
+            _json_atomic(os.path.join(
+                synthesis_dir, canonical_id + ".json.meta.json"),
+                {"input_fingerprint": fingerprints08[canonical_id]})
+            continue
+        schema08b = commercial.stage08b_schema(
+            [row["signal_id"] for row in signal_catalogue],
+            canonical["primary_evidence_ids"])
+        prompt08b = (
+            "Coalesce the complete extracted signal catalogue for this one "
+            "canonical audience. Every signal_id must be mapped exactly once."
+            "\n\nCANONICAL AUDIENCE:\n" +
+            json.dumps({key: canonical[key] for key in (
+                "canonical_segment_id", "slug", "name", "definition",
+                "commercial_distinction")}, ensure_ascii=False, indent=2) +
+            "\n\nSIGNAL CATALOGUE:\n" +
+            json.dumps(signal_catalogue, ensure_ascii=False, indent=2))
+        job = Job(
+            id=f"08b_{canonical_id}", prompt=prompt08b,
+            max_tokens=STAGE08B_TOKEN_TIERS[0], schema=schema08b,
+            effort=_segment_setting(cfg, "08b_effort", None))
+        jobs08b.append(job)
+        job08b_context[job.id] = (canonical, signal_catalogue)
+
+    if jobs08b:
+        print(f"  08B: {len(jobs08b)} canonical segment synthesis request(s)")
+        print("  Stage 08B retry ladder: " + " → ".join(
+            _token_tier_label(tier) for tier in STAGE08B_TOKEN_TIERS))
+        if not confirm(c.estimate(s08b, SEGMENT_PREAMBLE, jobs08b),
+                       getattr(args, "yes", False)):
+            return False
+    for job in jobs08b:
+        canonical, signal_catalogue = job08b_context[job.id]
+
+        def validate08b(payload, canonical=canonical,
+                        signal_catalogue=signal_catalogue):
+            commercial.finalize_stage08(
+                canonical, signal_catalogue, payload, by_id)
+
+        raw08b = _run_single_structured(
+            c, s08b, SEGMENT_PREAMBLE, job,
+            os.path.join(diagnostics, "08b", job.id),
+            token_tiers=STAGE08B_TOKEN_TIERS,
+            response_validator=validate08b,
+            repair_guidance=(
+                "Return the COMPLETE themes collection. Correct only the stated "
+                "signal-lineage or shape violation; preserve every valid theme and "
+                "map every original signal_id exactly once."))
+        synthesis = commercial.finalize_stage08(
+            canonical, signal_catalogue, raw08b, by_id)
+        canonical_id = canonical["canonical_segment_id"]
+        output_path = os.path.join(synthesis_dir, canonical_id + ".json")
+        _json_atomic(os.path.join(synthesis_dir, canonical_id + ".08b.json"), raw08b)
+        _json_atomic(output_path, synthesis)
+        _json_atomic(output_path + ".meta.json", {
+            "input_fingerprint": fingerprints08[canonical_id]})
+        synthesis_by_id[canonical_id] = synthesis
+        print(f"  08 {canonical_id}: {canonical['primary_evidence_count']:,} "
+              "evidence items synthesized")
+    if not pending:
+        print(f"  08 VOC synthesis: reusing all {len(canonical_rows)} segment(s)")
+
+    for canonical in canonical_rows:
+        canonical_id = canonical["canonical_segment_id"]
+        if canonical_id not in synthesis_by_id:
+            synthesis_by_id[canonical_id] = _load_json(
+                os.path.join(synthesis_dir, canonical_id + ".json"))
+        commercial.validate_synthesis(synthesis_by_id[canonical_id], canonical)
+
+    # ------------------------------------------------- 09 deterministic pack
+    assigned_count = len({row["evidence_id"]
+                          for row in commercial.assigned_rows(assignments)})
+    stage09_fingerprint = _value_fingerprint({
+        "catalogue": catalogue, "mapping": mapping,
+        "synthesis": synthesis_by_id,
+        "refined_count": len(items), "assigned_count": assigned_count,
+        "contract": commercial.COMMERCIAL_CONTRACT_VERSION,
+    })
+    final_dir = paths.research(cfg["_dir"], "segments", "final")
+    meta09 = os.path.join(final_dir, "09.meta.json")
+    index_path = os.path.join(final_dir, "00_segment_index.txt")
+    if (_segment_force(args, "09") or not _meta_matches(
+            meta09, stage09_fingerprint) or not os.path.isfile(index_path)):
+        index, _filenames = commercial.render_research_pack(
+            final_dir, cfg["name"], len(items), assigned_count,
+            len(items) - assigned_count, validated, catalogue, mapping,
+            synthesis_by_id, by_id)
+        _json_atomic(meta09, {"input_fingerprint": stage09_fingerprint})
+        print(f"  09 human research pack: {len(canonical_rows)} segment files -> "
+              f"{final_dir}")
+    else:
+        print(f"  09 human research pack: reusing {index_path}")
+
+    if c is not None:
+        stage_end = _model_meter(c)
+        summary = {
+            "research_segment_count": len(validated),
+            "canonical_segment_count": len(canonical_rows),
+            "assigned_evidence_count": assigned_count,
+            "preserved_evidence_count": mapping["preserved_evidence_count"],
+            "model_usage": _meter_delta(stage_start, stage_end),
+            "output_paths": {
+                "canonical_segments": catalogue_path,
+                "commercial_mapping": mapping_path,
+                "synthesis": synthesis_dir,
+                "research_pack": final_dir,
+            },
+        }
+        _json_atomic(os.path.join(commercial_dir, "07_09_run_summary.json"), summary)
+        usage = summary["model_usage"]["usage"]
+        print(f"  Stages 07--09 model usage: {usage.get('in', 0):,} input · "
+              f"{usage.get('out', 0):,} output · "
+              f"{usage.get('reasoning', 0):,} reasoning · "
+              f"${summary['model_usage']['cost_usd']:.4f}")
+    return True
+
+
 def cmd_segment(cfg, args):
-    """Resumable 03A -> 03B -> expansion -> 03C -> 04 -> 05 -> 06."""
+    """Resumable 03A -> 03B -> 03C -> 04 -> 05 -> 06 -> 07 -> 08 -> 09."""
     from llm import Job, confirm
 
     requested_source = getattr(args, "source", None)
@@ -3066,6 +3418,18 @@ def cmd_segment(cfg, args):
             items, audit_items, require_complete=not bool(requested_source))
     except ValueError as error:
         sys.exit(f"{error}; run refine-voc again.")
+
+    # Starting at the synthesis layer is a deliberate migration/resume path.
+    # It loads the completed immutable Stage 04/05 contracts directly and never
+    # executes Stages 03--06 (including deterministic Stage 06 rewrites).
+    if getattr(args, "from_stage", None) in ("07", "08", "09"):
+        validated, decisions, rows = _completed_segmentation_inputs(cfg, voc)
+        expected = {row["id"] for row in items}
+        _require_exact_ids(rows, expected, "persisted Stage 05 assignment")
+        stage_client = (None if args.from_stage == "09" else client(cfg, args))
+        _run_commercial_layers(
+            stage_client, cfg, args, items, by_id, validated, decisions, rows)
+        return
 
     c = client(cfg, args)
     stage03_started = time.monotonic()
@@ -3605,6 +3969,8 @@ def cmd_segment(cfg, args):
             f"{key} {value}" for key, value in tally.most_common()))
 
     build_evidence_files(cfg, validated, rows, by_id, voc)
+    _run_commercial_layers(
+        c, cfg, args, items, by_id, validated, decisions, rows)
 
 
 def build_evidence_files(cfg, validated, rows, by_id, voc):

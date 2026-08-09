@@ -14,7 +14,7 @@ The CLI still exists if you prefer it:
 ```bash
 ./adpipe studio                       # same UI
 ./adpipe ingest  raw_voc.txt          # filter + dedupe                (code, free)
-./adpipe segment                      # discover + assign + evidence   (code + model)
+./adpipe segment                      # research segments + commercial pack (both)
 ./adpipe run     <segment>            # extract → … → rendered PNGs    (code + model)
 ```
 
@@ -89,7 +89,7 @@ the save. `ingest`, segment assignment, `qa` and `render` need no key at all.
 | Stage | What it does | Engine |
 |---|---|---|
 | `ingest` | Skills 01–02. Splits a dump into individual comments (one comment = one evidence item), strips boilerplate, scores relevance, drops duplicates. | code |
-| `segment` | Skills 03–06. Model discovers and validates segments from a sample; assignment and evidence-file building are deterministic, so each item lands in exactly one segment. | both |
+| `segment` | Stages 03–09. Discover, validate, assign, build evidence, coalesce commercial audiences, synthesize VOC, and render a clean research pack. Stage-05 provenance remains authoritative. | both |
 | `extract` | Skills 07–26 against one evidence file — 20 dimensions, **batched and cached**. | model |
 | `picc` | Skill 27 barrier ranking, then the quick PICC card and 5 angles. | model |
 | `concepts` | 10 concepts, 2–3 in-image hooks each in the segment's own words, each mapped to a real layout. Writes `concepts.json`. | model |

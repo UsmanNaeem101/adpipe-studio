@@ -1057,6 +1057,17 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
                         "primary_cues": ["desk"], "rationale": "dominant context",
                         "assignment_status": "assigned", "secondary_attributes": []}
                         for eid in job.expected_ids]}
+                elif job.id.startswith("08a_"):
+                    ids = job.schema["properties"]["signals"]["items"][
+                        "properties"]["evidence_ids"]["items"]["enum"]
+                    payload = {"signals": [{
+                        "dimension": "pain_points",
+                        "label": "Pain after desk work",
+                        "evidence_ids": ids,
+                        "representative_quotes": [],
+                        "typical_outcome": "",
+                        "common_complaint": "",
+                    }]}
                 else:
                     raise AssertionError(f"unexpected batch schema for {job.id}")
                 replies[job.id] = BatchResult(json.dumps(payload), "stop")
@@ -1083,6 +1094,39 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
                     "segment_id": "seg_001", "status": "validated",
                     "rationale": "independent recurring context",
                     "merged_into": "", "split_into": []}]}
+            elif job_id == "07_commercial_coalesce":
+                payload = {
+                    "canonical_segments": [{
+                        "canonical_key": "desk_workers",
+                        "slug": "desk_workers",
+                        "name": "Desk workers",
+                        "definition": "People whose desk work drives their pain.",
+                        "commercial_distinction": (
+                            "Workday context changes ergonomic messaging."),
+                        "source_segment_ids": ["seg_001"],
+                        "subsegments": [], "attributes": [],
+                        "inclusion_criteria": ["desk work is dominant"],
+                        "exclusion_criteria": ["incidental desk mention"],
+                    }],
+                    "research_segment_mappings": [{
+                        "segment_id": "seg_001", "disposition": "parent",
+                        "canonical_key": "desk_workers", "label": "Desk workers",
+                        "rationale": "A distinct workday audience",
+                    }],
+                }
+            elif job_id == "08b_cseg_001":
+                signal_ids = schema["properties"]["themes"]["items"][
+                    "properties"]["source_signal_ids"]["items"]["enum"]
+                evidence_ids = schema["properties"]["themes"]["items"][
+                    "properties"]["representative_evidence_ids"]["items"]["enum"]
+                payload = {"themes": [{
+                    "dimension": "pain_points",
+                    "label": "Pain after desk work",
+                    "source_signal_ids": signal_ids,
+                    "representative_evidence_ids": evidence_ids[:1],
+                    "summary": "Desk work triggers pain",
+                    "typical_outcome": "", "common_complaint": "",
+                }]}
             else:
                 raise AssertionError(f"unexpected single schema for {job_id}")
             return BatchResult(json.dumps(payload), "stop")
@@ -1161,6 +1205,28 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
                 cli.cmd_segment(cfg, self.args())
 
             self.assertEqual(resume.calls, [])
+
+    def test_from_09_renders_without_model_or_stage03_to_stage06_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.project(tmp)
+            first = self.FakeClient()
+            with mock.patch.object(cli, "client", return_value=first), \
+                    mock.patch.object(llm, "confirm", return_value=True), \
+                    mock.patch.object(cli, "record_provenance"):
+                cli.cmd_segment(cfg, self.args())
+
+            resume_args = self.args()
+            resume_args.from_stage = "09"
+            with mock.patch.object(
+                    cli, "client", side_effect=AssertionError(
+                        "Stage 09 must not construct a model client")), \
+                    mock.patch.object(
+                        cli, "build_evidence_files", side_effect=AssertionError(
+                            "Stage 06 must not rerun")):
+                cli.cmd_segment(cfg, resume_args)
+
+            self.assertTrue(os.path.isfile(os.path.join(
+                tmp, "research", "segments", "final", "00_segment_index.txt")))
 
 
 if __name__ == "__main__":

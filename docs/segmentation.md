@@ -1,7 +1,7 @@
 # Scalable segmentation pipeline
 
-`segment` is a persisted 03A → 03B → 03E → 03C → 04 → 05 → 06 pipeline. Raw VOC
-never has to fit in one model context.
+`segment` is a persisted 03A → 03B → 03E → 03C → 04 → 05 → 06 → 07 → 08 → 09
+pipeline. Raw VOC never has to fit in one model context.
 
 ## Discovery flow
 
@@ -30,6 +30,14 @@ never has to fit in one model context.
    an explicit unassigned status.
 8. **06 build** joins assignments to audit provenance in code and writes the evidence
    tier into every segment file.
+9. **07 commercial coalescing** uses compact research-segment cards to group peer,
+   subsegment, attribute, journey, watchlist, and excluded roles. Code requires every
+   Stage-04 segment exactly once, assigns stable canonical IDs from immutable lineage,
+   and proves every assigned Stage-05 evidence ID remains represented.
+10. **08 VOC synthesis** extracts evidence-ID-backed signals in segment-local chunks,
+    then coalesces them within each canonical audience. Code derives all unique counts.
+11. **09 research pack** deterministically renders a human index, one clean segment
+    file per canonical audience, a watchlist, and machine-readable copies.
 
 ## Artifacts and lineage
 
@@ -58,6 +66,18 @@ be followed back through `audit_voc.jsonl` to original URLs and Stage 01/02 deci
 usage, reasoning tokens when reported, cost, wall time, representative coverage, and
 best-effort comparison data from a preserved monolithic output/audit log.
 
+The post-segmentation layer writes:
+
+```text
+research/segments/commercial/07_commercial_mapping.json
+research/segments/commercial/07_canonical_segments.json
+research/segments/commercial/synthesis/cseg_*.json
+research/segments/final/00_segment_index.txt
+research/segments/final/NN_<commercial-segment>.txt
+research/segments/final/_research_watchlist.txt
+research/segments/final/_machine/
+```
+
 ## Running and resuming
 
 ```bash
@@ -68,6 +88,9 @@ best-effort comparison data from a preserved monolithic output/audit log.
 ./adpipe -p PROJECT segment --from 04
 ./adpipe -p PROJECT segment --from 05
 ./adpipe -p PROJECT segment --from 06
+./adpipe -p PROJECT segment --from 07
+./adpipe -p PROJECT segment --from 08
+./adpipe -p PROJECT segment --from 09
 ```
 
 `--rediscover` remains an alias for `--from 03a`; `--reassign` reruns Stage 05.
@@ -105,7 +128,11 @@ Optional `project.json` settings live under `segmentation`:
     "03c_effort": "high",
     "04_effort": "high",
     "05_chunk_tokens": 8000,
-    "05_effort": "high"
+    "05_effort": "high",
+    "07_effort": "high",
+    "08a_chunk_tokens": 8000,
+    "08a_effort": "high",
+    "08b_effort": "high"
   }
 }
 ```

@@ -104,6 +104,31 @@ class AppOutputTests(unittest.TestCase):
             ["request.json", "response.json"])
         self.assertIn("'render','logs'", app.PAGE)
 
+    def test_commercial_and_human_pack_outputs_appear_in_studio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make_project(tmp)
+            commercial = os.path.join(
+                tmp, "projects", "shoulder", "research", "segments", "commercial")
+            final = os.path.join(
+                tmp, "projects", "shoulder", "research", "segments", "final")
+            os.makedirs(commercial)
+            os.makedirs(final)
+            with open(os.path.join(commercial, "07_canonical_segments.json"), "w",
+                      encoding="utf-8") as fh:
+                fh.write('{"canonical_segments": []}')
+            with open(os.path.join(final, "00_segment_index.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("COMMERCIAL SEGMENT INDEX")
+            with mock.patch.object(app, "ROOT", tmp):
+                output = app.project_outputs("shoulder")
+
+        segment = [row for row in output["stages"] if row["stage"] == "segment"]
+        labels = [row["label"] for row in segment]
+        self.assertTrue(any("07-08 commercial" in label for label in labels))
+        self.assertTrue(any("09 research pack" in label for label in labels))
+        final_rows = [row for row in segment if "09 research pack" in row["label"]]
+        self.assertTrue(all(row["role"] == "final" for row in final_rows))
+
     def test_page_has_one_accordion_outputs_renderer(self):
         self.assertEqual(app.PAGE.count("async function loadOutputs()"), 1)
         self.assertIn("<details class=outstage", app.PAGE)
