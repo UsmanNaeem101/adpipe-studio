@@ -100,7 +100,8 @@ class AnthropicEstimateTests(unittest.TestCase):
                 client = client_for(model)
                 client.count("system", "prompt", schema=schema, effort="high")
                 params = client.client.messages.count_calls[-1]
-                self.assertEqual(params["thinking"], {"type": "adaptive"})
+                self.assertEqual(params["thinking"], {
+                    "type": "enabled", "budget_tokens": 4096})
                 self.assertNotIn("effort", params["output_config"])
                 self.assertEqual(params["output_config"]["format"]["schema"],
                                  schema)
@@ -117,6 +118,13 @@ class AnthropicEstimateTests(unittest.TestCase):
         preamble_only = client._system("", "stage preamble")
         self.assertEqual(preamble_only[0]["cache_control"]["ttl"], "1h")
         self.assertIsNone(client._system("", ""))
+
+    def test_haiku_reasoning_ceiling_is_preserved_in_count_shape(self):
+        client = client_for()
+        client.count("system", "prompt", max_tokens=12_000,
+                     reasoning_max_tokens=3_000)
+        self.assertEqual(client.client.messages.count_calls[-1]["thinking"], {
+            "type": "enabled", "budget_tokens": 3_000})
 
     def test_prewarm_uses_same_cached_prefix_and_skips_absent_system(self):
         class WarmMessages(FakeMessages):
@@ -145,6 +153,35 @@ class AnthropicEstimateTests(unittest.TestCase):
         with mock.patch.object(llm.auditlog, "start", return_value=audit):
             client.prewarm("", "")
         self.assertEqual(len(client.client.messages.inference_calls), 1)
+
+    def test_nested_anthropic_reasoning_usage_is_reported(self):
+        usage = SimpleNamespace(output_tokens_details=SimpleNamespace(
+            thinking_tokens=3_734))
+        self.assertEqual(llm._anthropic_thinking_tokens(usage), 3_734)
+
+    def test_batch_error_extracts_nested_provider_contract_failure(self):
+        raw = {
+            "type": "errored",
+            "error": {
+                "type": "error",
+                "request_id": None,
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "adaptive thinking is not supported on this model",
+                    "details": {"error_visibility": "user_facing"},
+                },
+            },
+        }
+        detail = llm._anthropic_batch_error(
+            raw, custom_id="03e_0000", batch_id="msgbatch_test")
+        self.assertEqual(detail["type"], "invalid_request_error")
+        self.assertIn("adaptive thinking", detail["message"])
+        self.assertEqual(detail["custom_id"], "03e_0000")
+        self.assertEqual(detail["batch_id"], "msgbatch_test")
+        self.assertEqual(detail["details"]["error_visibility"], "user_facing")
+        result = llm.BatchResult(
+            "", "batch_errored", provider="Anthropic", provider_error=detail)
+        self.assertFalse(result.retryable)
 
     def test_stage03e_native_estimate_with_real_catalogue_scale_and_aliases(self):
         # The live 208-candidate catalogue is about 169k characters / 42k tokens.

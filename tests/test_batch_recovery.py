@@ -97,6 +97,18 @@ class FailureClassificationTests(unittest.TestCase):
         self.assertTrue(llm.BatchResult("", "request_error:URLError").retryable)
         self.assertTrue(llm.BatchResult("", "batch_errored").retryable)
 
+    def test_invalid_batch_request_is_not_blindly_retried(self):
+        result = llm.BatchResult(
+            "", "batch_errored", provider="Anthropic",
+            provider_error={
+                "type": "invalid_request_error",
+                "message": "adaptive thinking is not supported on this model",
+                "custom_id": "03e_0000",
+                "batch_id": "msgbatch_test",
+            })
+        self.assertFalse(result.retryable)
+        self.assertFalse(result.repairable)
+
     def test_refusal_is_never_retryable(self):
         # Re-asking only spends money to be refused again.
         self.assertFalse(llm.BatchResult("", "refusal").retryable)
@@ -624,6 +636,64 @@ class FailureModeReportingTests(unittest.TestCase):
                 (llm.BatchResult("", "stop"), "returned an empty reply"),
                 (llm.BatchResult('{"nope":1}', "stop"), "returned the wrong shape")):
             self.assertEqual(cli._failure_mode(result), mode)
+
+    def test_batch_provider_error_is_never_collapsed_to_empty_response(self):
+        result = llm.BatchResult(
+            "", "batch_errored", provider="Anthropic",
+            provider_error={
+                "type": "invalid_request_error",
+                "message": "adaptive thinking is not supported on this model",
+                "custom_id": "03e_0000",
+                "batch_id": "msgbatch_test",
+            })
+        self.assertEqual(cli._failure_mode(result),
+                         "provider batch error: invalid_request_error")
+        reason = cli._failure_reason(result, "provider returned no content")
+        self.assertIn("invalid_request_error", reason)
+        self.assertIn("adaptive thinking", reason)
+        self.assertIn("03e_0000", reason)
+        self.assertNotIn("empty response", reason)
+
+    def test_provider_error_is_saved_with_failure_diagnostic(self):
+        result = llm.BatchResult(
+            "", "batch_errored", provider="Anthropic",
+            provider_error={
+                "type": "invalid_request_error",
+                "message": "unsupported field",
+                "custom_id": "03e_0000",
+                "batch_id": "msgbatch_test",
+                "details": {"field": "thinking.type"},
+            })
+        with tempfile.TemporaryDirectory() as directory:
+            cli._save_failure(
+                directory, job("03e_0000"), result,
+                cli._failure_reason(result, "empty"), "original")
+            with open(os.path.join(
+                    directory, "03e_0000.original.txt"), encoding="utf-8") as fh:
+                saved = fh.read()
+        self.assertIn("invalid_request_error", saved)
+        self.assertIn("thinking.type", saved)
+        self.assertNotIn("API_KEY", saved)
+
+    def test_native_anthropic_03e_skips_incompatible_sync_prewarm(self):
+        class FakeClient:
+            batch_cache_self_seeds = True
+
+            def __init__(self):
+                self.prewarm_calls = 0
+
+            def prewarm(self, *_args):
+                self.prewarm_calls += 1
+
+        client = FakeClient()
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            cli._prewarm_segment_stage(client, "catalogue", "preamble", "03E")
+        self.assertEqual(client.prewarm_calls, 0)
+        self.assertIn("first 03E request seeds", buf.getvalue())
+
+        cli._prewarm_segment_stage(client, "catalogue", "preamble", "03A")
+        self.assertEqual(client.prewarm_calls, 1)
 
     def report(self, failures, total=83):
         buf = io.StringIO()

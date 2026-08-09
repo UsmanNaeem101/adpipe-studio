@@ -1153,6 +1153,15 @@ def _failure_reason(result, parse_error):
                 f"(stop reason {stop!r}, {len(result.text)} chars returned)")
     if stop in NO_RETRY_STOP_REASONS:
         return f"provider refused the request (stop reason {stop!r})"
+    if result.provider_error:
+        error = result.provider_error
+        message = error.get("message") or "no provider message"
+        location = ""
+        if error.get("custom_id") or error.get("batch_id"):
+            location = (f", custom_id {error.get('custom_id')!r}, "
+                        f"batch {error.get('batch_id')!r}")
+        return (f"provider batch error {error.get('type', 'unknown')!r}: "
+                f"{message}{location}")
     if not result.text.strip():
         detail = f", stop reason {stop!r}" if stop else ""
         return f"provider returned an empty response{detail}"
@@ -1167,6 +1176,9 @@ def _save_failure(diagnostics_dir, job, result, reason, suffix):
     ambiguity that made this failure hard to read.
     """
     os.makedirs(diagnostics_dir, exist_ok=True)
+    provider_error = (json.dumps(
+        result.provider_error, ensure_ascii=False, sort_keys=True)
+        if result.provider_error else "none")
     with open(os.path.join(diagnostics_dir, f"{job.id}.{suffix}.txt"), "w",
               encoding="utf-8") as fh:
         fh.write(f"WHY SAVED: {reason}\n"
@@ -1175,7 +1187,9 @@ def _save_failure(diagnostics_dir, job, result, reason, suffix):
                  f"REASONING ASKED: {job.reasoning_max_tokens or 'uncapped'}"
                  f" (effort {job.effort or 'client default'})\n"
                  f"BUDGET SPENT: {result.budget_note or 'not reported'}\n"
-                 f"RESPONSE CHARS: {len(result.text)}\n\n{result.text}")
+                 f"RESPONSE CHARS: {len(result.text)}\n"
+                 f"PROVIDER ERROR: {provider_error}\n\n"
+                 f"{result.text}")
 
 
 def _rerun_batch(client_, corpus, preamble, failures, factor):
@@ -1276,6 +1290,9 @@ def _failure_mode(result):
     """
     if result.stop_reason in NO_RETRY_STOP_REASONS:
         return "blocked by the provider"
+    if result.provider_error:
+        return ("provider batch error: " +
+                str(result.provider_error.get("type") or "unknown"))
     if (result.stop_reason or "").startswith("request_error"):
         return "the request never completed"
     if result.out_of_budget:
@@ -2093,6 +2110,15 @@ def _print_03a_contract_error(error, fallback_chunk=None):
         print(f"  violation: {error}")
 
 
+def _prewarm_segment_stage(client_, corpus, preamble, stage):
+    """Warm where useful; let serial Anthropic 03E Batches seed themselves."""
+    if stage == "03E" and getattr(client_, "batch_cache_self_seeds", False):
+        print("  Anthropic Batch cache: first 03E request seeds the shared prefix; "
+              "later requests read it")
+        return
+    client_.prewarm(corpus, preamble)
+
+
 def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
                                 diagnostics_dir, args, stage, force=False,
                                 row_validator=None, row_cleaner=None,
@@ -2171,7 +2197,7 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
         if not confirm(c.estimate(corpus, SEGMENT_PREAMBLE, work_jobs,
                                   batched=True), getattr(args, "yes", False)):
             return None
-        c.prewarm(corpus, SEGMENT_PREAMBLE)
+        _prewarm_segment_stage(c, corpus, SEGMENT_PREAMBLE, stage)
 
         if missing_jobs:
             stage_stats = AdaptiveStageStats(stage=stage, total=len(missing_jobs))

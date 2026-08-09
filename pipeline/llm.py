@@ -11,9 +11,10 @@ The pipeline's shape makes two API features do most of the work:
   one corpus cost roughly one full read plus change instead of 21.
 
   Batching — those 21 extractions are independent, so they go out as one batch at
-  50% off. Batches can't pre-warm their own cache (parallel requests can't read
-  what each other is still writing), so we fire a max_tokens=0 warm-up first and
-  let the batch read the entry it wrote.
+  50% off. Live Stage 03E diagnostics showed that a synchronous cache write was
+  not read by the first Message Batch, even with the same structured request
+  shape. Anthropic's serial one-request Stage 03E waves therefore let the first
+  real Batch seed the shared prefix and subsequent Batches read it.
 
 Everything is costed with count_tokens before it runs; nothing spends money
 without the caller seeing the estimate.
@@ -44,6 +45,7 @@ CACHE_READ = 0.10       # cache read discount
 BATCH = 0.50            # Batch API discount
 
 CACHE_MIN_TOKENS = 512  # Opus 5 minimum cacheable prefix; below this it silently won't cache
+HAIKU_THINKING_BUDGET = 4096
 
 
 @dataclass
@@ -101,6 +103,12 @@ class BatchResult:
     # Actual route used for aggregators such as OpenRouter.  This is telemetry,
     # never a routing instruction; provider selection remains unchanged.
     provider: str | None = None
+    # Structured provider failures belong beside the empty response. In
+    # particular, an Anthropic Message Batch `errored` result contains the real
+    # invalid_request_error one level below the outer result type. Keeping it
+    # here prevents downstream recovery from reducing that contract failure to
+    # the misleading phrase "provider returned an empty response".
+    provider_error: dict | None = None
 
     @property
     def budget_note(self) -> str:
@@ -125,6 +133,8 @@ class BatchResult:
         regenerate, and a refusal is not a shortfall at all.
         """
         if self.stop_reason in NO_RETRY_STOP_REASONS:
+            return False
+        if ((self.provider_error or {}).get("type") == "invalid_request_error"):
             return False
         return self.out_of_budget or not (self.text or "").strip()
 
@@ -178,6 +188,12 @@ class Estimate:
 
 class Client:
     """Thin wrapper: caching, batching, cost, and a single place for model config."""
+
+    # Used by Stage 03E only. Its native Anthropic rolling waves contain one
+    # request each, so the first real Message Batch can seed the cache before
+    # the next starts. A synchronous prewarm did not populate that Batch cache
+    # in the live proof and would only add a discarded paid generation.
+    batch_cache_self_seeds = True
 
     def __init__(self, model=MODEL, effort="high", verbose=True):
         try:
@@ -255,7 +271,8 @@ class Client:
         blocks[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
         return blocks
 
-    def _params(self, system, prompt, max_tokens, schema=None, effort=None):
+    def _params(self, system, prompt, max_tokens, schema=None, effort=None,
+                reasoning_max_tokens=None):
         p = {
             "model": self.model,
             "max_tokens": max_tokens,
@@ -264,16 +281,31 @@ class Client:
             # survives a model swap. No temperature/top_p — rejected on Opus 5.
             "thinking": {"type": "adaptive"},
         }
-        # Haiku 4.5 accepts adaptive thinking but rejects output_config.effort.
-        # Keep the reasoning mode, and omit only the unsupported control in both
-        # counting and inference because both paths are built here.
-        supports_effort = not self.model.startswith("claude-haiku-4-5")
+        # Haiku 4.5 rejects adaptive thinking at inference time (including in
+        # Message Batches), even though count_tokens accepts the same body. Keep
+        # reasoning enabled, but express it with Haiku's supported explicit
+        # budget. `reasoning_max_tokens` remains the stage-specific override.
+        is_haiku_45 = self.model.startswith("claude-haiku-4-5")
+        supports_effort = not is_haiku_45
+        thinking_disabled = (effort or "").lower() == "none"
+        if is_haiku_45 and not thinking_disabled:
+            requested = reasoning_max_tokens or HAIKU_THINKING_BUDGET
+            # Anthropic requires at least 1,024 thinking tokens and room for an
+            # answer inside max_tokens. Stage 03E uses 12k, so its default is
+            # the proven 4,096-token configuration rather than the invalid
+            # adaptive form seen in the live request.
+            budget = min(max(int(requested), 1024), max(max_tokens - 1, 1024))
+            if budget >= max_tokens:
+                raise ValueError(
+                    f"Anthropic Haiku thinking budget {budget} must be below "
+                    f"max_tokens {max_tokens}")
+            p["thinking"] = {"type": "enabled", "budget_tokens": budget}
         output_config = ({"effort": (effort or self.effort)}
                          if supports_effort else {})
         system = self._normalise_system(system)
         if system is not None:
             p["system"] = system
-        if (effort or "").lower() == "none":
+        if thinking_disabled:
             # Opus 5 accepts disabled thinking only at effort `high` or below,
             # so pin the level too rather than emit a combination the API 400s.
             # Note this is the documented-riskier setting on Opus 5 (it can leak
@@ -305,7 +337,8 @@ class Client:
 
     # ---------------------------------------------------------------- costing
 
-    def count(self, system, prompt, schema=None, effort=None) -> int:
+    def count(self, system, prompt, schema=None, effort=None, max_tokens=16000,
+              reasoning_max_tokens=None) -> int:
         """Use Anthropic's native counter with the real inference input shape.
 
         ``count_tokens`` accepts the same system/messages/thinking/output-config
@@ -313,7 +346,8 @@ class Client:
         through ``_params`` so estimation cannot drift from inference, remove
         only that output-only field, and omit ``system`` entirely when absent.
         """
-        params = self._params(system, prompt, 1, schema, effort)
+        params = self._params(system, prompt, max_tokens, schema, effort,
+                              reasoning_max_tokens)
         params.pop("max_tokens")
         return self.client.messages.count_tokens(**params).input_tokens
 
@@ -333,7 +367,9 @@ class Client:
             # Count the exact system + prompt + schema + effort structure the
             # inference request will use, then allocate the stable prefix to the
             # cached side of the estimate.
-            full_tokens = self.count(system, j.prompt, j.schema, j.effort)
+            full_tokens = self.count(
+                system, j.prompt, j.schema, j.effort, j.max_tokens,
+                j.reasoning_max_tokens)
             est.uncached_in += max(full_tokens - corpus_tokens, 0)
             # Assume jobs run to ~55% of their cap; extraction output is verbose.
             est.est_out += int(j.max_tokens * 0.55)
@@ -373,12 +409,11 @@ class Client:
                    reasoning_max_tokens=None) -> BatchResult:
         """Single request retaining stop reason and usage for recovery.
 
-        Anthropic adaptive thinking currently has no separate reasoning-token
-        ceiling in this client. Accept the shared interface field so a Job can
-        travel intact, but do not pretend it is enforceable on this backend.
+        Haiku's explicit thinking mode can enforce `reasoning_max_tokens`;
+        adaptive-capable Anthropic models retain their existing behaviour.
         """
         params = self._params(self._system(corpus, preamble), prompt, max_tokens,
-                              schema, effort)
+                              schema, effort, reasoning_max_tokens)
         audit = auditlog.start("anthropic", self.model, operation, params,
                                job_id=job_id)
         try:
@@ -394,7 +429,7 @@ class Client:
 
         return BatchResult(
             text, msg.stop_reason,
-            getattr(msg.usage, "thinking_tokens", 0) or 0,
+            _anthropic_thinking_tokens(msg.usage),
             getattr(msg.usage, "output_tokens", 0) or 0,
             "Anthropic")
 
@@ -419,7 +454,8 @@ class Client:
 
         system = self._system(corpus, preamble)
         params_by_id = {j.id: self._params(
-            system, j.prompt, j.max_tokens, j.schema, j.effort) for j in jobs}
+            system, j.prompt, j.max_tokens, j.schema, j.effort,
+            j.reasoning_max_tokens) for j in jobs}
         audits = {j.id: auditlog.start(
             "anthropic", self.model, "pipeline_batch_job", params_by_id[j.id],
             job_id=j.id) for j in jobs}
@@ -473,16 +509,39 @@ class Client:
                         text, m.stop_reason,
                         # Anthropic bills thinking inside output_tokens too, and
                         # reports it separately only when it is asked for.
-                        getattr(m.usage, "thinking_tokens", 0) or 0,
+                        _anthropic_thinking_tokens(m.usage),
                         getattr(m.usage, "output_tokens", 0) or 0,
                         "Anthropic")
                 else:
-                    detail = getattr(
-                        getattr(res.result, "error", None), "type", res.result.type)
-                    audits[res.custom_id].event(
-                        "batch_failure", res.result, batch_id=batch.id)
-                    failed.append(f"{res.custom_id}: {detail}")
-                    out[res.custom_id] = BatchResult("", f"batch_{res.result.type}")
+                    raw = _provider_plain(res.result)
+                    detail = _anthropic_batch_error(
+                        raw, custom_id=res.custom_id, batch_id=batch.id)
+                    audits[res.custom_id].response(
+                        res.result, text="", stop_reason=f"batch_{res.result.type}",
+                        batch_id=batch.id, custom_id=res.custom_id,
+                        provider_error=detail)
+                    message = detail.get("message") or "no provider message"
+                    failed.append(
+                        f"{res.custom_id}: {detail['type']}: {message} "
+                        f"(batch {batch.id})")
+                    if self.verbose:
+                        print("\n  ANTHROPIC BATCH ERROR")
+                        print(f"  custom_id: {res.custom_id}")
+                        print(f"  batch_id: {batch.id}")
+                        print(f"  type: {detail['type']}")
+                        print(f"  message: {message}")
+                        if detail.get("code") is not None:
+                            print(f"  code: {detail['code']}")
+                        if detail.get("request_id"):
+                            print(f"  request_id: {detail['request_id']}")
+                        if detail.get("details"):
+                            print("  details: " + json.dumps(
+                                detail["details"], ensure_ascii=False,
+                                sort_keys=True))
+                        print(f"  diagnostics: {audits[res.custom_id].relative_path}")
+                    out[res.custom_id] = BatchResult(
+                        text="", stop_reason=f"batch_{res.result.type}",
+                        provider="Anthropic", provider_error=detail)
         except Exception as e:
             for audit in audits.values():
                 audit.error(e, phase="batch_results", batch_id=batch.id)
@@ -491,6 +550,58 @@ class Client:
         for f in failed:
             print(f"  ! {f}")
         return out
+
+
+def _provider_plain(value):
+    """Convert SDK result objects to JSON-shaped data for diagnostics."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _provider_plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_provider_plain(item) for item in value]
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        return _provider_plain(dump())
+    if hasattr(value, "__dict__"):
+        return _provider_plain(vars(value))
+    return repr(value)
+
+
+def _anthropic_batch_error(raw_result, *, custom_id, batch_id):
+    """Flatten Anthropic's nested Message Batch error without losing detail."""
+    raw = _provider_plain(raw_result) or {}
+    outer = raw.get("error") if isinstance(raw, dict) else {}
+    outer = outer if isinstance(outer, dict) else {}
+    inner = outer.get("error")
+    inner = inner if isinstance(inner, dict) else {}
+    details = inner.get("details", outer.get("details"))
+    code = (inner.get("code", inner.get("status_code"))
+            if inner else outer.get("code", outer.get("status_code")))
+    return {
+        "type": (inner.get("type") or outer.get("type")
+                 or (raw.get("type") if isinstance(raw, dict) else None)
+                 or "unknown_batch_error"),
+        "message": inner.get("message") or outer.get("message") or "",
+        "code": code,
+        "request_id": outer.get("request_id") or inner.get("request_id"),
+        "details": details,
+        "custom_id": custom_id,
+        "batch_id": batch_id,
+    }
+
+
+def _anthropic_thinking_tokens(usage):
+    """Read both legacy direct and current nested Anthropic usage telemetry."""
+    direct = getattr(usage, "thinking_tokens", None)
+    if direct is not None:
+        return direct or 0
+    details = getattr(usage, "output_tokens_details", None)
+    if details is None and isinstance(usage, dict):
+        details = usage.get("output_tokens_details")
+    if isinstance(details, dict):
+        return details.get("thinking_tokens", 0) or 0
+    return getattr(details, "thinking_tokens", 0) or 0
 
 
 def confirm(estimate: Estimate, assume_yes=False) -> bool:
