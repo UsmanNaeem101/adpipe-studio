@@ -3740,17 +3740,112 @@ def _completed_segmentation_inputs(cfg, voc):
     return validated, decisions, assignments, graph
 
 
-def _stage08_chunk_prompt(canonical, records):
-    card = {key: canonical[key] for key in (
+def _stage08_card(canonical):
+    return {key: canonical[key] for key in (
         "canonical_segment_id", "slug", "name", "definition",
         "commercial_distinction", "subsegments", "attributes")}
+
+
+def _stage08_chunk_prompt(canonical, records):
     return (
         "Extract VOC signals from this bounded portion of the complete evidence "
         "union for the canonical audience below. Do not reconsider the audience."
         "\n\nCANONICAL AUDIENCE:\n" +
-        json.dumps(card, ensure_ascii=False, indent=2) +
+        json.dumps(_stage08_card(canonical), ensure_ascii=False, indent=2) +
         "\n\nEVIDENCE CHUNK:\n" +
         segmentation.evidence_text(records, include_tier=True))
+
+
+# Which extraction skill owns each commercial signal dimension. This mapping is
+# the whole point of sourcing synthesis from extractions: a pain point in the
+# operator's pack becomes the same object skill 07 defined over 980 lines of
+# classification boundaries, rather than a second, thinner notion of a pain point
+# re-derived from raw text by a stage that had never read those rules.
+SIGNAL_DIMENSION_SKILLS = {
+    "pain_points": (7,),
+    "desired_outcomes": (9,),
+    "failed_solutions": (14,),
+    "triggers": (8,),
+    "beliefs": (12,),
+    "emotional_states": (10,),
+    "objections": (18,),
+    "buying_triggers": (16,),
+    "representative_language": (24, 25),
+}
+
+
+def _extraction_documents(cfg, slugs):
+    """Every existing extraction that feeds a commercial signal dimension."""
+    wanted = {}
+    for dimension, numbers in SIGNAL_DIMENSION_SKILLS.items():
+        for number in numbers:
+            wanted.setdefault(number, []).append(dimension)
+    documents = []
+    for slug in slugs:
+        directory = paths.extractions(cfg["_dir"], slug)
+        if not os.path.isdir(directory):
+            continue
+        for name in sorted(os.listdir(directory)):
+            if not name.endswith(".md"):
+                continue
+            try:
+                number = int(name[:2])
+            except ValueError:
+                continue
+            if number not in wanted:
+                continue
+            path = os.path.join(directory, name)
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    text = handle.read().strip()
+            except OSError:
+                continue
+            if text:
+                documents.append({
+                    "segment_slug": slug, "skill": number,
+                    "dimensions": wanted[number], "name": name, "text": text,
+                })
+    return documents
+
+
+def _stage08_extraction_chunks(canonical, documents, target_tokens):
+    """Chunk extraction documents, keeping each document whole where possible."""
+    chunks, current, size = [], [], 0
+    for document in documents:
+        cost = max(len(document["text"]) // 4, 1)
+        if current and size + cost > target_tokens:
+            chunks.append(current)
+            current, size = [], 0
+        current.append(document)
+        size += cost
+    if current:
+        chunks.append(current)
+    canonical_id = canonical["canonical_segment_id"]
+    return [{
+        "chunk_id": f"08a_{canonical_id}_x{index:04d}",
+        "evidence_ids": list(canonical["primary_evidence_ids"]),
+        "estimated_tokens": max(
+            sum(len(document["text"]) for document in group) // 4, 1),
+        "documents": group,
+    } for index, group in enumerate(chunks)]
+
+
+def _stage08_extraction_prompt(canonical, documents):
+    body = "\n\n".join(
+        f"--- {document['segment_slug']} · {document['name']} "
+        f"(dimensions: {', '.join(document['dimensions'])}) ---\n"
+        f"{document['text']}" for document in documents)
+    return (
+        "Convert the completed extraction documents below into structured VOC "
+        "signals for this canonical audience. These are finished analyses of "
+        "this audience's own evidence, produced by the extraction skills — do "
+        "not re-analyse the raw text, re-open the audience, or introduce "
+        "findings the documents do not contain. Carry each document's findings "
+        "across, preserving its labels and wording where they are already "
+        "good, and cite the evidence IDs it cites."
+        "\n\nCANONICAL AUDIENCE:\n" +
+        json.dumps(_stage08_card(canonical), ensure_ascii=False, indent=2) +
+        "\n\nEXTRACTION DOCUMENTS:\n" + body)
 
 
 def _run_commercial_layers(c, cfg, args, items, by_id, validated, decisions,
@@ -3844,6 +3939,13 @@ def _run_commercial_layers(c, cfg, args, items, by_id, validated, decisions,
     synthesis_by_id = {}
     pending = []
     fingerprints08 = {}
+    slug_by_segment_id = {row["segment_id"]: row["slug"] for row in validated}
+    source_slugs = {
+        row["canonical_segment_id"]: [
+            slug_by_segment_id[segment_id]
+            for segment_id in row["source_segment_ids"]
+            if segment_id in slug_by_segment_id]
+        for row in canonical_rows}
     for canonical in canonical_rows:
         canonical_id = canonical["canonical_segment_id"]
         evidence_input = [{
@@ -3854,6 +3956,12 @@ def _run_commercial_layers(c, cfg, args, items, by_id, validated, decisions,
         fingerprint = _value_fingerprint({
             "canonical_mapping": canonical,
             "assigned_evidence": evidence_input,
+            # Included so that running `extract` and re-running the commercial
+            # layer actually re-synthesises. Without it, a pack built before the
+            # extractions existed would be served from cache forever, and the
+            # switch to extraction-sourced synthesis would silently never happen.
+            "extraction_documents": _extraction_documents(
+                cfg, source_slugs[canonical_id]),
             "skills": {"08a": s08a, "08b": s08b},
             "contract": commercial.COMMERCIAL_CONTRACT_VERSION,
         })
@@ -3886,16 +3994,31 @@ def _run_commercial_layers(c, cfg, args, items, by_id, validated, decisions,
     target08 = int(_segment_setting(cfg, "08a_chunk_tokens", 8000))
     for canonical in pending:
         canonical_id = canonical["canonical_segment_id"]
-        records = [by_id[evidence_id]
-                   for evidence_id in canonical["primary_evidence_ids"]]
-        chunks = segmentation.chunk_by_tokens(
-            records, target08, f"08a_{canonical_id}")
-        segmentation.assert_exact_chunk_coverage(
-            chunks, canonical["primary_evidence_ids"])
+        # Prefer the completed extraction documents. Where they exist, the
+        # operator pack's pain points are skill 07's pain points rather than a
+        # second definition derived here; where they do not, this falls back to
+        # the raw evidence so the pipeline still runs end to end in one pass.
+        documents = _extraction_documents(cfg, source_slugs[canonical_id])
+        if documents:
+            chunks = _stage08_extraction_chunks(canonical, documents, target08)
+            print(f"  08A {canonical['slug']}: sourcing from "
+                  f"{len(documents)} extraction document(s)")
+        else:
+            records = [by_id[evidence_id]
+                       for evidence_id in canonical["primary_evidence_ids"]]
+            chunks = segmentation.chunk_by_tokens(
+                records, target08, f"08a_{canonical_id}")
+            segmentation.assert_exact_chunk_coverage(
+                chunks, canonical["primary_evidence_ids"])
+            print(f"  ! 08A {canonical['slug']}: no extractions found, "
+                  "re-deriving signals from raw evidence. Run `extract` on its "
+                  "research segments first for pack-sourced synthesis.")
         for chunk in chunks:
+            prompt = (_stage08_extraction_prompt(canonical, chunk["documents"])
+                      if "documents" in chunk
+                      else _stage08_chunk_prompt(canonical, chunk["records"]))
             job = Job(
-                id=chunk["chunk_id"],
-                prompt=_stage08_chunk_prompt(canonical, chunk["records"]),
+                id=chunk["chunk_id"], prompt=prompt,
                 max_tokens=STAGE08A_TOKEN_TIERS[0],
                 schema=commercial.stage08a_schema(chunk["evidence_ids"]),
                 effort=_segment_setting(cfg, "08a_effort", None))
@@ -5005,31 +5128,68 @@ def evidence_path(cfg, segment):
     return p
 
 
-def research_pack_path(cfg, segment):
+def research_pack_path(cfg, segment, required=True):
     directory = paths.research(cfg["_dir"], "segments", "packs")
     path = os.path.join(directory, f"{segment}.txt")
-    if not os.path.exists(path):
-        available = ([name[:-4] for name in sorted(os.listdir(directory))
-                      if name.endswith(".txt")] if os.path.isdir(directory) else [])
-        sys.exit(f"No research pack for {segment!r}. Run `segment` to build "
-                 f"Layer 2, or drop --pack to read the evidence file.\n"
-                 f"  Available packs: {', '.join(available) or 'none'}")
-    return path
+    if os.path.exists(path):
+        return path
+    if not required:
+        return None
+    available = ([name[:-4] for name in sorted(os.listdir(directory))
+                  if name.endswith(".txt")] if os.path.isdir(directory) else [])
+    sys.exit(f"No research pack for {segment!r}. Run `segment` to build "
+             f"Layer 2, or pass --evidence to read Layer 1 instead.\n"
+             f"  Available packs: {', '.join(available) or 'none'}")
+
+
+def extraction_source(cfg, segment, args):
+    """Which layer skills 07-26 read, and why.
+
+    Layer 2 is the default because it is what the extractors were starved for:
+    a narrow segment's own evidence is often too thin to characterise, while the
+    context that would characterise it sits one edge away. Layer 1 stays one
+    flag away, and a project that predates packs falls back to it silently
+    rather than failing.
+    """
+    if getattr(args, "evidence", False):
+        return evidence_path(cfg, segment), "evidence"
+    pack = research_pack_path(cfg, segment, required=False)
+    if pack:
+        return pack, "pack"
+    return evidence_path(cfg, segment), "evidence"
+
+
+# Appended to every extraction prompt reading Layer 2. The extractors were
+# written against a file where every item belonged to the segment; a pack breaks
+# that assumption, so the assumption has to be replaced explicitly rather than
+# left for each of twenty skills to rediscover.
+PACK_READING_RULE = (
+    "\n\nTHIS IS A LAYER-2 RESEARCH PACK. It contains this segment's PRIMARY "
+    "EVIDENCE followed by a BORROWED CONTEXT section drawn from related "
+    "segments, each borrowed item labelled with its origin.\n"
+    "- Every count you report is a count of PRIMARY evidence only.\n"
+    "- Borrowed context tells you how these people talk, and may inform "
+    "labels, wording and interpretation.\n"
+    "- Where a finding rests on borrowed context, say so and give its primary "
+    "count separately — never add the two together.\n"
+    "- A finding that appears ONLY in borrowed context is not this segment's "
+    "finding. Report it as context, clearly marked, or leave it out."
+)
 
 
 def cmd_extract(cfg, args):
-    """Skills 07-26 against one evidence file. The corpus is identical across all
+    """Skills 07-26 against one segment file. The corpus is identical across all
     20, so it goes in a cached system block and only the skill varies — then the
     whole set fans out as one batch at 50%."""
     from llm import Job, confirm
     warn_if_imported(cfg, args.segment)
     c = client(cfg, args)
-    source = (research_pack_path(cfg, args.segment)
-              if getattr(args, "pack", False) else evidence_path(cfg, args.segment))
+    source, layer = extraction_source(cfg, args.segment, args)
     with open(source, encoding="utf-8") as fh:
         corpus = fh.read()
-    if getattr(args, "pack", False):
-        print(f"  reading the Layer-2 research pack: {source}")
+    label = ("Layer 2 (research pack)" if layer == "pack"
+             else "Layer 1 (evidence file)")
+    print(f"  reading {label}: {source}")
     out = paths.extractions(cfg["_dir"], args.segment); os.makedirs(out, exist_ok=True)
 
     picked = chosen_extractors(args)
@@ -5052,8 +5212,9 @@ def cmd_extract(cfg, args):
             continue
         names[name] = dest
         jobs.append(Job(id=name, prompt=(
-            f"{body}\n\n---\n\nApply this skill to the evidence file. Output only the "
+            f"{body}\n\n---\n\nApply this skill to the segment file. Output only the "
             f"skill's specified artefact in Markdown — no preamble, no meta-commentary."
+            + (PACK_READING_RULE if layer == "pack" else "")
         ), max_tokens=16000))
 
     if not jobs:
@@ -5632,10 +5793,9 @@ def main():
             s.add_argument("--preset", choices=sorted(PRESETS),
                            help="extraction depth: fast, standard, or deep (default: deep)")
             s.add_argument("--skills", help="explicit list, e.g. 7,8,14,18,24,25")
-            s.add_argument("--pack", action="store_true",
-                           help="read the Layer-2 research pack (primary evidence "
-                                "plus weighted borrowed context) instead of the "
-                                "evidence file")
+            s.add_argument("--evidence", action="store_true",
+                           help="read Layer 1 (the segment evidence file) instead "
+                                "of the default Layer-2 research pack")
         if name in ("picc", "concepts", "brief", "run"):
             s.add_argument("--product", help="which product in this project to "
                                              "build on (default: the only one)")

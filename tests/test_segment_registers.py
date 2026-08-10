@@ -361,6 +361,7 @@ class RegisterPipelineIntegrationTests(unittest.TestCase):
     class FakeClient:
         def __init__(self):
             self.calls = []
+            self.prompts = []
 
         def estimate(self, *args, **kwargs):
             return mock.Mock()
@@ -370,6 +371,7 @@ class RegisterPipelineIntegrationTests(unittest.TestCase):
 
         def batch(self, corpus, preamble, jobs):
             self.calls.extend(job.id for job in jobs)
+            self.prompts.extend(job.prompt for job in jobs)
             replies = {}
             for job in jobs:
                 if job.id.startswith("03a_"):
@@ -425,6 +427,7 @@ class RegisterPipelineIntegrationTests(unittest.TestCase):
         def one_result(self, corpus, preamble, prompt, max_tokens, schema, **kwargs):
             job_id = kwargs.get("job_id")
             self.calls.append(job_id)
+            self.prompts.append(prompt)
             if job_id in ("03b_consolidate", "03b_novelty_consolidate"):
                 payload = {"candidates": [
                     {"slug": "desk_workers", "name": "Desk workers",
@@ -610,12 +613,43 @@ class RegisterPipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(manifest["packs"][0]["borrowed_item_count"], 0)
             self.assertEqual(manifest["context_budget_tokens"], 8000)
 
-    def test_a_missing_pack_names_the_fix_rather_than_falling_back(self):
+    def test_a_missing_pack_names_the_fix_rather_than_failing_silently(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = {"_dir": tmp, "name": "test", "segmentation": {}}
             with self.assertRaises(SystemExit) as caught:
                 cli.research_pack_path(cfg, "desk_workers")
-            self.assertIn("--pack", str(caught.exception))
+            self.assertIn("--evidence", str(caught.exception))
+            self.assertIsNone(
+                cli.research_pack_path(cfg, "desk_workers", required=False))
+
+    def test_synthesis_switches_to_the_extractions_once_they_exist(self):
+        """One definition of a pain point: skill 07's, carried across."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_pipeline(tmp)
+            extractions = os.path.join(
+                tmp, "research", "extractions", "desk_workers")
+            os.makedirs(extractions, exist_ok=True)
+            with open(os.path.join(extractions, "07_pain_points.md"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("# Desk Workers Pain Points\n\n"
+                         "### 1. Pain after a full day at the desk\n"
+                         "- Evidence: 1, 2\n")
+
+            cfg = {"_dir": tmp, "name": "test", "segmentation": {
+                "min_segment_evidence": 4}}
+            args = self.args()
+            args.from_stage = "08"
+            client = self.FakeClient()
+            with mock.patch.object(cli, "client", return_value=client), \
+                    mock.patch.object(llm, "confirm", return_value=True), \
+                    mock.patch.object(cli, "record_provenance"):
+                cli.cmd_segment(cfg, args)
+
+            prompts = [text for text in client.prompts
+                       if text.startswith("Convert the completed extraction")]
+            self.assertTrue(prompts, "Stage 08A did not source from extractions")
+            self.assertIn("Pain after a full day at the desk", prompts[0])
+            self.assertIn("07_pain_points.md", prompts[0])
 
     def test_the_graph_is_persisted_and_reused_without_a_model_call(self):
         with tempfile.TemporaryDirectory() as tmp:

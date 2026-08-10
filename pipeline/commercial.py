@@ -19,14 +19,23 @@ COMMERCIAL_CONTRACT_VERSION = "commercial-synthesis-v1"
 MAPPING_DISPOSITIONS = (
     "parent",
     "subsegment",
-    "attribute",
-    "journey_state",
     "research_watchlist",
     "excluded_from_commercial_taxonomy",
 )
-ATTACHED_DISPOSITIONS = frozenset({
-    "parent", "subsegment", "attribute", "journey_state",
-})
+# `attribute` and `journey_state` used to be dispositions here, and attaching
+# one handed its evidence to whichever canonical parent absorbed it: `medication
+# takers` at 120 comments silently inflated that audience's headline. The code
+# had no better option -- Stage 05 had already given the cluster evidence, and
+# folding it into a parent was the only lossless move left.
+#
+# Registers removed the cause upstream. Attributes and journey states are facets
+# now: they tag comments inside a segment and never become research segments, so
+# there is nothing left for this stage to demote. Rather than reject the
+# disposition at runtime, it is simply no longer expressible.
+ATTACHED_DISPOSITIONS = frozenset({"parent", "subsegment"})
+# Of those, the ones a canonical audience may claim as its *own* evidence. A
+# subsegment's evidence belongs to the branch, not to the node.
+OWN_DISPOSITIONS = frozenset({"parent"})
 SIGNAL_DIMENSIONS = (
     "pain_points",
     "desired_outcomes",
@@ -324,6 +333,7 @@ def finalize_stage07(payload, validated, assignments, evidence_by_id):
         canonical_by_key[key] = row
 
     attached_by_key = defaultdict(list)
+    own_by_key = defaultdict(list)
     parent_by_key = Counter()
     for mapping in mappings:
         disposition = mapping.get("disposition")
@@ -332,6 +342,8 @@ def finalize_stage07(payload, validated, assignments, evidence_by_id):
             raise CommercialContractError(
                 f"research segment {mapping.get('segment_id')!r} has invalid "
                 f"disposition {disposition!r}")
+        if disposition in OWN_DISPOSITIONS and key in canonical_by_key:
+            own_by_key[key].append(mapping["segment_id"])
         if disposition in ATTACHED_DISPOSITIONS:
             if key not in canonical_by_key:
                 raise CommercialContractError(
@@ -378,6 +390,13 @@ def finalize_stage07(payload, validated, assignments, evidence_by_id):
                 f"canonical {key!r} has no assigned evidence; preserve its research "
                 "clusters as watchlist/excluded metadata instead")
         all_canonical_evidence.update(evidence_ids)
+        # Two integers, never summed. `own` is what this audience can claim on
+        # its own account; `rollup` is what its branch covers once subsegments
+        # are included. Reporting only the rollup is how a parent ends up
+        # claiming its children's people; reporting only its own hides that the
+        # branch is bigger than the node.
+        own_ids = sorted({evidence_id for source_id in sorted(own_by_key[key])
+                          for evidence_id in research_evidence.get(source_id, [])})
         tiers = Counter(evidence_by_id[evidence_id].get("tier", "context")
                         for evidence_id in evidence_ids)
         final_canonical.append({
@@ -391,6 +410,12 @@ def finalize_stage07(payload, validated, assignments, evidence_by_id):
             "attributes": row["attributes"],
             "inclusion_criteria": row["inclusion_criteria"],
             "exclusion_criteria": row["exclusion_criteria"],
+            "own_evidence_ids": own_ids,
+            "own_evidence_count": len(own_ids),
+            "rollup_evidence_count": len(evidence_ids),
+            # Retained under its original name because Stage 08 synthesises over
+            # the whole branch: a theme may legitimately cite a subsegment's
+            # comment. It is the rollup, and the renderer now says so.
             "primary_evidence_ids": evidence_ids,
             "primary_evidence_count": len(evidence_ids),
             "tier_counts": {tier: tiers[tier]
@@ -652,9 +677,20 @@ def _solution_line(theme):
 
 def render_segment(canonical, synthesis, evidence_by_id):
     """Render one clean operator-facing segment file from audited artifacts."""
+    own = canonical.get("own_evidence_count", canonical["primary_evidence_count"])
+    rollup = canonical.get("rollup_evidence_count",
+                           canonical["primary_evidence_count"])
     lines = [canonical["name"].upper(), "=" * 72, "",
              f"Canonical segment ID: {canonical['canonical_segment_id']}",
-             f"Primary evidence items: {canonical['primary_evidence_count']:,}", ""]
+             f"Primary evidence items (this audience only): {own:,}"]
+    if rollup != own:
+        lines.append(f"Rollup with subsegments:                    {rollup:,}")
+        lines.append("")
+        lines.append("The two are separate on purpose. This audience's own "
+                     "evidence is what it")
+        lines.append("can claim; the rollup is what its branch covers. Do not "
+                     "add them together.")
+    lines.append("")
     lines.extend(["SEGMENT DEFINITION", "-" * 72, canonical["definition"], ""])
     lines.extend(["COMMERCIAL DISTINCTION", "-" * 72,
                   canonical["commercial_distinction"], ""])
@@ -708,9 +744,14 @@ def render_index(project_name, refined_count, assigned_count, unassigned_count,
              "VALIDATED COMMERCIAL SEGMENTS", "-" * 72]
     for index, canonical in enumerate(canonical_rows, 1):
         synthesis = synthesis_by_id[canonical["canonical_segment_id"]]
-        lines.extend([f"{index}. {canonical['name']}",
-                      f"   Primary evidence items: "
-                      f"{canonical['primary_evidence_count']:,}",
+        own = canonical.get("own_evidence_count",
+                            canonical["primary_evidence_count"])
+        rollup = canonical.get("rollup_evidence_count",
+                               canonical["primary_evidence_count"])
+        count_line = f"   Primary evidence items: {own:,}"
+        if rollup != own:
+            count_line += f" (rollup with subsegments: {rollup:,})"
+        lines.extend([f"{index}. {canonical['name']}", count_line,
                       "   Top pain points:"])
         pains = synthesis.get("pain_points", [])[:5]
         if pains:

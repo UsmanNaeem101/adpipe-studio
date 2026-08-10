@@ -189,6 +189,39 @@ class CommercialSegmentationTests(unittest.TestCase):
         self.assertEqual(watchlist[0]["segment_id"], "seg_010")
         self.assertEqual(watchlist[0]["evidence_ids"], [4])
 
+    def test_own_and_rollup_counts_are_separate(self):
+        catalogue, _mapping = self.finalize()
+        canonical = catalogue["canonical_segments"][0]
+        # seg_001 is the parent; seg_002 is a subsegment of it.
+        self.assertEqual(canonical["own_evidence_ids"], [1, 2])
+        self.assertEqual(canonical["own_evidence_count"], 2)
+        self.assertEqual(canonical["rollup_evidence_count"], 3)
+
+    def test_a_facet_can_no_longer_be_attached_to_an_audience_at_all(self):
+        """The original defect, closed by making it unrepresentable."""
+        self.assertNotIn("attribute", commercial.MAPPING_DISPOSITIONS)
+        self.assertNotIn("journey_state", commercial.MAPPING_DISPOSITIONS)
+        schema = commercial.stage07_schema(["seg_001"])
+        allowed = schema["properties"]["research_segment_mappings"]["items"][
+            "properties"]["disposition"]["enum"]
+        self.assertEqual(sorted(allowed), [
+            "excluded_from_commercial_taxonomy", "parent", "research_watchlist",
+            "subsegment"])
+
+        payload = copy.deepcopy(self.payload)
+        payload["research_segment_mappings"][2]["disposition"] = "attribute"
+        with self.assertRaises(commercial.CommercialContractError):
+            self.finalize(payload)
+
+    def test_a_treatment_attitude_is_preserved_without_being_counted(self):
+        catalogue, mapping = self.finalize()
+        canonical = catalogue["canonical_segments"][0]
+        self.assertNotIn(4, canonical["primary_evidence_ids"])
+        watchlisted = [row for row in mapping["mappings"]
+                       if row["segment_id"] == "seg_010"][0]
+        self.assertEqual(watchlisted["evidence_ids"], [4])
+        self.assertIsNone(watchlisted["canonical_segment_id"])
+
     def test_pain_counts_are_unique_ids_and_signals_may_overlap(self):
         _catalogue, canonical, synthesis = self.synthesis()
         pain = synthesis["pain_points"][0]
@@ -226,7 +259,14 @@ class CommercialSegmentationTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(rendered_first, rendered_second)
         self.assertIn("Canonical commercial segments: 1", first)
-        self.assertIn("Primary evidence items: 3", first)
+        # The parent owns two comments; the third is its subsegment's. Both
+        # numbers are shown and neither is the sum of the other.
+        self.assertIn("Primary evidence items: 2 (rollup with subsegments: 3)",
+                      first)
+        self.assertIn("Primary evidence items (this audience only): 2",
+                      rendered_first)
+        self.assertIn("Rollup with subsegments:                    3",
+                      rendered_first)
         self.assertIn("TOP PAIN POINTS", rendered_first)
         for forbidden in ("reasoning_tokens", "provider", "fingerprint",
                           "winning_margin", "schema"):

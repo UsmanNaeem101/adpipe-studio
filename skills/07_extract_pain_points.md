@@ -87,20 +87,34 @@ Examples:
 
 ### Required input
 
-Exactly one file produced by:
+Exactly one segment file, in one of two layers:
 
 ```text
-06_build_segment_evidence_files
-```
-
-Filename:
-
-```text
-evidence/{segment_slug}.txt
+research/segments/packs/{segment_slug}.txt   Layer 2 — the default
+evidence/{segment_slug}.txt                  Layer 1 — with --evidence
 ```
 
 The harness reads this file and injects its contents into the prompt, so the
 path is context rather than something to open.
+
+**When the input is a Layer-2 research pack** it contains this segment's
+`PRIMARY EVIDENCE` followed by a `BORROWED CONTEXT` section drawn from related
+segments — parent, children, siblings, neighbours — with every borrowed item
+labelled `BORROWED FROM: {slug} ({relation}, {strength})`. That exists because a
+narrow segment's own evidence is often too thin to characterise while directly
+relevant language sits one edge away.
+
+It changes what you count, not what you extract:
+
+- **Every count is a count of primary evidence.** `evidence_count`, the
+  frequency ranking, the confidence bands — all primary only.
+- Borrowed context may inform a pain point's label, its wording, and how you
+  interpret a thin primary signal.
+- Where a pain point leans on borrowed context, say so and report its primary
+  count separately. Never add the two.
+- A pain point appearing **only** in borrowed context is not this segment's pain
+  point. Record it under `Inferences retained` as borrowed context, naming the
+  segment it came from, or leave it out.
 
 ### Required segment metadata
 
@@ -131,7 +145,8 @@ path is context rather than something to open.
 
 ## Evidence Policy
 
-Use only evidence from the current segment evidence file.
+Use only evidence from the current segment file, and count only its primary
+evidence.
 
 Every retained pain point must:
 
