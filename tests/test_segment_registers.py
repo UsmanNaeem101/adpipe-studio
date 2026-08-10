@@ -460,7 +460,8 @@ class RegisterPipelineIntegrationTests(unittest.TestCase):
                          "source_facet_ids": ["pfac_000"]},
                         {"facet_key": "brace_use", "name": "Brace use",
                          "definition": "Already wearing a brace",
-                         "facet_type": "attribute", "source_facet_ids": []}]}
+                         "facet_type": "attribute", "source_facet_ids": []}],
+                    "segment_edges": []}
             elif job_id == "07_commercial_coalesce":
                 payload = {
                     "canonical_segments": [{
@@ -588,6 +589,24 @@ class RegisterPipelineIntegrationTests(unittest.TestCase):
             # One validated segment, so every runner-up is honestly empty.
             self.assertEqual(tally["pairs"], [])
             self.assertEqual(tally["measured_from_assignments"], 0)
+
+    def test_the_graph_is_persisted_and_reused_without_a_model_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_pipeline(tmp)
+            graph_path = os.path.join(tmp, "research", "voc",
+                                      "segment_graph.json")
+            with open(graph_path, encoding="utf-8") as fh:
+                graph = json.load(fh)
+            self.assertEqual(graph, {"specialises": [], "adjacent": []})
+
+            # A resume reads the persisted graph rather than re-deriving it, so
+            # every child is judged as a child on the second run too.
+            cfg = {"_dir": tmp, "name": "test",
+                   "segmentation": {"min_segment_evidence": 4}}
+            voc = os.path.join(tmp, "research", "voc")
+            _validated, _decisions, _rows, reused = (
+                cli._completed_segmentation_inputs(cfg, voc))
+            self.assertEqual(reused, graph)
 
 
 if __name__ == "__main__":

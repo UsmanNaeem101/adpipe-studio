@@ -44,6 +44,9 @@ Standard library only.
 
 from __future__ import annotations
 
+import re
+from collections import Counter
+
 # --------------------------------------------------------------- corroboration
 
 FIRST_PERSON = "first_person_experience"
@@ -220,6 +223,107 @@ def segment_floors(cfg):
     settings = (cfg or {}).get("segmentation") or {}
     return (int(settings.get("min_segment_threads", DEFAULT_MIN_THREADS)),
             int(settings.get("min_segment_evidence", DEFAULT_MIN_EVIDENCE)))
+
+
+# ------------------------------------------------------------- child floors
+
+# A child of an existing segment is not judged like a root, because it is not
+# being asked the same question. The parent has already proved the audience
+# exists; the child only has to prove it says something the parent does not.
+# So the volume bar drops and a second, different bar goes up.
+#
+# Volume alone cannot do this job in either direction. `violinists with a
+# rotator cuff tear` on two comments should not become a permanent audience --
+# but neither should `swimmers with a rotator cuff tear` on fifteen comments
+# that say exactly what the parent already says. One is too thin; the other is
+# a duplicate wearing a sport's name.
+DEFAULT_MIN_CHILD_THREADS = 2
+DEFAULT_MIN_CHILD_EVIDENCE = 3
+# How much of the parent's vocabulary counts as "already said". Set generously:
+# the parent's own top terms are also what makes a stopword list unnecessary
+# here, since `the`, `and` and `pain` are always in it.
+DEFAULT_PARENT_TOP_TERMS = 50
+DEFAULT_MIN_DISTINCTIVE_TERMS = 1
+# A term has to recur inside the child to count. One person's word is a turn of
+# phrase; two people's word is the beginning of an angle.
+DEFAULT_DISTINCTIVE_MIN_ITEMS = 2
+
+# Backstop only, for the case where a parent is small enough that its top terms
+# do not cover the function words. Kept deliberately short: the parent's own
+# vocabulary is the real filter and a long list here would start deciding
+# outcomes on its own.
+_COMMON_WORDS = frozenset("""
+about after again all also and any are been before being but can cant did does
+dont down for from get got had has have her here him his how into its ive just
+like more most much not now off one only other our out over own same she should
+some still such than that the their them then there these they this those through
+too under until very was way well were what when where which while who why will
+with would you your
+""".split())
+
+_WORD_RE = re.compile(r"[a-z][a-z'-]{2,}")
+
+
+def _document_frequency(texts):
+    """How many separate items each term appears in."""
+    counts = Counter()
+    for text in texts:
+        counts.update(set(_WORD_RE.findall(str(text or "").lower())))
+    return counts
+
+
+def child_floors(cfg):
+    settings = (cfg or {}).get("segmentation") or {}
+    return {
+        "min_threads": int(settings.get(
+            "min_child_threads", DEFAULT_MIN_CHILD_THREADS)),
+        "min_evidence": int(settings.get(
+            "min_child_evidence", DEFAULT_MIN_CHILD_EVIDENCE)),
+        "parent_top_terms": int(settings.get(
+            "parent_top_terms", DEFAULT_PARENT_TOP_TERMS)),
+        "min_distinctive_terms": int(settings.get(
+            "min_distinctive_terms", DEFAULT_MIN_DISTINCTIVE_TERMS)),
+        "distinctive_min_items": int(settings.get(
+            "distinctive_min_items", DEFAULT_DISTINCTIVE_MIN_ITEMS)),
+    }
+
+
+def distinctive_terms(child_texts, parent_texts, floors):
+    """Terms the child's people use that its parent's people do not.
+
+    Deterministic and code-owned: no model is asked whether a child is
+    different, because "is this segment distinctive?" is exactly the kind of
+    question a model answers yes to. Word frequency is a blunt proxy for a
+    distinct message, and it is meant to be -- it only has to catch the child
+    that is a relabelling of its parent.
+    """
+    parent_common = {
+        term for term, _count in _document_frequency(parent_texts).most_common(
+            max(floors["parent_top_terms"], 0))}
+    child_frequency = _document_frequency(child_texts)
+    return sorted(
+        term for term, count in child_frequency.items()
+        if (count >= floors["distinctive_min_items"]
+            and term not in parent_common
+            and term not in _COMMON_WORDS))
+
+
+def child_floor_failure(threads, evidence, child_texts, parent_texts, floors):
+    """Why this child is too thin or too derivative to stand, or None."""
+    if threads < floors["min_threads"]:
+        return (f"rests on {threads} thread(s); {floors['min_threads']} required "
+                "for a child segment")
+    if evidence < floors["min_evidence"]:
+        return (f"has {evidence} evidence item(s); {floors['min_evidence']} "
+                "required for a child segment")
+    wanted = floors["min_distinctive_terms"]
+    if wanted > 0:
+        found = distinctive_terms(child_texts, parent_texts, floors)
+        if len(found) < wanted:
+            return (f"contributes {len(found)} recurring term(s) its parent does "
+                    f"not already use; {wanted} required — it is a relabelling "
+                    "of its parent, not an angle on it")
+    return None
 
 
 def floor_failure(candidate, min_threads, min_evidence):

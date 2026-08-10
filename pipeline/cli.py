@@ -2135,15 +2135,36 @@ VALIDATION_SCHEMA = {
             "required": ["facet_key", "name", "definition", "facet_type",
                          "source_facet_ids"],
             "additionalProperties": False}},
+        "segment_edges": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "from_segment_id": {"type": "string"},
+                "to_segment_id": {"type": "string"},
+                "edge_type": {"type": "string",
+                              "enum": list(segmentation.EDGE_TYPES)},
+                # Strength is a judgement the model can actually make. Turning
+                # it into a retrieval weight is config's job, not the model's.
+                "strength": {"type": "string",
+                             "enum": list(segmentation.EDGE_STRENGTHS)},
+                "rationale": {"type": "string"},
+            },
+            "required": ["from_segment_id", "to_segment_id", "edge_type",
+                         "strength", "rationale"],
+            "additionalProperties": False}},
     },
-    "required": ["decisions", "facet_vocabulary"], "additionalProperties": False,
+    "required": ["decisions", "facet_vocabulary", "segment_edges"],
+    "additionalProperties": False,
 }
 
 
 def validation_schema(segment_ids, provisional_facet_ids=()):
     schema = copy.deepcopy(VALIDATION_SCHEMA)
+    ids = list(segment_ids)
     schema["properties"]["decisions"]["items"]["properties"][
-        "segment_id"]["enum"] = list(segment_ids)
+        "segment_id"]["enum"] = ids
+    edge = schema["properties"]["segment_edges"]["items"]["properties"]
+    edge["from_segment_id"]["enum"] = ids
+    edge["to_segment_id"]["enum"] = ids
     facet_ids = list(provisional_facet_ids)
     if facet_ids:
         schema["properties"]["facet_vocabulary"]["items"]["properties"][
@@ -2252,7 +2273,30 @@ def _demote(decisions, segment_id, failure):
         return
 
 
-def _apply_segment_floors(validated, decisions, cfg, verbose=True):
+def _root_order(segment_ids, graph):
+    """Segment IDs ordered parents-before-children.
+
+    Floors are hierarchical, so a child can only be judged as a child once its
+    parent's fate is known. A child whose parent was demoted is not a child any
+    more — it is a root, and it gets judged as one.
+    """
+    parents = segmentation.parent_map(graph)
+    ordered, placed = [], set()
+    remaining = list(segment_ids)
+    while remaining:
+        ready = [segment_id for segment_id in remaining
+                 if parents.get(segment_id) not in set(remaining) - {segment_id}]
+        if not ready:  # Unreachable given the graph is acyclic; stay total anyway.
+            ready = sorted(remaining)
+        for segment_id in ready:
+            ordered.append(segment_id)
+            placed.add(segment_id)
+        remaining = [segment_id for segment_id in remaining
+                     if segment_id not in placed]
+    return ordered
+
+
+def _apply_segment_floors(validated, decisions, cfg, verbose=True, graph=None):
     """Demote validated candidates too thin to be audiences, before assignment.
 
     Skill 04 already rules that a single thread is a conversation rather than an
@@ -2264,28 +2308,52 @@ def _apply_segment_floors(validated, decisions, cfg, verbose=True):
     this gate only catches candidates that were hopeless from the start. The
     floor that does the work runs after assignment, below.
 
+    A child clears the lower child volume bar instead, because its parent has
+    already carried the burden of proving the audience exists. The distinctness
+    half of the child floor is not applied here: it needs assigned evidence to
+    compare, and discovery evidence is not that.
+
     Demotion is to `needs_more_research`, not `rejected`: a thin candidate is
     usually a real audience the corpus under-samples, and it should come back if
     a later scrape finds it.
     """
     min_threads, min_evidence = corpus_policy.segment_floors(cfg)
-    kept, demoted = [], []
-    for candidate in validated:
-        failure = corpus_policy.floor_failure(candidate, min_threads, min_evidence)
+    child = corpus_policy.child_floors(cfg)
+    parents = segmentation.parent_map(graph)
+    by_id = {row["segment_id"]: row for row in validated}
+    order = [row["segment_id"] for row in validated]
+    surviving = set(by_id)
+    kept_ids, demoted = [], []
+    for segment_id in _root_order(order, graph):
+        candidate = by_id[segment_id]
+        is_child = parents.get(segment_id) in surviving
+        if is_child:
+            failure = corpus_policy.child_floor_failure(
+                int(candidate.get("unique_thread_count") or 0),
+                int(candidate.get("unique_evidence_count") or 0),
+                [], [], {**child, "min_distinctive_terms": 0})
+        else:
+            failure = corpus_policy.floor_failure(
+                candidate, min_threads, min_evidence)
         if failure is None:
-            kept.append(candidate)
+            kept_ids.append(segment_id)
             continue
+        surviving.discard(segment_id)
         demoted.append((candidate, failure))
         _demote(decisions, candidate["segment_id"], failure)
+    kept = [by_id[segment_id] for segment_id in sorted(kept_ids, key=order.index)]
     if demoted and verbose:
         print(f"  04 floors: {len(demoted)} validated candidate(s) below "
-              f"{min_threads} threads / {min_evidence} items -> needs_more_research")
+              f"{min_threads} threads / {min_evidence} items "
+              f"({child['min_threads']}/{child['min_evidence']} for children) "
+              "-> needs_more_research")
         for candidate, failure in demoted:
             print(f"    {candidate['slug']:44} {failure}")
     return kept
 
 
-def _apply_assigned_floors(validated, decisions, rows, by_id, cfg, verbose=True):
+def _apply_assigned_floors(validated, decisions, rows, by_id, cfg, verbose=True,
+                           graph=None):
     """Demote segments whose *assigned* evidence is too thin, after Stage 05.
 
     This is the floor that matters, and applying it earlier cannot work. A
@@ -2296,43 +2364,89 @@ def _apply_assigned_floors(validated, decisions, rows, by_id, cfg, verbose=True)
     card caught 1 of 70 segments; gating here catches the 19 that actually rest
     on three conversations or fewer.
 
-    Evidence from a demoted segment returns to the unassigned pool rather than
-    being deleted — it was never wrong, it just has nowhere strong enough to sit.
-    Stage 06 and Stage 07 are then handed the same taxonomy, which is the point:
-    a segment with no evidence file must not reach commercial coalescing.
+    Children are judged differently, and the difference cuts both ways: a lower
+    volume bar, because the parent already proved the audience exists, plus a
+    distinctness bar the parent never has to clear. A child that only repeats its
+    parent's vocabulary is a relabelling, however much evidence it carries.
+
+    Where a demoted root's evidence returns to the unassigned pool, a demoted
+    child's evidence moves to its parent. That is not a rounding-up of counts:
+    `specialises` means every member of the child is a member of the parent, so
+    the parent is where those comments belonged all along, and the parent's card
+    records which child it absorbed.
     """
     min_threads, min_evidence = corpus_policy.segment_floors(cfg)
+    child_rules = corpus_policy.child_floors(cfg)
+    parents = segmentation.parent_map(graph)
     assigned = defaultdict(list)
     for row in rows:
         if row.get("assignment_status") == "assigned":
             assigned[row.get("primary_segment_id")].append(row)
 
-    kept, demoted = [], []
-    for segment in validated:
-        segment_rows = assigned.get(segment["segment_id"], [])
+    def texts(segment_id):
+        return [by_id.get(row["evidence_id"], {}).get("text", "")
+                for row in assigned.get(segment_id, [])]
+
+    by_id_segment = {row["segment_id"]: row for row in validated}
+    surviving = set(by_id_segment)
+    kept_ids, demoted, absorbed = [], [], defaultdict(list)
+    for segment_id in _root_order([row["segment_id"] for row in validated], graph):
+        segment = by_id_segment[segment_id]
+        segment_rows = assigned.get(segment_id, [])
         threads = {(by_id.get(row["evidence_id"], {}).get("thread_id")
                     or by_id.get(row["evidence_id"], {}).get("url"))
                    for row in segment_rows}
         threads.discard(None)
-        failure = corpus_policy.floor_failure(
-            {"unique_thread_count": len(threads),
-             "unique_evidence_count": len(segment_rows)},
-            min_threads, min_evidence)
+        parent_id = parents.get(segment_id)
+        parent_id = parent_id if parent_id in surviving else None
+        if parent_id:
+            failure = corpus_policy.child_floor_failure(
+                len(threads), len(segment_rows), texts(segment_id),
+                texts(parent_id), child_rules)
+        else:
+            failure = corpus_policy.floor_failure(
+                {"unique_thread_count": len(threads),
+                 "unique_evidence_count": len(segment_rows)},
+                min_threads, min_evidence)
         if failure is None:
-            kept.append(segment)
+            kept_ids.append(segment_id)
             continue
-        demoted.append((segment, failure, len(segment_rows)))
-        _demote(decisions, segment["segment_id"], failure)
+        surviving.discard(segment_id)
+        demoted.append((segment, failure, len(segment_rows), parent_id))
+        _demote(decisions, segment_id, failure)
         for row in segment_rows:
-            row["assignment_status"] = "unassigned_insufficient_evidence"
-            row["primary_segment_id"] = ""
+            if parent_id:
+                row["primary_segment_id"] = parent_id
+                row["absorbed_from_segment_id"] = segment_id
+                assigned[parent_id].append(row)
+            else:
+                row["assignment_status"] = "unassigned_insufficient_evidence"
+                row["primary_segment_id"] = ""
+        if parent_id:
+            absorbed[parent_id].append(
+                {"segment_id": segment_id, "slug": segment["slug"],
+                 "name": segment.get("name") or segment["slug"],
+                 "evidence_count": len(segment_rows), "reason": failure})
+
+    order = [row["segment_id"] for row in validated]
+    kept = [by_id_segment[segment_id]
+            for segment_id in sorted(kept_ids, key=order.index)]
+    for segment in kept:
+        if absorbed.get(segment["segment_id"]):
+            segment["absorbed_children"] = absorbed[segment["segment_id"]]
     if demoted and verbose:
-        released = sum(count for _s, _f, count in demoted)
+        released = sum(count for _s, _f, count, parent in demoted if not parent)
+        folded = sum(count for _s, _f, count, parent in demoted if parent)
         print(f"  05 floors: {len(demoted)} segment(s) below {min_threads} "
-              f"threads / {min_evidence} assigned items -> needs_more_research "
-              f"({released:,} item(s) returned to unassigned)")
-        for segment, failure, _count in demoted:
-            print(f"    {segment['slug']:44} {failure}")
+              f"threads / {min_evidence} assigned items "
+              f"({child_rules['min_threads']}/{child_rules['min_evidence']} plus "
+              "distinctness for children) -> needs_more_research "
+              f"({released:,} item(s) returned to unassigned, "
+              f"{folded:,} folded into a parent)")
+        for segment, failure, _count, parent_id in demoted:
+            destination = (f" -> {by_id_segment[parent_id]['slug']}"
+                           if parent_id else "")
+            print(f"    {segment['slug']:44} {failure}{destination}")
     return kept
 
 
@@ -2864,6 +2978,27 @@ def _finalize_stage04_facets(vocabulary, provisional_facets, decisions, candidat
                   f"{len(row['unknown_ids'])} unknown provisional facet ID(s); "
                   "dropped from its lineage")
     return facets
+
+
+def _finalize_stage04_graph(edges, decisions, verbose=True):
+    """Validate declared relationships against the segments that survived 04.
+
+    Endpoints are restricted to candidates Stage 04 actually validated. An edge
+    onto something it rejected, merged or reclassified is not a relationship —
+    it is a relationship to a segment that no longer exists — so it is dropped
+    and reported rather than left to break the floors that read this graph.
+    """
+    eligible = [row["segment_id"] for row in decisions
+                if row.get("status") == "validated"]
+    graph, dropped = segmentation.finalize_segment_graph(edges, eligible)
+    if verbose and (graph["specialises"] or graph["adjacent"]):
+        print(f"  04 graph: {len(graph['specialises'])} specialises · "
+              f"{len(graph['adjacent'])} adjacent edge(s)")
+    if verbose and dropped:
+        reasons = Counter(row["reason"] for row in dropped)
+        print("  ! 04 graph: dropped " + " · ".join(
+            f"{count} {reason}" for reason, count in sorted(reasons.items())))
+    return graph
 
 
 def _validate_decision_coverage(decisions, candidates):
@@ -3574,7 +3709,7 @@ def _run_stage05_assignments(c, corpus, jobs, chunks, artifact_dir,
 
 
 def _completed_segmentation_inputs(cfg, voc):
-    """Load authenticated Stage 04/05 outputs for a post-06-only resume."""
+    """Load authenticated Stage 04/05 outputs, and the graph, for a resume."""
     discovery = paths.research(cfg["_dir"], "segments", "discovery")
     candidates_path = os.path.join(discovery, "discovered_segments.json")
     decisions_path = os.path.join(voc, "validated_segments.json")
@@ -3592,11 +3727,16 @@ def _completed_segmentation_inputs(cfg, voc):
                      and row.get("segment_id") in by_segment_id)]
     assignments = _normalize_assignment_contract(_read_jsonl(assignments_path))
     # The resume path must see the same taxonomy the full run would, or Stage 07
-    # coalesces a segment set that Stage 05 never assigned against.
-    validated = _apply_segment_floors(validated, decisions, cfg)
+    # coalesces a segment set that Stage 05 never assigned against. That includes
+    # the graph: without it every child is re-judged as a root and the resume
+    # quietly drops segments the full run kept.
+    graph_path = os.path.join(voc, "segment_graph.json")
+    graph = (_load_json(graph_path) if os.path.isfile(graph_path)
+             else {"specialises": [], "adjacent": []})
+    validated = _apply_segment_floors(validated, decisions, cfg, graph=graph)
     if not validated:
         sys.exit("Cannot start Stage 07: no validated Stage-04 segments found.")
-    return validated, decisions, assignments
+    return validated, decisions, assignments, graph
 
 
 def _stage08_chunk_prompt(canonical, records):
@@ -3952,7 +4092,7 @@ def cmd_segment(cfg, args):
     # It loads the completed immutable Stage 04/05 contracts directly and never
     # executes Stages 03--06 (including deterministic Stage 06 rewrites).
     if getattr(args, "from_stage", None) in ("07", "08", "09"):
-        validated, decisions, rows = _completed_segmentation_inputs(cfg, voc)
+        validated, decisions, rows, graph = _completed_segmentation_inputs(cfg, voc)
         expected = {row["id"] for row in items}
         _require_exact_ids(rows, expected, "persisted Stage 05 assignment")
         # The resume path must reach Stage 07 with the taxonomy the full run
@@ -3960,7 +4100,8 @@ def cmd_segment(cfg, args):
         # a segment set that no evidence file was ever built for.
         _enforce_assignment_thresholds(
             rows, paths.voc(cfg["_dir"], "_model_failures", "05_assign"))
-        validated = _apply_assigned_floors(validated, decisions, rows, by_id, cfg)
+        validated = _apply_assigned_floors(validated, decisions, rows, by_id, cfg,
+                                           graph=graph)
         if not validated:
             sys.exit("  No segment cleared the evidence floor after assignment.")
         stage_client = (None if args.from_stage == "09" else client(cfg, args))
@@ -4417,12 +4558,15 @@ def cmd_segment(cfg, args):
     val_p = os.path.join(voc, "validated_segments.json")
     val_meta = val_p + ".meta.json"
     facets_p = os.path.join(voc, "facet_vocabulary.json")
+    graph_p = os.path.join(voc, "segment_graph.json")
     candidate_fingerprint = _value_fingerprint(
         {"candidates": candidates, "provisional_facets": provisional_facets})
     if (os.path.exists(val_p) and not _segment_force(args, "04")
             and _meta_matches(val_meta, candidate_fingerprint)):
         decisions = _load_json(val_p)
         facets = _load_json(facets_p) if os.path.exists(facets_p) else []
+        graph = (_load_json(graph_p) if os.path.exists(graph_p)
+                 else {"specialises": [], "adjacent": []})
         print("  04 validate: reusing decisions")
     else:
         _, s04 = skill(4)
@@ -4435,6 +4579,22 @@ def cmd_segment(cfg, args):
             "enforced in code after you decide; validating below them only "
             "moves the decision, it does not make the segment.\n\n")
         scope_rule = corpus_policy.scope_prompt(cfg)
+        child_rules = corpus_policy.child_floors(cfg)
+        edge_rule = (
+            "RELATIONSHIPS — declare how the validated segments relate in "
+            "`segment_edges`. Use `specialises` (from child to parent) only "
+            "when every member of the child is also a member of the parent, and "
+            "`adjacent` when two audiences overlap or are discussed together "
+            "with neither containing the other. Not every segment needs an "
+            "edge, and an empty array is correct when none genuinely relate.\n"
+            f"A child is held to a lower volume floor than a root "
+            f"({child_rules['min_threads']} threads / "
+            f"{child_rules['min_evidence']} items rather than "
+            f"{min_threads}/{min_evidence}) and must contribute language its "
+            "parent does not already use. So declaring a parent is how a "
+            "narrow but genuine audience survives — and declaring one for a "
+            "segment that merely relabels its parent is how it gets folded "
+            "back in.\n\n")
         register_rule = (
             "REGISTERS — a candidate that is a response to the problem or the "
             "market (treatment preference, price stance, scepticism) or a point "
@@ -4462,6 +4622,7 @@ def cmd_segment(cfg, args):
                     "candidate exactly one decision.\n\n"
                     + floor_rule
                     + register_rule
+                    + edge_rule
                     + ((scope_rule + "\nA candidate whose defining trait is a "
                         "diagnosis is out of scope: reject it, however coherent "
                         "its evidence.\n\n") if scope_rule else "")
@@ -4489,8 +4650,10 @@ def cmd_segment(cfg, args):
         facets = _finalize_stage04_facets(
             validation.get("facet_vocabulary"), provisional_facets,
             decisions, candidates)
+        graph = _finalize_stage04_graph(validation.get("segment_edges"), decisions)
         _json_atomic(val_p, decisions)
         _json_atomic(facets_p, facets)
+        _json_atomic(graph_p, graph)
         _json_atomic(val_meta, {"input_fingerprint": candidate_fingerprint})
         tally = Counter(d["status"] for d in decisions)
         print("  04 validate: " + " · ".join(
@@ -4507,7 +4670,7 @@ def cmd_segment(cfg, args):
     validated = [by_segment_id[row["segment_id"]] for row in decisions
                  if (row["status"] == "validated"
                      and row["segment_id"] in by_segment_id)]
-    validated = _apply_segment_floors(validated, decisions, cfg)
+    validated = _apply_segment_floors(validated, decisions, cfg, graph=graph)
     if not validated:
         sys.exit("  No segment survived validation. Nothing to build.\n"
                  f"  Review {val_p} — every candidate has a written rationale.")
@@ -4585,7 +4748,8 @@ def cmd_segment(cfg, args):
         print("  05 assign: " + " · ".join(
             f"{key} {value}" for key, value in tally.most_common()))
 
-    validated = _apply_assigned_floors(validated, decisions, rows, by_id, cfg)
+    validated = _apply_assigned_floors(validated, decisions, rows, by_id, cfg,
+                                       graph=graph)
     if not validated:
         sys.exit("  No segment cleared the evidence floor after assignment.\n"
                  f"  Review {asg_p} — every item kept its score and rationale.")
@@ -4712,6 +4876,15 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=()):
             fh.write("INCLUSION\n" + "".join(f"  - {x}\n" for x in s["inclusion_criteria"]))
             fh.write("EXCLUSION\n" + "".join(f"  - {x}\n" for x in s["exclusion_criteria"]))
             fh.write("\nEach item appears in this segment only once.\n\n")
+            if s.get("absorbed_children"):
+                # A child that could not stand on its own is still a named
+                # sub-context inside its parent. Extractors get to see it,
+                # which is the whole reason folding beats deleting.
+                fh.write(f"ABSORBED SUB-CONTEXTS\n{'-' * 72}\n")
+                for child in s["absorbed_children"]:
+                    fh.write(f"  - {child['name']}: {child['evidence_count']} "
+                             f"item(s) — {child['reason']}\n")
+                fh.write("\n")
             if facet_tally:
                 # Facets describe the people already in this segment. The counts
                 # are shares of this file, never audience sizes, and they are

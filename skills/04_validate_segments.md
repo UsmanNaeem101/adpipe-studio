@@ -64,6 +64,41 @@ attribute or journey state, near-duplicates collapsed under a single `facet_key`
 citing the `provisional_facet_id` values it absorbs. Every `facet_key` you reclassify
 a candidate into should appear there too.
 
+## How the validated segments relate
+
+Declare relationships in `segment_edges`. Real markets are not trees, so there are
+two kinds and they are not interchangeable.
+
+```
+specialises   from child to parent, and only when every member of the child is
+              also a member of the parent
+              swimmers with a rotator cuff tear -> rotator cuff tear
+
+adjacent      two audiences that overlap or get discussed together, with
+              neither containing the other
+              desk workers <-> side sleepers · rotator cuff <-> frozen shoulder
+```
+
+Desk workers and side sleepers are the case that matters. Plenty of people are both,
+and the overlap is commercially real — but neither contains the other, and inventing a
+parent to hold them would name an audience nobody would ever target. That is
+`adjacent`. Reach for `specialises` only when the containment is genuine.
+
+Give each edge a `strength` of `strong`, `moderate` or `weak` — how much one
+segment's evidence would genuinely inform the other. Say what you mean qualitatively;
+the pipeline decides what that is worth in retrieval, and a number from you would be
+precision neither of us can justify.
+
+Declaring a parent changes how a candidate is judged. A child clears a lower volume
+floor than a root, because its parent has already proved the audience exists — so a
+narrow but genuine audience survives as a child where it would have died as a peer.
+It must also contribute language its parent does not already use: a child that merely
+relabels its parent gets folded back into it, keeping its evidence. Both halves are
+enforced in code after you decide.
+
+Not every segment needs an edge. An empty array is right when nothing genuinely
+relates, and a wrong parent is worse than none.
+
 You receive compact candidate cards, deterministic Core/Supporting/Context counts,
 thread/subreddit counts, and bounded verbatim representative evidence. Treat the
 counts as code-computed facts; judge what they mean. Do not demand or reconstruct the

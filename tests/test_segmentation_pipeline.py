@@ -1095,7 +1095,7 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
                     "rationale": "independent recurring context",
                     "merged_into": "", "split_into": [],
                     "facet_key": "", "facet_type": ""}],
-                    "facet_vocabulary": []}
+                    "facet_vocabulary": [], "segment_edges": []}
             elif job_id == "07_commercial_coalesce":
                 payload = {
                     "canonical_segments": [{

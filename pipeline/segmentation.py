@@ -28,6 +28,29 @@ EVIDENCE_TIERS = ("core", "supporting", "context")
 REGISTERS = ("segment", "attribute", "journey_state", "symptom")
 FACET_REGISTERS = ("attribute", "journey_state")
 
+# How two segments can be related.  Real markets are not trees: `swimmers with a
+# rotator cuff tear` sits under `rotator cuff tear`, but `desk workers` and
+# `side sleepers` are neither parent nor child of one another and plenty of
+# people are both.  Forcing that second relationship into a hierarchy either
+# invents a parent nobody would target or throws the relationship away, so
+# hierarchy and adjacency are separate edge types over one graph.
+#
+#   specialises  directed, child -> parent, acyclic, at most one parent.
+#                Every member of the child is a member of the parent, which is
+#                what makes folding a failed child back into its parent safe.
+#   adjacent     undirected, declared. Two audiences discussed together or
+#                overlapping in population, with neither containing the other.
+#
+# A third type, co-occurrence, is deliberately absent here: it is measured from
+# Stage 05 runner-ups rather than declared, so it is not the model's to assert.
+EDGE_TYPES = ("specialises", "adjacent")
+
+# How much a related segment's evidence is worth as borrowed context. The model
+# judges the relationship's strength, which it can do; config turns strength
+# into a number, because a model asked for `0.6` is inventing precision it has
+# no way to calibrate.
+EDGE_STRENGTHS = ("strong", "moderate", "weak")
+
 # Included in every persisted 03A chunk fingerprint.  Prompt and schema changes
 # already alter the fingerprint themselves; this explicit semantic-contract
 # version also invalidates cached work when only the code-side quality gate
@@ -742,6 +765,85 @@ def facet_catalogue(rows, minimum_evidence=2):
                                  for term in row.get("cue_terms", [])}),
         })
     return output
+
+
+def finalize_segment_graph(edges, eligible_ids):
+    """Turn declared edges into a validated graph, reporting everything dropped.
+
+    Code owns the invariants a hierarchy cannot survive without -- known
+    endpoints, no self-edges, one parent per child, no cycles -- and the model
+    owns which segments are actually related. Nothing raises: a broken edge is
+    dropped with a reason, because a single bad relationship should not cost a
+    run that has already done all of its expensive work.
+    """
+    eligible = set(eligible_ids)
+    specialises, adjacent, dropped = {}, {}, []
+
+    def drop(edge, reason):
+        dropped.append({"edge": edge, "reason": reason})
+
+    for edge in edges or []:
+        if not isinstance(edge, dict):
+            continue
+        child = edge.get("from_segment_id")
+        parent = edge.get("to_segment_id")
+        kind = edge.get("edge_type")
+        strength = (edge.get("strength")
+                    if edge.get("strength") in EDGE_STRENGTHS else "moderate")
+        rationale = edge.get("rationale") or ""
+        if kind not in EDGE_TYPES:
+            drop(edge, f"unknown edge_type {kind!r}")
+            continue
+        if child not in eligible or parent not in eligible:
+            drop(edge, "endpoint is not a validated segment")
+            continue
+        if child == parent:
+            drop(edge, "self-edge")
+            continue
+        if kind == "adjacent":
+            key = tuple(sorted((child, parent)))
+            if key in adjacent:
+                drop(edge, "duplicate adjacency")
+                continue
+            adjacent[key] = {"segment_ids": list(key), "edge_type": "adjacent",
+                             "strength": strength, "rationale": rationale}
+            continue
+        if child in specialises:
+            drop(edge, "child already has a parent")
+            continue
+        specialises[child] = {"from_segment_id": child, "to_segment_id": parent,
+                              "edge_type": "specialises", "strength": strength,
+                              "rationale": rationale}
+
+    # Cycles are resolved by dropping the edge that closes them, walking children
+    # in sorted order so the same declaration always yields the same graph.
+    for child in sorted(specialises):
+        seen, node = {child}, specialises[child]["to_segment_id"]
+        while node in specialises:
+            if node in seen:
+                drop(specialises.pop(child), "closes a specialisation cycle")
+                break
+            seen.add(node)
+            node = specialises[node]["to_segment_id"]
+
+    return {
+        "specialises": [specialises[child] for child in sorted(specialises)],
+        "adjacent": [adjacent[key] for key in sorted(adjacent)],
+    }, dropped
+
+
+def parent_map(graph):
+    """child segment ID -> parent segment ID."""
+    return {edge["from_segment_id"]: edge["to_segment_id"]
+            for edge in (graph or {}).get("specialises", [])}
+
+
+def children_map(graph):
+    """parent segment ID -> sorted child segment IDs."""
+    children = defaultdict(list)
+    for edge in (graph or {}).get("specialises", []):
+        children[edge["to_segment_id"]].append(edge["from_segment_id"])
+    return {parent: sorted(kids) for parent, kids in children.items()}
 
 
 def finalize_facets(vocabulary_rows, provisional_facets, reclassified):

@@ -411,6 +411,7 @@ def project_outputs(project):
     for f, lbl in (("candidate_segments.json", "03 candidates"),
                    ("validated_segments.json", "04 decisions"),
                    ("facet_vocabulary.json", "04 facet vocabulary"),
+                   ("segment_graph.json", "04 segment graph"),
                    ("segment_assignments.jsonl", "05 assignments"),
                    ("segment_cooccurrence.json", "05 co-occurrence"),
                    ("unassigned_evidence.md", "06 unassigned"),
