@@ -15,9 +15,31 @@ Every evidence item gets at most one **primary** segment ID selected exactly fro
 supplied validated definitions, chosen by its *dominant*
 customer context — not by incidental keywords. "I'm an accountant and my shoulder kills
 from sitting all day, and it wrecks my sleep" belongs to `desk_workers` if that's the
-dominant context; the sleep mention is a secondary attribute, recorded separately, and
-it does **not** also drop this comment into a side-sleeper segment. Secondary attributes
+dominant context; the sleep mention is a facet, recorded separately, and
+it does **not** also drop this comment into a side-sleeper segment. Facets
 never touch segment totals.
+
+## Facets
+
+Alongside the segment, tag each item with every facet it genuinely shows, using
+`facet_ids` — selected exactly from the supplied closed facet vocabulary, never
+invented. Facets are attributes (a stance or behaviour that responds to the problem:
+cost-sensitive, brace user, surgery-averse) and journey states (awaiting an MRI,
+post-op, in physio). They describe the *same person* the segment describes; they are
+not a second membership, they carry no counts, and an empty list is common and
+correct. If the vocabulary has no entry for something you can see, leave it out —
+Stage 04 owns the vocabulary, and inventing a tag here breaks the closed set that
+makes facets countable at all.
+
+## The runner-up
+
+Record `runner_up_segment_id`: the segment that scored second, or `""` when nothing
+else scored at all. This is not a fallback assignment and nothing is ever placed
+there — it is how the pipeline learns which audiences genuinely overlap. Two segments
+that keep coming first and second in the same comments are adjacent in the market
+even when neither is a parent of the other, and that is worth knowing. Report it
+honestly, including when the runner-up was close enough to make you hesitate; a
+hesitation you record is a signal, and one you round away is lost.
 
 And crucially: **unassigned is a valid, correct outcome.** Forcing an ambiguous comment
 into a segment to avoid a blank is worse than leaving it out.
@@ -56,13 +78,14 @@ assigned · unassigned_ambiguous · unassigned_insufficient_evidence
 · unassigned_no_matching_segment
 ```
 
-Record the score, the winning margin, the cues, and a one-line rationale for every
-item. Store secondary attributes separately from the primary assignment.
+Record the score, the winning margin, the runner-up, the cues, and a one-line
+rationale for every item. Store facets separately from the primary assignment.
 
 ## Check yourself before finishing
 
 - Every assigned item has exactly one `primary_segment_id`, with scores and rationale.
-- Secondary attributes are stored apart and affect no totals.
+- Facets come from the supplied vocabulary, are stored apart, and affect no totals.
+- The runner-up is recorded wherever a second segment scored.
 - No evidence item contributes to more than one segment total.
 - Ambiguous items are left unassigned and audited. Results are deterministic.
 

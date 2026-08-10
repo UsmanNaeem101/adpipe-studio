@@ -31,7 +31,7 @@ class SegmentationBookkeepingTests(unittest.TestCase):
             "candidate_key": key, "provisional_name": "Desk workers",
             "audience_cue": "desk work", "why_commercially_distinct": "workday",
             "evidence_ids": list(evidence_ids or [1]), "cue_terms": ["desk"],
-            "discovery_strength": "probable",
+            "discovery_strength": "probable", "register": "segment",
         }
 
     @staticmethod
@@ -281,12 +281,12 @@ class SegmentationBookkeepingTests(unittest.TestCase):
                 "candidate_key": "desk_workers", "provisional_name": "Desk workers",
                 "audience_cue": "computer work", "why_commercially_distinct": "workday",
                 "evidence_ids": [3, 4], "cue_terms": ["desk"],
-                "discovery_strength": "strong"}]}, {
+                "discovery_strength": "strong", "register": "segment"}]}, {
             "chunk_id": "03a_0000", "evidence_ids": [1, 2], "candidates": [{
                 "candidate_key": "desk_workers", "provisional_name": "Office workers",
                 "audience_cue": "sitting", "why_commercially_distinct": "ergonomics",
                 "evidence_ids": [1, 2], "cue_terms": ["computer"],
-                "discovery_strength": "probable"}]}]
+                "discovery_strength": "probable", "register": "segment"}]}]
 
         catalogue = segmentation.aggregate_harvest(chunks)
 
@@ -548,7 +548,7 @@ class SegmentationBookkeepingTests(unittest.TestCase):
             "candidate_key": "desk_workers", "provisional_name": "Desk workers",
             "audience_cue": "desk work", "why_commercially_distinct": "workday",
             "evidence_ids": [1], "cue_terms": ["desk"],
-            "discovery_strength": "probable",
+            "discovery_strength": "probable", "register": "segment",
         }
         for key in ("candidate", "renamed semantic concept", "Desk Workers"):
             with self.subTest(candidate_key=key):
@@ -563,11 +563,11 @@ class SegmentationBookkeepingTests(unittest.TestCase):
             "candidate_key": "desk_workers", "provisional_name": "Desk workers",
             "audience_cue": "desk", "why_commercially_distinct": "work",
             "evidence_ids": [1, 2], "cue_terms": ["desk"],
-            "discovery_strength": "strong"}, {
+            "discovery_strength": "strong", "register": "segment"}, {
             "candidate_key": "remote_workers", "provisional_name": "Remote workers",
             "audience_cue": "home office", "why_commercially_distinct": "remote setup",
             "evidence_ids": [2, 3], "cue_terms": ["home office"],
-            "discovery_strength": "probable"}]
+            "discovery_strength": "probable", "register": "segment"}]
         segmentation.validate_harvest_rows(rows, [1, 2, 3, 4])
         self.assertNotIn(4, {eid for row in rows for eid in row["evidence_ids"]})
 
@@ -596,7 +596,7 @@ class SegmentationBookkeepingTests(unittest.TestCase):
             "audience_cue": "chairside work",
             "why_commercially_distinct": "profession-specific positioning",
             "evidence_ids": [1, 2], "cue_terms": ["dentist"],
-            "discovery_strength": "strong"}
+            "discovery_strength": "strong", "register": "segment"}
         segmentation.validate_harvest_rows([candidate], [1, 2])
         claims = segmentation.harvest_full_chunk_claims([{
             "chunk_id": "03a_0000", "evidence_ids": [1, 2],
@@ -653,7 +653,7 @@ class SegmentationArtifactTests(unittest.TestCase):
             "candidate_key": "desk", "provisional_name": "Desk",
             "audience_cue": "desk work", "why_commercially_distinct": "workday",
             "evidence_ids": [1, 2], "cue_terms": ["desk"],
-            "discovery_strength": "strong"}]}
+            "discovery_strength": "strong", "register": "segment"}]}
 
         class Client:
             def __init__(self):
@@ -723,12 +723,12 @@ class SegmentationArtifactTests(unittest.TestCase):
             "candidate_key": "audience", "provisional_name": "audience",
             "audience_cue": "whole chunk", "why_commercially_distinct": "audience",
             "evidence_ids": [1, 2, 3], "cue_terms": ["audience"],
-            "discovery_strength": "strong"}]}
+            "discovery_strength": "strong", "register": "segment"}]}
         good = {"candidates": [{
             "candidate_key": "desk_workers", "provisional_name": "Desk workers",
             "audience_cue": "desk work", "why_commercially_distinct": "workday",
             "evidence_ids": [1, 2], "cue_terms": ["desk"],
-            "discovery_strength": "probable"}]}
+            "discovery_strength": "probable", "register": "segment"}]}
 
         class Client:
             def __init__(self):
@@ -771,7 +771,7 @@ class SegmentationArtifactTests(unittest.TestCase):
             "candidate_key": "desk_workers", "provisional_name": "Desk workers",
             "audience_cue": "desk work", "why_commercially_distinct": "workday",
             "evidence_ids": [1, 999], "cue_terms": ["desk"],
-            "discovery_strength": "probable",
+            "discovery_strength": "probable", "register": "segment",
         }
 
         class Client:
@@ -821,7 +821,7 @@ class SegmentationArtifactTests(unittest.TestCase):
                 "audience_cue": "desk work",
                 "why_commercially_distinct": "workday",
                 "evidence_ids": evidence_ids, "cue_terms": ["desk"],
-                "discovery_strength": "probable",
+                "discovery_strength": "probable", "register": "segment",
             }
 
         class Client:
@@ -909,7 +909,7 @@ class SegmentationArtifactTests(unittest.TestCase):
                 "audience_cue": "desk work",
                 "why_commercially_distinct": "workday",
                 "evidence_ids": list(evidence_ids), "cue_terms": ["desk"],
-                "discovery_strength": "probable",
+                "discovery_strength": "probable", "register": "segment",
             }
 
         def validator(job, rows):
@@ -991,7 +991,7 @@ class SegmentationArtifactTests(unittest.TestCase):
         assignment = {"evidence_id": 1, "primary_segment_id": "seg_001", "score": 8,
                       "winning_margin": 3, "cue_types": ["dominant_context_match"],
                       "primary_cues": ["desk"], "rationale": "dominant",
-                      "assignment_status": "assigned", "secondary_attributes": []}
+                      "assignment_status": "assigned", "runner_up_segment_id": "", "facet_ids": []}
         source = {"id": 1, "text": "I hurt after desk work", "tier": "supporting",
                   "thread_id": "t1", "url": "https://example.test", "title": "title"}
         with tempfile.TemporaryDirectory() as tmp:
@@ -1043,7 +1043,7 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
                         "why_commercially_distinct": "workday messaging",
                         "evidence_ids": list(job.expected_ids or (1, 2, 3)),
                         "cue_terms": ["desk", "computer"],
-                        "discovery_strength": "strong"}]}
+                        "discovery_strength": "strong", "register": "segment"}]}
                 elif job.id.startswith("03e_"):
                     payload = {"matches": [{
                         "evidence_id": eid, "segment_ids": ["seg_001"],
@@ -1055,7 +1055,7 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
                         "score": 8, "winning_margin": 3,
                         "cue_types": ["dominant_context_match"],
                         "primary_cues": ["desk"], "rationale": "dominant context",
-                        "assignment_status": "assigned", "secondary_attributes": []}
+                        "assignment_status": "assigned", "runner_up_segment_id": "", "facet_ids": []}
                         for eid in job.expected_ids]}
                 elif job.id.startswith("08a_"):
                     ids = job.schema["properties"]["signals"]["items"][
@@ -1093,7 +1093,9 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
                 payload = {"decisions": [{
                     "segment_id": "seg_001", "status": "validated",
                     "rationale": "independent recurring context",
-                    "merged_into": "", "split_into": []}]}
+                    "merged_into": "", "split_into": [],
+                    "facet_key": "", "facet_type": ""}],
+                    "facet_vocabulary": []}
             elif job_id == "07_commercial_coalesce":
                 payload = {
                     "canonical_segments": [{

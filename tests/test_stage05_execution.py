@@ -26,7 +26,7 @@ def assignment(evidence_id):
         "primary_cues": ["desk"],
         "rationale": "dominant context",
         "assignment_status": "assigned",
-        "secondary_attributes": [],
+        "runner_up_segment_id": "", "facet_ids": [],
     }
 
 

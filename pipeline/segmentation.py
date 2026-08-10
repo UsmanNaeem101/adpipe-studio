@@ -14,11 +14,30 @@ from collections import Counter, defaultdict
 
 EVIDENCE_TIERS = ("core", "supporting", "context")
 
+# The registers a 03A discovery can belong to.  One taxonomy cannot hold four
+# kinds of entity: `desk worker` (identity), `side sleeper` (posture),
+# `medication taker` (a response to the problem) and `can't sleep on that
+# shoulder` (a symptom) are not peers, and flattening them is what produced 70
+# "segments" of which roughly 40 were misfiled rather than wrong.
+#
+# Only `segment` owns evidence and forms an audience.  `attribute` and
+# `journey_state` are facets: they tag a comment inside whatever segment owns
+# it and are never counted as audiences.  `symptom` belongs to skills 07/08 and
+# leaves the taxonomy entirely, recorded as discovery telemetry so the decision
+# stays auditable.
+REGISTERS = ("segment", "attribute", "journey_state", "symptom")
+FACET_REGISTERS = ("attribute", "journey_state")
+
 # Included in every persisted 03A chunk fingerprint.  Prompt and schema changes
 # already alter the fingerprint themselves; this explicit semantic-contract
 # version also invalidates cached work when only the code-side quality gate
 # changes.
-HARVEST_CONTRACT_VERSION = "03a-semantic-contract-v2"
+HARVEST_CONTRACT_VERSION = "03a-register-contract-v3"
+
+# The contract version completed register-less runs were fingerprinted under.
+# Paired with LEGACY_HARVEST_SKILL_V3 below, it lets finished discovery work
+# move forward without replaying every chunk.
+LEGACY_HARVEST_CONTRACT_V2 = "03a-semantic-contract-v2"
 
 # Exact immediately-previous 03A skill text. Machine-ID migration deliberately
 # changed semantic-label guidance and its schema, so this authenticated contract
@@ -91,6 +110,52 @@ Do not validate, assign all evidence, write polished segment cards, invent evide
 or cite an ID outside this chunk. Return only the supplied structured output.
 """
 
+# Exact 03A skill text from immediately before registers existed.  A finished
+# 70-candidate discovery run is many hours of model work; authenticating its
+# fingerprint lets the register migration default those rows to `segment` --
+# exactly the taxonomy that run already produced -- instead of re-harvesting.
+LEGACY_HARVEST_SKILL_V3 = """# Harvest Segment Candidates
+
+You are the high-recall harvester in a customer-segmentation pipeline. Search one
+deterministic chunk of **Core** VOC for every plausible recurring audience pattern.
+The chunk is a heterogeneous search space, not an audience and not an assignment
+unit. **Do not name or summarise the chunk.** Missing a real minority audience is
+worse than returning an extra provisional candidate.
+
+A segment is an audience whose context, constraint, job-to-be-done, buying situation,
+or behaviour would justify different messaging, positioning, targeting, offer, or
+product decisions. A symptom, incidental attribute, arbitrary demographic, or one
+isolated comment is not a segment.
+
+Return zero or more provisional candidates. A chunk may contain multiple audiences,
+unrelated evidence, and evidence supporting no recurring candidate. Input evidence
+does **not** need to be assigned in 03A. For each candidate:
+
+- `candidate_key` is a compact, meaningful semantic audience label, such as
+  `desk_bound_knowledge_workers`; code assigns the immutable machine candidate ID
+  after your response, so do not invent one.
+- `provisional_name` names the people or their defining situation in plain language,
+  such as `Desk-bound knowledge workers`; it is never a schema field name.
+- `evidence_ids` contains only IDs whose individual text genuinely supports that
+  candidate. It is nonempty, contains no duplicates, and may overlap another
+  candidate's evidence when both patterns are genuinely present.
+- Leave unrelated or non-recurring evidence unassigned. Never include an ID merely
+  because it appeared in the supplied chunk.
+
+Returning every chunk ID for one candidate is valid only in the unusual case where
+every item independently expresses the same audience pattern. Re-check every cited ID
+before doing this. Do not collapse distinct groups into a generic umbrella audience.
+
+For each plausible recurring pattern also return a specific audience cue, commercial
+distinction, short cue terms, and an honest discovery strength. Preserve potentially
+valuable minority audiences and avoid aggressive merging; global semantic merging is
+Stage 03B's job.
+
+Do not validate, force coverage, write polished segment cards, invent evidence, or
+cite an ID outside this chunk. Return only the supplied structured output. An empty
+`candidates` array is correct when the chunk contains no recurring audience pattern.
+"""
+
 # Core requires direct lived experience plus a second meaningful signal.  The
 # reason vocabulary is closed by Stage 01, so this mapping is stable and generic.
 CORE_SIGNALS = frozenset({
@@ -149,6 +214,7 @@ HARVEST_SCHEMA = {
                 "type": "string", "minLength": 1,
             },
             "provisional_name": {"type": "string", "minLength": 3},
+            "register": {"type": "string", "enum": list(REGISTERS)},
             "audience_cue": {"type": "string", "minLength": 3},
             "why_commercially_distinct": {"type": "string", "minLength": 3},
             "evidence_ids": {
@@ -162,9 +228,9 @@ HARVEST_SCHEMA = {
             "discovery_strength": {"type": "string",
                                    "enum": ["strong", "probable", "emerging", "weak"]},
         },
-        "required": ["candidate_key", "provisional_name", "audience_cue",
-                     "why_commercially_distinct", "evidence_ids", "cue_terms",
-                     "discovery_strength"],
+        "required": ["candidate_key", "provisional_name", "register",
+                     "audience_cue", "why_commercially_distinct", "evidence_ids",
+                     "cue_terms", "discovery_strength"],
         "additionalProperties": False,
     }}},
     "required": ["candidates"],
@@ -181,9 +247,26 @@ def harvest_schema(chunk_ids):
     return schema
 
 
+def pre_register_harvest_schema():
+    """Reconstruct the static schema from before candidates carried a register."""
+    schema = copy.deepcopy(HARVEST_SCHEMA)
+    item = schema["properties"]["candidates"]["items"]
+    item["properties"].pop("register", None)
+    item["required"] = [name for name in item["required"] if name != "register"]
+    return schema
+
+
+def legacy_harvest_schema_v3(chunk_ids):
+    """Reconstruct the exact dynamic schema used by register-less runs."""
+    schema = pre_register_harvest_schema()
+    schema["properties"]["candidates"]["items"]["properties"][
+        "evidence_ids"]["items"]["enum"] = list(chunk_ids)
+    return schema
+
+
 def legacy_harvest_schema_v1():
     """Reconstruct the exact static schema used by existing 27-chunk runs."""
-    schema = copy.deepcopy(HARVEST_SCHEMA)
+    schema = pre_register_harvest_schema()
     candidate = schema["properties"]["candidates"]["items"]["properties"]
     for name in ("candidate_key", "provisional_name", "audience_cue",
                  "why_commercially_distinct"):
@@ -201,7 +284,7 @@ def legacy_harvest_schema_v1():
 
 def legacy_harvest_schema_v2(chunk_ids):
     """Reconstruct the exact dynamic schema used by completed Haiku caches."""
-    schema = copy.deepcopy(HARVEST_SCHEMA)
+    schema = pre_register_harvest_schema()
     key = schema["properties"]["candidates"]["items"]["properties"][
         "candidate_key"]
     key["minLength"] = 3
@@ -351,8 +434,20 @@ def legacy_harvest_prompt_v1(records):
 
 
 def migrate_legacy_harvest_rows(rows):
-    """Preserve legacy semantic fields; machine identity is assigned separately."""
-    return [dict(row) for row in rows]
+    """Preserve legacy semantic fields; machine identity is assigned separately.
+
+    A row harvested before registers existed is defaulted to `segment`, which is
+    the taxonomy that run already produced.  Defaulting is deliberately not a
+    guess at the right register: re-deciding a cached row would silently rewrite
+    finished discovery, so the correction happens where it is visible, in Stage
+    04, which can reclassify any candidate to a facet with a written rationale.
+    """
+    migrated = []
+    for row in rows:
+        item = dict(row)
+        item.setdefault("register", "segment")
+        migrated.append(item)
+    return migrated
 
 
 def chunk_by_tokens(records, target_tokens, prefix="chunk"):
@@ -476,6 +571,10 @@ def validate_harvest_rows(rows, chunk_ids, chunk_id=None):
             raise HarvestContractError(
                 "03A candidate has an invalid discovery_strength",
                 chunk_id=chunk_id, candidate=raw_key)
+        if row.get("register") not in set(REGISTERS):
+            raise HarvestContractError(
+                "03A candidate has an invalid register",
+                chunk_id=chunk_id, candidate=raw_key)
         cue_terms = row.get("cue_terms")
         if (not isinstance(cue_terms, list) or not cue_terms
                 or any(not isinstance(term, str) or not term.strip()
@@ -565,6 +664,7 @@ def aggregate_harvest(chunk_results, minimum_evidence=2):
             output.append({
                 "candidate_id": row["candidate_id"],
                 "candidate_key": row["candidate_key"],
+                "register": row.get("register", "segment"),
                 "occurrence_count": 1,
                 "unique_evidence_count": len(evidence),
                 "unique_chunk_count": 1,
@@ -578,6 +678,153 @@ def aggregate_harvest(chunk_results, minimum_evidence=2):
                 "provenance": [{"chunk_id": chunk_id, "result_index": index}],
             })
     return output
+
+
+def partition_by_register(catalogue):
+    """Split the 03A catalogue into the segment taxonomy and everything else.
+
+    Only `segment` rows continue into 03B consolidation, Stage 04 validation and
+    Stage 05 assignment.  Facet rows become a vocabulary comments are tagged
+    with; symptom rows leave the taxonomy for skills 07/08.  Nothing is deleted:
+    every partition is written out, so a candidate that changed register can
+    always be traced back to the chunk that discovered it.
+    """
+    segments, facets, symptoms = [], [], []
+    for row in catalogue:
+        register = row.get("register", "segment")
+        if register in FACET_REGISTERS:
+            facets.append(row)
+        elif register == "symptom":
+            symptoms.append(row)
+        else:
+            segments.append(row)
+    return segments, facets, symptoms
+
+
+def facet_catalogue(rows, minimum_evidence=2):
+    """Group per-chunk facet discoveries into one compact provisional vocabulary.
+
+    Grouping is by `candidate_key` and nothing else.  This is deliberately code,
+    not a second model call: a facet vocabulary carries no counts anyone acts on,
+    so exact semantic merging is not worth a round trip.  Stage 04 sees this
+    catalogue and owns the merging judgement, exactly as it already owns whether
+    a candidate is a segment at all.
+    """
+    grouped = defaultdict(list)
+    for row in rows:
+        key = str(row.get("candidate_key") or "").strip()
+        if key:
+            grouped[key].append(row)
+    output = []
+    for key in sorted(grouped):
+        members = grouped[key]
+        evidence = sorted({eid for row in members
+                           for eid in row.get("evidence_ids", [])})
+        if len(evidence) < minimum_evidence:
+            continue
+        registers = Counter(row.get("register") for row in members)
+        output.append({
+            "provisional_facet_id": f"pfac_{len(output):03d}",
+            "facet_key": key,
+            # A key discovered as both an attribute and a journey state is
+            # settled by weight of discovery, then alphabetically, so replaying
+            # the same catalogue always yields the same vocabulary.
+            "facet_type": (min(registers,
+                               key=lambda name: (-registers[name], name))
+                           if registers else "attribute"),
+            "occurrence_count": len(members),
+            "unique_evidence_count": len(evidence),
+            "evidence_ids": evidence,
+            "source_candidate_ids": sorted(row["candidate_id"] for row in members),
+            "aliases": sorted({alias for row in members
+                               for alias in row.get("aliases", [])}),
+            "cue_terms": sorted({term for row in members
+                                 for term in row.get("cue_terms", [])}),
+        })
+    return output
+
+
+def finalize_facets(vocabulary_rows, provisional_facets, reclassified):
+    """Assign durable facet IDs and prove no reclassified candidate is stranded.
+
+    Two inputs feed one closed vocabulary: facets 03A discovered directly, and
+    segment candidates Stage 04 reclassified.  The second is the load-bearing
+    one.  Demoting a candidate *after* Stage 05 has assigned evidence to it
+    strands that evidence -- the only lossless move left is to fold it into some
+    parent, which is how an attribute's comments end up inflating an audience's
+    headline count.  Reclassifying here, before any assignment exists, costs
+    nothing: the candidate simply never becomes a segment.
+
+    `reclassified` rows are `{facet_key, facet_type, name, definition,
+    segment_id, evidence_ids}` drawn from Stage 04 decisions.  A key Stage 04
+    reclassified into but forgot to declare still gets a vocabulary entry, so a
+    forgotten declaration can never delete an audience's worth of evidence.
+    """
+    known = {row["provisional_facet_id"]: row for row in provisional_facets}
+    declared, unknown_references = {}, []
+    for row in vocabulary_rows or []:
+        key = str(row.get("facet_key") or "").strip()
+        if not key or key in declared:
+            continue
+        source_ids = [facet_id for facet_id in (row.get("source_facet_ids") or [])
+                      if isinstance(facet_id, str)]
+        missing = [facet_id for facet_id in source_ids if facet_id not in known]
+        if missing:
+            unknown_references.append({"facet_key": key, "unknown_ids": missing})
+        declared[key] = {
+            "facet_key": key,
+            "name": row.get("name") or key.replace("_", " ").capitalize(),
+            "definition": row.get("definition") or "",
+            "facet_type": (row.get("facet_type")
+                           if row.get("facet_type") in FACET_REGISTERS
+                           else "attribute"),
+            "source_facet_ids": [facet_id for facet_id in source_ids
+                                 if facet_id in known],
+            "source_segment_ids": [],
+        }
+
+    for row in reclassified or []:
+        key = str(row.get("facet_key") or "").strip()
+        if not key:
+            continue
+        entry = declared.setdefault(key, {
+            "facet_key": key,
+            "name": row.get("name") or key.replace("_", " ").capitalize(),
+            "definition": row.get("definition") or "",
+            "facet_type": (row.get("facet_type")
+                           if row.get("facet_type") in FACET_REGISTERS
+                           else "attribute"),
+            "source_facet_ids": [],
+            "source_segment_ids": [],
+        })
+        entry["source_segment_ids"].append(row["segment_id"])
+
+    reclassified_evidence = defaultdict(set)
+    for row in reclassified or []:
+        key = str(row.get("facet_key") or "").strip()
+        if key:
+            reclassified_evidence[key].update(row.get("evidence_ids") or [])
+
+    output = []
+    for ordinal, key in enumerate(sorted(declared), 1):
+        entry = declared[key]
+        evidence = {eid for facet_id in entry["source_facet_ids"]
+                    for eid in known[facet_id]["evidence_ids"]}
+        evidence |= reclassified_evidence.get(key, set())
+        cue_terms = {term for facet_id in entry["source_facet_ids"]
+                     for term in known[facet_id]["cue_terms"]}
+        output.append({
+            **entry,
+            "facet_id": f"fac_{ordinal:03d}",
+            "source_segment_ids": sorted(set(entry["source_segment_ids"])),
+            "cue_terms": sorted(cue_terms),
+            # Named so it can never be read as an audience size.  A facet tags
+            # comments inside segments; it never owns them and never competes
+            # with them for a headline number.
+            "discovery_evidence_count": len(evidence),
+            "discovery_evidence_ids": sorted(evidence),
+        })
+    return output, unknown_references
 
 
 class ConsolidationContractError(ValueError):

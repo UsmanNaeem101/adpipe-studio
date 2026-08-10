@@ -2101,27 +2101,53 @@ def _write_jsonl(path, rows):
 
 VALIDATION_SCHEMA = {
     "type": "object",
-    "properties": {"decisions": {"type": "array", "items": {
-        "type": "object",
-        "properties": {
-            "segment_id": {"type": "string"},
-            "status": {"type": "string",
-                       "enum": ["validated", "merged", "split_required",
-                                "needs_more_research", "rejected"]},
-            "rationale": {"type": "string"},
-            "merged_into": {"type": "string"},
-            "split_into": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["segment_id", "status", "rationale", "merged_into", "split_into"],
-        "additionalProperties": False}}},
-    "required": ["decisions"], "additionalProperties": False,
+    "properties": {
+        "decisions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "segment_id": {"type": "string"},
+                "status": {"type": "string",
+                           "enum": ["validated", "merged", "split_required",
+                                    "reclassified_as_facet",
+                                    "needs_more_research", "rejected"]},
+                "rationale": {"type": "string"},
+                "merged_into": {"type": "string"},
+                "split_into": {"type": "array", "items": {"type": "string"}},
+                # Populated only for `reclassified_as_facet`; empty otherwise.
+                "facet_key": {"type": "string"},
+                "facet_type": {"type": "string",
+                               "enum": ["", "attribute", "journey_state"]},
+            },
+            "required": ["segment_id", "status", "rationale", "merged_into",
+                         "split_into", "facet_key", "facet_type"],
+            "additionalProperties": False}},
+        "facet_vocabulary": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "facet_key": {"type": "string", "minLength": 1},
+                "name": {"type": "string", "minLength": 1},
+                "definition": {"type": "string"},
+                "facet_type": {"type": "string",
+                               "enum": ["attribute", "journey_state"]},
+                "source_facet_ids": {"type": "array", "uniqueItems": True,
+                                     "items": {"type": "string"}},
+            },
+            "required": ["facet_key", "name", "definition", "facet_type",
+                         "source_facet_ids"],
+            "additionalProperties": False}},
+    },
+    "required": ["decisions", "facet_vocabulary"], "additionalProperties": False,
 }
 
 
-def validation_schema(segment_ids):
+def validation_schema(segment_ids, provisional_facet_ids=()):
     schema = copy.deepcopy(VALIDATION_SCHEMA)
     schema["properties"]["decisions"]["items"]["properties"][
         "segment_id"]["enum"] = list(segment_ids)
+    facet_ids = list(provisional_facet_ids)
+    if facet_ids:
+        schema["properties"]["facet_vocabulary"]["items"]["properties"][
+            "source_facet_ids"]["items"]["enum"] = facet_ids
     return schema
 
 # Mirrored from skills/05_assign_primary_segment.md § How to score an assignment.
@@ -2153,22 +2179,65 @@ ASSIGN_SCHEMA = {
                                   "enum": ["assigned", "unassigned_ambiguous",
                                            "unassigned_insufficient_evidence",
                                            "unassigned_no_matching_segment"]},
-            "secondary_attributes": {"type": "array", "items": {"type": "string"}},
+            # The segment that scored second. Nothing is ever placed here: it is
+            # recorded because a comment where two segments scored closely is
+            # direct evidence that those two audiences overlap, and `winning_margin`
+            # alone throws away which segment the margin was against.
+            "runner_up_segment_id": {"type": "string"},
+            # Closed vocabulary from Stage 04. Replaces the old free-text
+            # `secondary_attributes`: an open list cannot be counted, joined or
+            # audited, so it could only ever be read by a human one row at a time.
+            "facet_ids": {"type": "array", "uniqueItems": True,
+                          "items": {"type": "string"}},
         },
         "required": ["evidence_id", "primary_segment_id", "score", "winning_margin",
                      "cue_types", "primary_cues", "rationale", "assignment_status",
-                     "secondary_attributes"],
+                     "runner_up_segment_id", "facet_ids"],
         "additionalProperties": False}}},
     "required": ["assignments"], "additionalProperties": False,
 }
 
 
-def assignment_schema(evidence_ids, segment_ids):
+def assignment_schema(evidence_ids, segment_ids, facet_ids=()):
     schema = copy.deepcopy(ASSIGN_SCHEMA)
     row = schema["properties"]["assignments"]["items"]["properties"]
     row["evidence_id"]["enum"] = list(evidence_ids)
     row["primary_segment_id"]["enum"] = [""] + list(segment_ids)
+    row["runner_up_segment_id"]["enum"] = [""] + list(segment_ids)
+    facets = list(facet_ids)
+    if facets:
+        row["facet_ids"]["items"]["enum"] = facets
+    else:
+        # No vocabulary means no legal tag, and an unconstrained array would let
+        # the free-text field back in through the schema's own gap.
+        row["facet_ids"]["maxItems"] = 0
     return schema
+
+
+def _normalize_assignment_contract(rows):
+    """Fill fields added after an assignment artifact was written.
+
+    Stage 05 is the most expensive stage in the pipeline, so a contract addition
+    must not invalidate a completed run: an older row is loadable, it simply has
+    no runner-up and no facets. What it must never do is look like a row that was
+    asked the question and answered `none` — `runner_up_recorded` marks the
+    difference so the co-occurrence graph is built only from rows that were.
+    """
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row["runner_up_recorded"] = "runner_up_segment_id" in row
+        row.setdefault("runner_up_segment_id", "")
+        if "facet_ids" not in row:
+            row["facet_ids"] = []
+            # Preserve the pre-vocabulary free text rather than dropping it; it
+            # is not a closed tag and never becomes one, but it is the only
+            # record of what that run observed.
+            legacy = row.pop("secondary_attributes", None)
+            if legacy:
+                row["legacy_secondary_attributes"] = legacy
+        row.pop("secondary_attributes", None)
+    return rows
 
 
 def _demote(decisions, segment_id, failure):
@@ -2525,6 +2594,38 @@ def _legacy_job_fingerprint_v1(job, evidence_ids, corpus=""):
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _stage03a_compatible_fingerprints(jobs, chunks):
+    """Fingerprints of every earlier 03A contract whose results still migrate.
+
+    Each generation is authenticated by the exact schema, skill text and contract
+    version it ran under, so a finished chunk is recognised as completed work
+    rather than silently re-harvested. Registers are taught entirely in the skill
+    text, which is why the register-less generation shares this generation's
+    prompt and differs only by schema, snapshot and version.
+    """
+    compatible = {}
+    for job, chunk in zip(jobs, chunks):
+        evidence_ids = chunk["evidence_ids"]
+        v1 = dataclasses.replace(
+            job, prompt=segmentation.legacy_harvest_prompt_v1(chunk["records"]),
+            schema=segmentation.legacy_harvest_schema_v1())
+        v2 = dataclasses.replace(
+            job, schema=segmentation.legacy_harvest_schema_v2(evidence_ids))
+        v3 = dataclasses.replace(
+            job, schema=segmentation.legacy_harvest_schema_v3(evidence_ids))
+        compatible[job.id] = {
+            _legacy_job_fingerprint_v1(
+                v1, evidence_ids, segmentation.LEGACY_HARVEST_SKILL_V1),
+            _job_fingerprint(
+                v2, evidence_ids, segmentation.LEGACY_HARVEST_SKILL_V2,
+                segmentation.LEGACY_HARVEST_CONTRACT_V2),
+            _job_fingerprint(
+                v3, evidence_ids, segmentation.LEGACY_HARVEST_SKILL_V3,
+                segmentation.LEGACY_HARVEST_CONTRACT_V2),
+        }
+    return compatible
+
+
 def _print_03a_contract_error(error, fallback_chunk=None):
     """Render a model-contract failure as an actionable pipeline event."""
     if getattr(error, "reported", False):
@@ -2722,6 +2823,47 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
     else:
         print(f"  {stage}: reusing all {len(jobs)} completed chunk(s)")
     return [complete[job.id] for job in jobs]
+
+
+def _finalize_stage04_facets(vocabulary, provisional_facets, decisions, candidates):
+    """Build the closed facet vocabulary from 04's decisions and 03A's discoveries.
+
+    A reclassified candidate hands its discovery evidence to the facet it became.
+    That evidence is not an audience count and never becomes one -- it is kept so
+    the facet can be traced back to the comments that produced it, which is the
+    only thing the old free-text `secondary_attributes` field could never do.
+    """
+    by_segment_id = {row["segment_id"]: row for row in candidates}
+    reclassified = []
+    for decision in decisions:
+        if decision.get("status") != "reclassified_as_facet":
+            continue
+        candidate = by_segment_id.get(decision["segment_id"])
+        key = str(decision.get("facet_key") or "").strip()
+        if not key:
+            # A reclassification with no destination would silently delete the
+            # candidate, so it falls back to its own slug rather than vanishing.
+            key = (candidate or {}).get("slug") or decision["segment_id"]
+            decision["facet_key"] = key
+        reclassified.append({
+            "facet_key": key,
+            "facet_type": decision.get("facet_type") or "attribute",
+            "name": (candidate or {}).get("name") or key,
+            "definition": (candidate or {}).get("definition") or "",
+            "segment_id": decision["segment_id"],
+            "evidence_ids": (candidate or {}).get("core_evidence_ids") or [],
+        })
+    facets, unknown = segmentation.finalize_facets(
+        vocabulary, provisional_facets, reclassified)
+    if unknown:
+        # The vocabulary is a tag set, not a count, so an unresolvable citation is
+        # dropped and reported rather than failing a stage that has already done
+        # its real work.
+        for row in unknown:
+            print(f"  ! 04 facet {row['facet_key']!r} cited "
+                  f"{len(row['unknown_ids'])} unknown provisional facet ID(s); "
+                  "dropped from its lineage")
+    return facets
 
 
 def _validate_decision_coverage(decisions, candidates):
@@ -3448,7 +3590,7 @@ def _completed_segmentation_inputs(cfg, voc):
     validated = [by_segment_id[row["segment_id"]] for row in decisions
                  if (row.get("status") == "validated"
                      and row.get("segment_id") in by_segment_id)]
-    assignments = _read_jsonl(assignments_path)
+    assignments = _normalize_assignment_contract(_read_jsonl(assignments_path))
     # The resume path must see the same taxonomy the full run would, or Stage 07
     # coalesces a segment set that Stage 05 never assigned against.
     validated = _apply_segment_floors(validated, decisions, cfg)
@@ -3914,27 +4056,9 @@ def cmd_segment(cfg, args):
     # revalidated and migrated; impossible provenance is cleaned deterministically,
     # while genuinely structural/semantic failures alone enter model repair.
     legacy_jobs03a = [dataclasses.replace(
-        job, schema=segmentation.HARVEST_SCHEMA) for job in jobs03a]
-    legacy_v2_jobs03a = [dataclasses.replace(
-        job, schema=segmentation.legacy_harvest_schema_v2(
-            chunk["evidence_ids"])) for job, chunk in zip(jobs03a, chunks03a)]
-    legacy_v1_jobs03a = [dataclasses.replace(
-        job, prompt=segmentation.legacy_harvest_prompt_v1(chunk["records"]),
-        schema=segmentation.legacy_harvest_schema_v1())
-        for job, chunk in zip(jobs03a, chunks03a)]
-    legacy_v1_fingerprints = {
-        job.id: {_legacy_job_fingerprint_v1(
-            job, chunk["evidence_ids"], segmentation.LEGACY_HARVEST_SKILL_V1)}
-        for job, chunk in zip(legacy_v1_jobs03a, chunks03a)
-    }
-    compatible_03a_fingerprints = {
-        job.id: legacy_v1_fingerprints[job.id] | {
-            _job_fingerprint(
-                legacy_v2, chunk["evidence_ids"],
-                segmentation.LEGACY_HARVEST_SKILL_V2,
-                segmentation.HARVEST_CONTRACT_VERSION)}
-        for job, legacy_v2, chunk in zip(jobs03a, legacy_v2_jobs03a, chunks03a)
-    }
+        job, schema=segmentation.pre_register_harvest_schema()) for job in jobs03a]
+    compatible_03a_fingerprints = _stage03a_compatible_fingerprints(
+        jobs03a, chunks03a)
     repair03a = (
         "Preserve every discovered candidate and every valid supporting evidence "
         "ID from the previous response. Correct only contract violations: "
@@ -4008,6 +4132,36 @@ def cmd_segment(cfg, args):
           f"candidates -> {catalogue_p}")
     if not catalogue:
         sys.exit("Stage 03A found no recurring candidate with at least two Core IDs.")
+
+    # Only the `segment` register continues into consolidation. Attributes and
+    # journey states become the facet vocabulary comments are tagged with;
+    # symptoms leave the taxonomy for skills 07/08. Every partition is written
+    # out, so nothing discovered here is lost — it is filed.
+    segment_rows, facet_rows, symptom_rows = segmentation.partition_by_register(
+        catalogue)
+    provisional_facets = segmentation.facet_catalogue(facet_rows)
+    # 03B is handed the register-free cards. The field is constant across every
+    # row that reaches it, so carrying it would add nothing to the prompt while
+    # changing the input fingerprint of every completed consolidation -- and the
+    # full catalogue above, plus the partition artifact below, already hold it.
+    catalogue = [{key: value for key, value in row.items() if key != "register"}
+                 for row in segment_rows]
+    registers_p = os.path.join(discovery, "03a_register_partition.json")
+    _json_atomic(registers_p, {
+        "segment_candidates": len(catalogue),
+        "facet_candidates": len(facet_rows),
+        "symptom_candidates": len(symptom_rows),
+        "provisional_facets": provisional_facets,
+        "symptoms": symptom_rows,
+    })
+    if facet_rows or symptom_rows:
+        print(f"  03A registers: {len(catalogue)} segment · "
+              f"{len(facet_rows)} facet ({len(provisional_facets)} after grouping) · "
+              f"{len(symptom_rows)} symptom -> {registers_p}")
+    if not catalogue:
+        sys.exit("Stage 03A found no candidate in the `segment` register. Every "
+                 f"discovery was an attribute, journey state or symptom.\n"
+                 f"  Review {registers_p}.")
 
     # ---------------------------------------------------------- 03B consolidate
     s03b = skill_named("03b_consolidate_segment_candidates.md")
@@ -4262,10 +4416,13 @@ def cmd_segment(cfg, args):
     # -------------------------------------------------------------- skill 04
     val_p = os.path.join(voc, "validated_segments.json")
     val_meta = val_p + ".meta.json"
-    candidate_fingerprint = _value_fingerprint(candidates)
+    facets_p = os.path.join(voc, "facet_vocabulary.json")
+    candidate_fingerprint = _value_fingerprint(
+        {"candidates": candidates, "provisional_facets": provisional_facets})
     if (os.path.exists(val_p) and not _segment_force(args, "04")
             and _meta_matches(val_meta, candidate_fingerprint)):
         decisions = _load_json(val_p)
+        facets = _load_json(facets_p) if os.path.exists(facets_p) else []
         print("  04 validate: reusing decisions")
     else:
         _, s04 = skill(4)
@@ -4278,6 +4435,25 @@ def cmd_segment(cfg, args):
             "enforced in code after you decide; validating below them only "
             "moves the decision, it does not make the segment.\n\n")
         scope_rule = corpus_policy.scope_prompt(cfg)
+        register_rule = (
+            "REGISTERS — a candidate that is a response to the problem or the "
+            "market (treatment preference, price stance, scepticism) or a point "
+            "in the treatment journey is not an audience. Give it "
+            "`reclassified_as_facet` with a `facet_key` and `facet_type` rather "
+            "than `rejected`: it keeps its language and becomes a tag every "
+            "comment can carry. Nothing has been assigned yet, so this costs "
+            "nothing now and cannot be done losslessly later.\n\n")
+        facet_packet = (
+            "PROVISIONAL FACET VOCABULARY — discovered at 03A and not yet "
+            "consolidated. Merge near-duplicates into one closed set in "
+            "`facet_vocabulary`, citing the provisional_facet_id values each "
+            "entry absorbs, and include every facet_key you reclassify a "
+            "candidate into.\n\n"
+            + json.dumps(provisional_facets, ensure_ascii=False, indent=2)
+            + "\n\n") if provisional_facets else (
+            "PROVISIONAL FACET VOCABULARY — 03A discovered none. Build "
+            "`facet_vocabulary` from the candidates you reclassify, or return "
+            "it empty.\n\n")
         validation_job = Job(
             id="04_validate",
             prompt=("Apply skill 04 to every compact candidate card below. The "
@@ -4285,13 +4461,16 @@ def cmd_segment(cfg, args):
                     "bounded representative sample, not the whole corpus. Give every "
                     "candidate exactly one decision.\n\n"
                     + floor_rule
+                    + register_rule
                     + ((scope_rule + "\nA candidate whose defining trait is a "
                         "diagnosis is out of scope: reject it, however coherent "
                         "its evidence.\n\n") if scope_rule else "")
+                    + facet_packet
                     + packet),
             max_tokens=STAGE04_TOKEN_TIERS[0],
             schema=validation_schema(
-                [row["segment_id"] for row in candidates]),
+                [row["segment_id"] for row in candidates],
+                [row["provisional_facet_id"] for row in provisional_facets]),
             effort=_segment_setting(cfg, "04_effort", None))
         print(f"  Stage 04 starting ceiling: "
               f"{_token_tier_label(STAGE04_TOKEN_TIERS[0])}")
@@ -4300,17 +4479,28 @@ def cmd_segment(cfg, args):
         if not confirm(c.estimate(s04, SEGMENT_PREAMBLE, [validation_job]),
                        getattr(args, "yes", False)):
             return
-        decisions = _run_single_structured(
+        validation = _run_single_structured(
             c, s04, SEGMENT_PREAMBLE, validation_job,
             os.path.join(diagnostics, "04_validate"),
             token_tiers=STAGE04_TOKEN_TIERS,
-            attempt_reporter=_report_stage04_attempt)["decisions"]
+            attempt_reporter=_report_stage04_attempt)
+        decisions = validation["decisions"]
         _validate_decision_coverage(decisions, candidates)
+        facets = _finalize_stage04_facets(
+            validation.get("facet_vocabulary"), provisional_facets,
+            decisions, candidates)
         _json_atomic(val_p, decisions)
+        _json_atomic(facets_p, facets)
         _json_atomic(val_meta, {"input_fingerprint": candidate_fingerprint})
         tally = Counter(d["status"] for d in decisions)
         print("  04 validate: " + " · ".join(
             f"{key} {value}" for key, value in tally.most_common()) + f" -> {val_p}")
+        if facets:
+            types = Counter(row["facet_type"] for row in facets)
+            print(f"  04 facets: {len(facets)} in the closed vocabulary ("
+                  + " · ".join(f"{key} {value}"
+                               for key, value in sorted(types.items()))
+                  + f") -> {facets_p}")
 
     by_segment_id = {candidate["segment_id"]: candidate
                      for candidate in candidates}
@@ -4336,27 +4526,41 @@ def cmd_segment(cfg, args):
     redo_assign = (force_assign
                    or not _meta_matches(asg_meta, assignment_fingerprint))
     if os.path.exists(asg_p) and not redo_assign:
-        rows = _read_jsonl(asg_p)
+        rows = _normalize_assignment_contract(_read_jsonl(asg_p))
         print(f"  05 assign: reusing {len(rows):,} assignments (--reassign to redo)")
+        if not any(row.get("runner_up_recorded") for row in rows):
+            print("  ! these assignments predate runner-up and facet recording; "
+                  "--reassign to collect them")
     else:
         _, s05 = skill(5)
         seg_defs = json.dumps(
             [{key: row[key] for key in ("segment_id", "slug", "name", "definition",
                                         "inclusion_criteria", "exclusion_criteria")}
              for row in validated], ensure_ascii=False, indent=2)
-        prefix = f"{s05}\n\n---\n\nTHE VALIDATED SEGMENTS:\n\n{seg_defs}\n"
+        facet_defs = json.dumps(
+            [{key: row[key] for key in ("facet_id", "facet_key", "name",
+                                        "definition", "facet_type")}
+             for row in facets], ensure_ascii=False, indent=2)
+        prefix = (f"{s05}\n\n---\n\nTHE VALIDATED SEGMENTS:\n\n{seg_defs}\n"
+                  f"\n---\n\nTHE FACET VOCABULARY — the closed set `facet_ids` "
+                  f"draws from. A facet tags a comment inside its segment; it is "
+                  f"never a second membership and carries no counts.\n\n"
+                  f"{facet_defs}\n")
         chunks05 = segmentation.chunk_by_tokens(
             items, int(_segment_setting(cfg, "05_chunk_tokens", 8000)), "05")
         jobs05 = [Job(
             id=chunk["chunk_id"],
             prompt=("Assign each evidence item by cue type. Assign only when the "
                     "winning score is >= 6 and the margin is >= 2; otherwise use the "
-                    "correct unassigned status. Tier is evidence strength, not "
+                    "correct unassigned status. Record the segment that scored "
+                    "second in runner_up_segment_id, and tag facets from the "
+                    "supplied vocabulary only. Tier is evidence strength, not "
                     "membership. Return exactly one row per ID.\n\nEVIDENCE:\n" +
                     _stage05_evidence_text(chunk["records"])),
             max_tokens=STAGE05_TOKEN_TIERS[0], schema=assignment_schema(
                 chunk["evidence_ids"],
-                [row["segment_id"] for row in validated]),
+                [row["segment_id"] for row in validated],
+                [row["facet_id"] for row in facets]),
             expected_ids=tuple(chunk["evidence_ids"]),
             effort=_segment_setting(cfg, "05_effort", None)) for chunk in chunks05]
         print(f"  05 assign: {len(items):,} items in {len(jobs05)} batched chunks")
@@ -4368,8 +4572,8 @@ def cmd_segment(cfg, args):
             force=force_assign)
         if artifacts05 is None:
             return
-        rows = [row for artifact in artifacts05
-                for row in artifact["assignments"]]
+        rows = _normalize_assignment_contract(
+            [row for artifact in artifacts05 for row in artifact["assignments"]])
         _require_exact_ids(rows, {row["id"] for row in items}, "skill 05 assignment")
         # Enforced before the rows are persisted, so the saved contract and the
         # reused-from-cache path can never disagree about what was assigned.
@@ -4385,12 +4589,54 @@ def cmd_segment(cfg, args):
     if not validated:
         sys.exit("  No segment cleared the evidence floor after assignment.\n"
                  f"  Review {asg_p} — every item kept its score and rationale.")
-    build_evidence_files(cfg, validated, rows, by_id, voc)
+    _write_cooccurrence_tally(rows, validated, voc)
+    build_evidence_files(cfg, validated, rows, by_id, voc, facets)
     _run_commercial_layers(
         c, cfg, args, items, by_id, validated, decisions, rows)
 
 
-def build_evidence_files(cfg, validated, rows, by_id, voc):
+def _write_cooccurrence_tally(rows, validated, voc):
+    """Tally how often each pair of segments came first and second.
+
+    This is raw measurement, not a graph: no edge is declared, no threshold is
+    applied, and nothing downstream reads it yet. It exists because `winning_margin`
+    was already being computed against *some* segment and then discarded, and
+    because two audiences that repeatedly place first and second in the same
+    comments overlap in the market whatever the taxonomy says about them.
+    """
+    known = {row["segment_id"]: row["slug"] for row in validated}
+    pairs = Counter()
+    measured = 0
+    for row in rows:
+        if not row.get("runner_up_recorded"):
+            continue
+        winner, runner_up = row.get("primary_segment_id"), row.get("runner_up_segment_id")
+        if row.get("assignment_status") != "assigned" or not runner_up:
+            continue
+        if winner not in known or runner_up not in known or winner == runner_up:
+            continue
+        measured += 1
+        pairs[tuple(sorted((winner, runner_up)))] += 1
+    path = os.path.join(voc, "segment_cooccurrence.json")
+    _json_atomic(path, {
+        "measured_from_assignments": measured,
+        "note": ("Raw first-and-second counts from Stage 05. Not edges, not "
+                 "thresholded, not yet consumed downstream."),
+        "pairs": [{"segment_ids": list(pair), "slugs": [known[pair[0]], known[pair[1]]],
+                   "count": count}
+                  for pair, count in sorted(pairs.items(),
+                                            key=lambda kv: (-kv[1], kv[0]))],
+    })
+    if pairs:
+        top = ", ".join(f"{known[a]}↔{known[b]} {count}"
+                        for (a, b), count in sorted(
+                            pairs.items(), key=lambda kv: (-kv[1], kv[0]))[:3])
+        print(f"  05 co-occurrence: {len(pairs)} segment pair(s) from {measured:,} "
+              f"assignments ({top}) -> {path}")
+    return path
+
+
+def build_evidence_files(cfg, validated, rows, by_id, voc, facets=()):
     """Skill 06 — pure assembly, deterministic, plus the audit set.
 
     The skill file is loaded and written beside the output as the build contract:
@@ -4402,6 +4648,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
     files. An item carrying more than one active assignment fails the build.
     """
     ev = paths.evidence(cfg["_dir"]); os.makedirs(ev, exist_ok=True)
+    facets_by_id = {row["facet_id"]: row for row in facets or ()}
     _, s06 = skill(6)
     with open(os.path.join(voc, "06_build_contract.md"), "w",
               encoding="utf-8") as fh:
@@ -4453,6 +4700,8 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
         }
         tiers = Counter(
             by_id[r["evidence_id"]].get("tier", "context") for r in rs)
+        facet_tally = Counter(facet_id for r in rs
+                              for facet_id in r.get("facet_ids") or [])
         p = os.path.join(ev, f"{s['slug']}.txt")
         with open(p, "w", encoding="utf-8") as fh:
             fh.write(f"{s['name'].upper()}\n{'=' * 72}\n\n")
@@ -4463,6 +4712,19 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
             fh.write("INCLUSION\n" + "".join(f"  - {x}\n" for x in s["inclusion_criteria"]))
             fh.write("EXCLUSION\n" + "".join(f"  - {x}\n" for x in s["exclusion_criteria"]))
             fh.write("\nEach item appears in this segment only once.\n\n")
+            if facet_tally:
+                # Facets describe the people already in this segment. The counts
+                # are shares of this file, never audience sizes, and they are
+                # printed here so an extractor can see the split without leaving
+                # the evidence file it is required to read.
+                fh.write(f"FACETS PRESENT\n{'-' * 72}\n")
+                for facet_id, count in sorted(
+                        facet_tally.items(), key=lambda kv: (-kv[1], kv[0])):
+                    facet = facets_by_id.get(facet_id, {})
+                    label = facet.get("name") or facet_id
+                    kind = facet.get("facet_type") or "attribute"
+                    fh.write(f"  - {label} [{kind}]: {count} of {len(rs)} items\n")
+                fh.write("\n")
             fh.write(f"EVIDENCE ITEMS\n{'-' * 72}\n")
             for r in rs:
                 it = by_id[r["evidence_id"]]
@@ -4474,6 +4736,10 @@ def build_evidence_files(cfg, validated, rows, by_id, voc):
                 fh.write(f"WINNING MARGIN: {r['winning_margin']}\n")
                 fh.write(f"PRIMARY CUES: {', '.join(r['primary_cues'])}\n")
                 fh.write(f"CUE TYPES: {', '.join(r['cue_types'])}\n")
+                if r.get("facet_ids"):
+                    fh.write("FACETS: " + ", ".join(
+                        facets_by_id.get(facet_id, {}).get("name") or facet_id
+                        for facet_id in r["facet_ids"]) + "\n")
                 fh.write(f"RATIONALE: {r['rationale']}\n")
                 fh.write(f"TEXT: {it['text']}\n\n")
         print(f"  {s['slug']:38} {len(rs):>6,} items -> {p}")

@@ -66,8 +66,15 @@ Then each evidence item, verbatim, with:
 evidence ID · source type · title · URL · original text (unaltered)
 · evidence tier (core / supporting / context)
 · assignment score · winning margin · primary cues · assignment rationale
+· facets (closed vocabulary, where present)
 · thread ID / author ID / created date (where available)
 ```
+
+Facets are attributes and journey states carried by the people already in this
+segment — cost-sensitive, brace user, post-op. They are recorded per item and
+tallied in the header as a share of the file. They are never a second membership
+and never an audience size: a facet appearing on 40 of 120 items describes those
+120 people, it does not describe a segment of 40.
 
 Example of one item, to fix the shape:
 

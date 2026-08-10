@@ -239,7 +239,7 @@ class AssignmentThresholdTests(unittest.TestCase):
         return [{"evidence_id": n, "primary_segment_id": "seg_001",
                  "score": score, "winning_margin": margin,
                  "cue_types": [], "primary_cues": [], "rationale": "why",
-                 "assignment_status": "assigned", "secondary_attributes": []}
+                 "assignment_status": "assigned", "runner_up_segment_id": "", "facet_ids": []}
                 for n, (score, margin) in enumerate(scores, 1)]
 
     def few_bad(self, *scores):

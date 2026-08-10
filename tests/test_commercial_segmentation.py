@@ -53,16 +53,16 @@ class CommercialSegmentationTests(unittest.TestCase):
         self.assignments = [
             {"evidence_id": 1, "primary_segment_id": "seg_001",
              "assignment_status": "assigned", "score": 9, "winning_margin": 4,
-             "secondary_attributes": []},
+             "runner_up_segment_id": "", "facet_ids": []},
             {"evidence_id": 2, "primary_segment_id": "seg_001",
              "assignment_status": "assigned", "score": 8, "winning_margin": 3,
-             "secondary_attributes": ["surgery avoidant"]},
+             "runner_up_segment_id": "", "facet_ids": ["fac_001"]},
             {"evidence_id": 3, "primary_segment_id": "seg_002",
              "assignment_status": "assigned", "score": 8, "winning_margin": 3,
-             "secondary_attributes": []},
+             "runner_up_segment_id": "", "facet_ids": []},
             {"evidence_id": 4, "primary_segment_id": "seg_010",
              "assignment_status": "assigned", "score": 7, "winning_margin": 2,
-             "secondary_attributes": []},
+             "runner_up_segment_id": "", "facet_ids": []},
         ]
         self.payload = {
             "canonical_segments": [{

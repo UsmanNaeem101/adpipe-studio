@@ -1,12 +1,40 @@
 {
   "records": [
-    {"id": 101, "tier": "core", "text": "After ten hours at my laptop my neck locks up and I need something I can use at my desk."},
-    {"id": 102, "tier": "core", "text": "My software job keeps me at a desk all day; the pain starts before I log off."},
-    {"id": 201, "tier": "core", "text": "I wake up with neck pain whenever I sleep on my side, especially on my current pillow."},
-    {"id": 202, "tier": "core", "text": "As a side sleeper I keep buying pillows but still wake with a stiff neck."},
-    {"id": 301, "tier": "core", "text": "I am a dentist and leaning over patients all day leaves my neck burning."},
-    {"id": 302, "tier": "core", "text": "Chairside work in my dental practice has caused years of neck strain."},
-    {"id": 999, "tier": "core", "text": "The parcel arrived yesterday and the outer box was green."}
+    {
+      "id": 101,
+      "tier": "core",
+      "text": "After ten hours at my laptop my neck locks up and I need something I can use at my desk."
+    },
+    {
+      "id": 102,
+      "tier": "core",
+      "text": "My software job keeps me at a desk all day; the pain starts before I log off."
+    },
+    {
+      "id": 201,
+      "tier": "core",
+      "text": "I wake up with neck pain whenever I sleep on my side, especially on my current pillow."
+    },
+    {
+      "id": 202,
+      "tier": "core",
+      "text": "As a side sleeper I keep buying pillows but still wake with a stiff neck."
+    },
+    {
+      "id": 301,
+      "tier": "core",
+      "text": "I am a dentist and leaning over patients all day leaves my neck burning."
+    },
+    {
+      "id": 302,
+      "tier": "core",
+      "text": "Chairside work in my dental practice has caused years of neck strain."
+    },
+    {
+      "id": 999,
+      "tier": "core",
+      "text": "The parcel arrived yesterday and the outer box was green."
+    }
   ],
   "candidates": [
     {
@@ -14,28 +42,54 @@
       "provisional_name": "Desk-bound knowledge workers",
       "audience_cue": "long computer-based workdays",
       "why_commercially_distinct": "workday ergonomic positioning and desk-use solutions",
-      "evidence_ids": [101, 102],
-      "cue_terms": ["laptop", "desk", "software job"],
-      "discovery_strength": "strong"
+      "evidence_ids": [
+        101,
+        102
+      ],
+      "cue_terms": [
+        "laptop",
+        "desk",
+        "software job"
+      ],
+      "discovery_strength": "strong",
+      "register": "segment"
     },
     {
       "candidate_key": "side_sleepers_with_morning_neck_pain",
       "provisional_name": "Side sleepers with morning neck pain",
       "audience_cue": "pain and stiffness after side sleeping",
       "why_commercially_distinct": "sleep-position and pillow-specific messaging",
-      "evidence_ids": [201, 202],
-      "cue_terms": ["side sleeper", "wake up", "pillow"],
-      "discovery_strength": "strong"
+      "evidence_ids": [
+        201,
+        202
+      ],
+      "cue_terms": [
+        "side sleeper",
+        "wake up",
+        "pillow"
+      ],
+      "discovery_strength": "strong",
+      "register": "segment"
     },
     {
       "candidate_key": "dental_professionals_with_chairside_strain",
       "provisional_name": "Dental professionals with chairside strain",
       "audience_cue": "sustained leaning over dental patients",
       "why_commercially_distinct": "profession-specific posture and between-patient relief",
-      "evidence_ids": [301, 302],
-      "cue_terms": ["dentist", "patients", "chairside"],
-      "discovery_strength": "strong"
+      "evidence_ids": [
+        301,
+        302
+      ],
+      "cue_terms": [
+        "dentist",
+        "patients",
+        "chairside"
+      ],
+      "discovery_strength": "strong",
+      "register": "segment"
     }
   ],
-  "unassigned_evidence_ids": [999]
+  "unassigned_evidence_ids": [
+    999
+  ]
 }
