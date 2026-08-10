@@ -28,6 +28,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -56,6 +57,32 @@ PRICING = {
 # accepted downstream — it only keeps the request from bouncing.
 _WIRE_DROP_KEYS = ("uniqueItems", "minItems", "maxItems", "minLength",
                    "maxLength", "pattern", "minProperties", "maxProperties")
+
+
+# Providers word this differently ("max_tokens is too large", "maximum output
+# tokens", "exceeds the maximum completion tokens"), so match the subject rather
+# than any one phrasing — and require a size word so an unrelated mention of
+# max_tokens is not read as a ceiling complaint.
+_MAX_TOKENS_ERROR = re.compile(
+    r"(max_tokens|max output tokens|maximum output tokens|completion tokens)"
+    r"[^.]{0,80}?(too (large|high|big)|exceed|greater than|at most|maximum|limit)"
+    r"|(too (large|high|big)|exceed|greater than|at most|maximum|limit)"
+    r"[^.]{0,80}?(max_tokens|max output tokens|maximum output tokens|completion tokens)",
+    re.I)
+
+
+def _stated_token_limit(detail, asked):
+    """The largest number in the error that is a plausible ceiling, or None.
+
+    Plausible means "smaller than what we asked for and big enough to answer
+    with": a provider's message also contains the rejected value and sometimes
+    a model id or an error code, and retrying at one of those would replace a
+    too-high ceiling with a nonsensical one.
+    """
+    candidates = [int(n) for n in re.findall(r"\d[\d,]*", detail.replace(",", ""))
+                  if n.isdigit()]
+    usable = [n for n in candidates if 256 <= n < asked]
+    return max(usable) if usable else None
 
 
 def _provider_safe_schema(schema):
@@ -104,10 +131,15 @@ class Estimate:
 class Client:
     """Drop-in for llm.Client. Same method names so cli.py doesn't branch."""
 
-    def __init__(self, model=DEFAULT_MODEL, effort="high", verbose=True, api_key=None):
+    def __init__(self, model=DEFAULT_MODEL, effort="high", verbose=True, api_key=None,
+                 max_output=None):
         self.model = model or DEFAULT_MODEL
         self.effort = effort
         self.verbose = verbose
+        # Declared, never guessed. OpenRouter routes to third-party providers
+        # whose output ceilings are not discoverable from here, and a ceiling
+        # guessed too low silently truncates work the route would have finished.
+        self.max_output = int(max_output) if max_output else None
         try:
             # An explicit constructor value is useful to callers that already
             # resolved a key. Otherwise use the same env -> private-store
@@ -229,6 +261,35 @@ class Client:
                 audit.event("http_error", detail_full, status=e.code,
                             attempt=attempt + 1, will_retry=(
                                 e.code in (429, 500, 502, 503) and attempt < retries - 1))
+                # An output ceiling above what the route accepts. This is the top
+                # of a recovery ladder, so exiting here would kill the process at
+                # the exact moment the pipeline was trying to recover — the same
+                # shape as a recovery that fails worse than the request it is
+                # recovering. Retry once at the limit the route names, and if it
+                # names none, fail with the setting that fixes it rather than an
+                # HTTP dump.
+                over_budget = (e.code in (400, 404, 422)
+                               and _MAX_TOKENS_ERROR.search(detail))
+                if over_budget:
+                    allowed = _stated_token_limit(detail, max_tokens)
+                    if allowed:
+                        if self.verbose:
+                            print(f"  ! this OpenRouter route caps output at "
+                                  f"{allowed:,} tokens (asked for {max_tokens:,}); "
+                                  f"retrying at the cap")
+                        return self._post(messages, allowed, schema=schema,
+                                          retries=retries, job_id=job_id,
+                                          operation=operation + "_capped",
+                                          effort=effort,
+                                          send_reasoning=send_reasoning,
+                                          reasoning_max_tokens=reasoning_max_tokens)
+                    sys.exit(
+                        f"  This OpenRouter route rejected max_tokens={max_tokens:,} "
+                        f"and did not state its limit.\n"
+                        f"  Declare it in project.json so the pipeline stops asking "
+                        f"for more than the route allows:\n"
+                        f'    "model": {{"max_output_tokens": 16384}}\n'
+                        f"  Provider said: {detail}")
                 # Not every route accepts the reasoning control. Drop it and keep
                 # the request rather than failing the stage — the sized budget
                 # and the audited re-run still cover us if the route then
@@ -308,6 +369,10 @@ class Client:
             prompt_tokens=sum(self._tokens(j.prompt) for j in jobs),
             out_tokens=sum(int(j.max_tokens * 0.55) for j in jobs),
             model=self.model)
+
+    def max_output_tokens(self):
+        """The declared ceiling for this route, or None if none was declared."""
+        return self.max_output
 
     def prewarm(self, corpus, preamble):
         """No-op: there is no controllable cache to warm here."""

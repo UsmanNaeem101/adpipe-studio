@@ -47,6 +47,23 @@ BATCH = 0.50            # Batch API discount
 CACHE_MIN_TOKENS = 512  # Opus 5 minimum cacheable prefix; below this it silently won't cache
 HAIKU_THINKING_BUDGET = 4096
 
+# The maximum `max_tokens` each model will accept, per Anthropic's published
+# limits. A recovery ladder is only a ladder if its top rung can be stood on:
+# a tier above these is rejected outright, so escalating into one converts a
+# recoverable budget stop into a failed request — the same shape as the bug
+# where the recovery reasoned harder than the request it was recovering.
+MAX_OUTPUT_TOKENS = {
+    "claude-opus-5": 128000,
+    "claude-fable-5": 128000,
+    "claude-opus-4-8": 128000,
+    "claude-opus-4-7": 128000,
+    "claude-opus-4-6": 128000,
+    "claude-sonnet-5": 128000,
+    "claude-sonnet-4-6": 128000,
+    "claude-haiku-4-5": 64000,
+    "claude-haiku-4-5-20251001": 64000,
+}
+
 
 @dataclass
 class Job:
@@ -355,6 +372,15 @@ class Client:
                               reasoning_max_tokens)
         params.pop("max_tokens")
         return self.client.messages.count_tokens(**params).input_tokens
+
+    def max_output_tokens(self):
+        """The largest `max_tokens` this model accepts, or None if unknown.
+
+        None means "do not clamp": silently lowering a ceiling that the route
+        would have honoured is its own truncation bug, so an unrecognised model
+        keeps whatever the stage asked for and finds out from the provider.
+        """
+        return MAX_OUTPUT_TOKENS.get(self.model)
 
     def estimate(self, corpus, preamble, jobs, batched=False) -> Estimate:
         """Price a stage before running it. Counts the corpus once and each job's

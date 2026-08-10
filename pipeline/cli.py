@@ -221,7 +221,13 @@ def client(cfg, args):
     name = getattr(args, "model", None) or m.get("id")
     if provider == "openrouter":
         import openrouter
-        return openrouter.Client(model=name or openrouter.DEFAULT_MODEL, effort=effort)
+        # OpenRouter fronts hundreds of third-party routes whose output ceilings
+        # are the provider's business and not published anywhere this code can
+        # read, so the ceiling is declared per project rather than guessed:
+        # "model": {"max_output_tokens": 16384}. Absent, nothing is clamped and
+        # an over-large request is reported by the route itself.
+        return openrouter.Client(model=name or openrouter.DEFAULT_MODEL, effort=effort,
+                                 max_output=m.get("max_output_tokens"))
     from llm import Client
     return Client(model=name or "claude-opus-5", effort=effort)
 
@@ -427,6 +433,44 @@ STAGE05_ANTHROPIC_BATCH_INTERVAL_SECONDS = 65
 STAGE05_GRAMMAR_RETRY_ATTEMPTS = 2
 ADAPTIVE_OPENROUTER_WAVE_SIZE = 4
 ADAPTIVE_PROGRESS_WIDTH = 20
+
+
+def _model_ceiling(client_):
+    """The client's own output ceiling, or None when it does not publish one."""
+    ask = getattr(client_, "max_output_tokens", None)
+    try:
+        return ask() if callable(ask) else None
+    except Exception:
+        # A ceiling lookup must never be the thing that fails a stage.
+        return None
+
+
+def _clamp_tiers(tiers, ceiling, stage="", verbose=True):
+    """Bound a recovery ladder to what the model will actually accept.
+
+    A ladder is only a ladder if its top rung can be stood on. Stage 04's ladder
+    tops out at 256,000 tokens and Stage 03B's and 07's at 128,000 — above what
+    several models accept — so escalating into one turns a recoverable budget
+    stop into a rejected request, which is the failure mode the ladder exists to
+    prevent. Clamping keeps every rung reachable.
+
+    Tiers above the ceiling collapse onto it rather than being dropped, so a
+    stage keeps its final attempt at the highest budget available instead of
+    quietly losing its last retry. A ceiling of None (an unrecognised model)
+    leaves the ladder alone: silently lowering a ceiling the route would have
+    honoured is its own truncation bug.
+    """
+    if not ceiling or not tiers:
+        return tuple(tiers)
+    if max(tiers) <= ceiling:
+        return tuple(tiers)
+    clamped = tuple(dict.fromkeys(min(t, ceiling) for t in tiers))
+    if verbose:
+        label = f"Stage {stage} " if stage else ""
+        print(f"  ! {label}ceiling {_token_tier_label(max(tiers))} exceeds this "
+              f"model's {_token_tier_label(ceiling)} output limit — using "
+              f"{', '.join(_token_tier_label(t) for t in clamped)}")
+    return clamped
 
 
 @dataclasses.dataclass
@@ -708,7 +752,10 @@ def _run_adaptive_stage(client_, corpus, preamble, jobs, diagnostics_dir, *,
     if stats.stage != stage:
         raise ValueError(f"Stage {stage} stats were labelled for Stage {stats.stage}")
 
-    requested_start = max(job.max_tokens for job in jobs)
+    # Bound the ladder before anything is scheduled, so a stage never escalates
+    # into a ceiling the model will reject.
+    token_tiers = _clamp_tiers(token_tiers, _model_ceiling(client_), stage=stage)
+    requested_start = min(max(job.max_tokens for job in jobs), max(token_tiers))
     tier_index = next(
         (index for index, tier in enumerate(token_tiers)
          if tier >= requested_start), len(token_tiers) - 1)
@@ -919,9 +966,13 @@ def _run_single_structured(client_, corpus, preamble, job, diagnostics_dir,
     malformed/schema-invalid reply gets one shape-only repair. At no point does
     an empty budget-starved response reach the JSON parser.
     """
-    tiers = _single_call_tiers(job.max_tokens, token_tiers)
+    # Same clamp as the batched path: the job's own starting budget is bounded
+    # too, since a stage can open at a tier the model would already reject.
+    ceiling = _model_ceiling(client_)
+    tiers = _clamp_tiers(_single_call_tiers(job.max_tokens, token_tiers), ceiling)
     tier_index = 0
-    current = job
+    current = job if job.max_tokens <= tiers[0] else dataclasses.replace(
+        job, max_tokens=tiers[0])
     repairing = False
     pending_result = (_as_result(initial_result)
                       if initial_result is not None else None)
