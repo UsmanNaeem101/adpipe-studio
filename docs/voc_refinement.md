@@ -32,8 +32,35 @@ production. When a
 surviving canonical record owns Stage 02 duplicate groups, the exact group objects
 are attached under `dedup_groups`.
 
-For the normal retained/deduplicated input both files contain the same records in the
-same order. Re-running against identical inputs produces identical bytes.
+Audit holds every input row; production holds the subset that clears the corpus
+policies below. A row held out carries `production_excluded` on its audit record,
+naming the rule that held it. Re-running against identical inputs produces identical
+bytes.
+
+## Corpus policies
+
+Both are applied here rather than at ingest, because this stage is deterministic and
+free. Retuning either one is a re-run of `refine-voc` — no model call, no cost — and
+nothing is deleted, so every held-back record is recoverable from the audit file.
+
+**Corroboration** (always on). A first-person account needs one other retention
+reason; anything else needs three. Held-back rows are marked
+`single_uncorroborated_signal` or `uncorroborated_second_hand_report`. Rows that
+predate Stage 01's reason vocabulary — a lean production file with a persisted tier
+and no reason codes — are passed through untouched rather than judged on absent
+evidence.
+
+**Population scope** (`audience.population_scope` in `project.json`). `all` is the
+default and excludes nobody. `mainstream` drops communities organised around a
+diagnosis, marking them `out_of_scope_community`, and tells skills 01 and 04 to treat
+a named condition as out of scope. Projects extend the built-in list with
+`audience.excluded_subreddits`; `audience.included_subreddits` overrules both the
+built-in list and the project's own exclusions, so a project whose audience genuinely
+lives in one of those communities can say so.
+
+This is a reach-versus-intensity trade, not a quality filter: people managing a
+chronic condition are often the most motivated buyers of a support product, and
+excluding them narrows who the research can speak for.
 
 ## Evidence tiers
 

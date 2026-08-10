@@ -140,6 +140,24 @@ TEMPLATE_PROJECT = {
         "topic": "", "pain": "", "first_person": "", "solution": "",
         "emotion": "", "product": "", "min_words": 12, "min_score": 2,
     },
+    "audience": {
+        "_comment": "Who counts as this market. 'all' researches everyone who "
+                    "mentions the topic. 'mainstream' excludes communities "
+                    "organised around a diagnosis and tells skills 01 and 04 to "
+                    "treat a named condition as out of scope — narrower voices, "
+                    "broader market. Nothing is deleted either way: excluded "
+                    "records stay in audit_voc.jsonl, so changing this setting "
+                    "and re-running refine-voc is free.",
+        "population_scope": "all",
+        "excluded_subreddits": [],
+        "included_subreddits": [],
+    },
+    "segmentation": {
+        "_comment": "Floors a validated segment must clear. Below either one it "
+                    "is demoted to needs_more_research: too few conversations is "
+                    "a thread, not an audience.",
+        "min_segment_threads": 4, "min_segment_evidence": 8,
+    },
     "compliance": {
         "_comment": "Which qa.py ruleset applies. Use 'health_adjacent' for anything "
                     "wellness-adjacent; it is the strict Meta set.",

@@ -87,6 +87,8 @@ class ReasonVocabularyTests(unittest.TestCase):
         """The skill is the spec; cli.py mirrors it. Fail loudly on drift."""
         self.assertEqual(cli.RETENTION_REASONS, self.skill_codes("Retention"))
         self.assertEqual(cli.REJECTION_REASONS, self.skill_codes("Rejection"))
+        self.assertEqual(cli.SCOPED_REJECTION_REASONS,
+                         cli.REJECTION_REASONS + self.skill_codes("Scoped rejection"))
 
     def test_schema_constrains_reasons_to_the_vocabulary(self):
         item = cli.FILTER_SCHEMA["properties"]["records"]["items"]

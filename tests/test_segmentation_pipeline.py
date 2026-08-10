@@ -1150,7 +1150,11 @@ class SegmentCommandIntegrationTests(unittest.TestCase):
         cli._write_jsonl(os.path.join(voc, cli.AUDIT_VOC_FILE), rows)
         return {"_dir": root, "name": "test", "segmentation": {
             "03a_chunk_tokens": 10000, "03e_chunk_tokens": 10000,
-            "03c_chunk_tokens": 10000, "05_chunk_tokens": 10000}}
+            "03c_chunk_tokens": 10000, "05_chunk_tokens": 10000,
+            # Scaled to this five-record fixture rather than switched off. These
+            # tests are about contracts, resume and caching, but the floor stays
+            # in the path so a change that breaks it still shows up here.
+            "min_segment_evidence": 4}}
 
     def test_complete_pipeline_persists_contracts_and_second_run_is_free(self):
         with tempfile.TemporaryDirectory() as tmp:

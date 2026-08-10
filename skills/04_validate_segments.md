@@ -24,6 +24,17 @@ distinctiveness, messaging distinctiveness, and commercial actionability. Volume
 *one* input among nine — never the only one. Watch especially for a "segment" whose
 evidence all traces to a single thread; that's a conversation, not an audience.
 
+**Thread diversity is a floor, not a factor.** A candidate drawn from very few
+conversations cannot be validated no matter how strong the other eight signals look —
+sixty comments from four threads is four people and their repliers, and the pipeline
+demotes such a candidate to `needs_more_research` in code after you decide. Sending it
+back yourself, with a rationale, is better than having it overturned.
+
+Also watch for the near-duplicate pair: two candidates describing the same people
+through slightly different language. Each looks defensible alone, and together they
+guarantee that evidence matching both will be dropped downstream as ambiguous. Merge
+them.
+
 You receive compact candidate cards, deterministic Core/Supporting/Context counts,
 thread/subreddit counts, and bounded verbatim representative evidence. Treat the
 counts as code-computed facts; judge what they mean. Do not demand or reconstruct the

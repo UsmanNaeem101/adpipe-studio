@@ -28,8 +28,8 @@ Evaluate each evidence item against every validated segment, and score the fit b
 kind of cue it is:
 
 ```
-explicit_self_identification      5    "as a side sleeper…"
-dominant_context_match            5    the whole comment sits in that context
+explicit_self_identification      6    "as a side sleeper…"
+dominant_context_match            6    the whole comment sits in that context
 segment_specific_problem          4
 segment_specific_constraint       3
 segment_specific_failed_solution  3
@@ -43,6 +43,13 @@ segment-specific problem → constraint → failed solution → incidental keywo
 second-best by a margin of at least **2**. If two segments tie, don't assign unless one
 has clearly stronger explicit contextual evidence. Everything else is unassigned, with
 the reason recorded:
+
+The top two cues are worth the threshold on their own, and nothing else is. That is
+deliberate: someone who says plainly which audience they belong to has told you, and
+one clear statement is enough. A problem, a constraint or a failed solution is
+circumstantial by comparison — any of those needs a second cue to corroborate it,
+exactly as two weak cues together are not a substitute for one strong one. A passing
+keyword earns nothing and never carries an assignment.
 
 ```
 assigned · unassigned_ambiguous · unassigned_insufficient_evidence

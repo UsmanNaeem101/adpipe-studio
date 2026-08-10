@@ -66,7 +66,11 @@ class VocRefinementTests(unittest.TestCase):
                 "title": "External source",
                 "evidence_id": 9,
                 "decision": "retain",
-                "retention_reasons": ["specific_problem"],
+                # Three signals and no first-person account: the corroboration
+                # gate's other route through. These tests are about the export's
+                # plumbing, so the fixture has to clear the gate to reach it.
+                "retention_reasons": ["specific_problem", "attempted_solution",
+                                      "outcome"],
                 "rejection_reasons": [],
                 "duplicate_of": None,
             },
@@ -212,7 +216,8 @@ class VocRefinementTests(unittest.TestCase):
             os.makedirs(voc)
             cli._write_jsonl(os.path.join(voc, "deduplicated_voc.jsonl"), [
                 {"id": 1, "text": "source is unavailable", "decision": "retain",
-                 "retention_reasons": ["customer_terminology"]}
+                 "retention_reasons": ["first_person_experience",
+                                       "customer_terminology"]}
             ])
             cli.refine_voc({"_dir": tmp}, announce=False)
             production = cli._read_jsonl(os.path.join(

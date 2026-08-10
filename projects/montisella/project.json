@@ -15,6 +15,23 @@
     "min_words": 12,
     "min_score": 2
   },
+  "audience": {
+    "_comment": "Mainstream TAM: this product sells to ordinary people with desk-, sleep- and training-driven upper back pain, not to managed clinical populations. 'mainstream' excludes diagnosis-organised communities (see CLINICAL_SUBREDDITS in pipeline/corpus_policy.py) and tells skills 01 and 04 that a named condition puts a voice out of scope. The extra exclusions below are communities from the first montisella scrape that are on-topic by keyword only.",
+    "population_scope": "mainstream",
+    "excluded_subreddits": [
+      "evilautism",
+      "90DayFiance",
+      "FPSAimTrainer",
+      "flu",
+      "DressForYourBody"
+    ],
+    "included_subreddits": []
+  },
+  "segmentation": {
+    "_comment": "A validated segment must rest on at least this many distinct conversations and evidence items, or it is demoted to needs_more_research. The first run validated 70 segments, 19 of them on three threads or fewer.",
+    "min_segment_threads": 4,
+    "min_segment_evidence": 8
+  },
   "compliance": {
     "_comment": "Which qa.py ruleset applies. 'health_adjacent' is the strict Meta wellness set in qa.py. A non-health product would use a different profile.",
     "profile": "health_adjacent",

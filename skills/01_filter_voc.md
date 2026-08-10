@@ -57,8 +57,17 @@ real emotional reaction tied to the problem.
   problem, or buying detail.
 - Keep **short comments** when the signal is strong and specific ("mine went flat
   in a week" earns its place; "same" does not).
-- When in doubt on a borderline item that might carry signal, lean toward keeping
-  it and let a downstream skill decide — but never invent signal that isn't there.
+- On a borderline item, ask what a downstream stage could actually *do* with it.
+  One vague signal and nothing else is not evidence — it is a comment that
+  mentions the topic. Reject it as `insufficient_information` rather than
+  passing the decision along.
+
+That last point used to read "lean toward keeping it and let a downstream skill
+decide." It cost more than it saved: on a 4,977-record corpus that instruction
+retained 86%, of which the assignment stage could use 28% — and items retained on
+a single reason were used **1.2%** of the time. There is no downstream skill that
+turns a thin comment into evidence; there is only a later stage paying to read it
+before reaching the same conclusion you would have.
 
 Give every retained item one or more **retention reasons** (below).
 
@@ -79,6 +88,18 @@ a requoted passage adding nothing new
 Give every rejected item one or more **rejection reasons**. Note the boundary: a
 joke, insult, or profanity that *also* carries a real customer signal is retained —
 you're rejecting on absence of signal, not on tone.
+
+### When the run supplies an AUDIENCE SCOPE rule
+
+Some runs research a defined population rather than everyone who mentions the topic.
+When the prompt carries an AUDIENCE SCOPE block, apply it and reject out-of-scope
+voices with the scoped rejection code below. Without that block the code is absent
+from your schema and nobody is out of scope for who they are.
+
+This is the one rejection that is not about signal quality. An out-of-scope comment
+may be the best-written evidence in the batch, and you still reject it — so give it
+the scoped code and never a quality code, which is what keeps the exclusion
+countable, auditable and reversible.
 
 ## Hard boundaries (what this skill must not do)
 
@@ -108,6 +129,8 @@ yours.
 `generic_acknowledgement`, `reaction_only`, `joke_without_signal`,
 `insult_without_signal`, `off_topic`, `exact_duplicate`,
 `quotation_without_new_evidence`, `insufficient_information`.
+
+**Scoped rejection:** `clinical_population`.
 
 **Retention:** `first_person_experience`, `third_person_observation`,
 `specific_problem`, `specific_context`, `attempted_solution`, `product_experience`,

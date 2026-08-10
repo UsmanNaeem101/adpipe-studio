@@ -25,9 +25,26 @@ pipeline. Raw VOC never has to fit in one model context.
    is no novelty loop.
 6. **04 validation** receives compact candidate cards, code-computed metrics, and a
    bounded verbatim representative set. It retains its validate/merge/split/reject/
-   needs-more-research role.
+   needs-more-research role. Code then demotes any validated candidate below the
+   configured floors. These are *discovery* counts and therefore an upper bound on a
+   segment's real support, so this gate only catches the hopeless.
 7. **05 assignment** still gives each evidence item one primary validated segment or
-   an explicit unassigned status.
+   an explicit unassigned status. Two code gates follow it:
+   - **Thresholds.** Skill 05's own `score >= 6` / `margin >= 2` bar, which JSON
+     Schema cannot express as a conditional. Rows below it are demoted to
+     `unassigned_insufficient_evidence`, keeping their score, cues and rationale, and
+     audited to `_model_failures/05_assign/threshold_violations.jsonl`. Above 5% of
+     assignments the run fails instead: at that rate the stage is working to a
+     different rule, not slipping on edge cases.
+   - **Floors.** The gate that does the work. A Stage 03 card counts the threads a
+     candidate was *discovered* across, which systematically overstates support — one
+     montisella segment carried 16 threads on its card and 2 in the finished segment.
+     Re-checking against assigned evidence cut 70 validated segments to 38 where the
+     card-level gate cut one. Demoted segments return their evidence to the unassigned
+     pool, and Stages 06 and 07 both receive the reduced taxonomy.
+
+   `segmentation.min_segment_threads` (4) and `min_segment_evidence` (8) configure
+   both gates.
 8. **06 build** joins assignments to audit provenance in code and writes the evidence
    tier into every segment file.
 9. **07 commercial coalescing** uses compact research-segment cards to group peer,

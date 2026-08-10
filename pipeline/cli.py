@@ -43,6 +43,7 @@ import paths  # noqa: E402
 import presets  # noqa: E402
 import segmentation  # noqa: E402
 import commercial  # noqa: E402
+import corpus_policy  # noqa: E402
 from llm import BatchResult, NO_RETRY_STOP_REASONS  # noqa: E402
 
 SKILLS = os.path.join(ROOT, "skills")
@@ -343,6 +344,12 @@ REJECTION_REASONS = [
     "insult_without_signal", "off_topic", "exact_duplicate",
     "quotation_without_new_evidence", "insufficient_information",
 ]
+# Out-of-scope by audience, not by quality, and therefore not part of the base
+# vocabulary: a project researching the whole population must never be offered
+# this code. Kept distinct from `off_topic` so a scope decision stays countable
+# and reversible — flipping back to `all` should be answerable from the audit
+# file rather than another pass over the corpus.
+SCOPED_REJECTION_REASONS = REJECTION_REASONS + [corpus_policy.CLINICAL_POPULATION]
 RETENTION_REASONS = [
     "first_person_experience", "third_person_observation", "specific_problem",
     "specific_context", "attempted_solution", "product_experience",
@@ -369,6 +376,28 @@ FILTER_SCHEMA = {
         "additionalProperties": False}}},
     "required": ["records"], "additionalProperties": False,
 }
+
+
+def filter_schema(cfg):
+    """Stage 01's schema for this project's audience scope.
+
+    A project researching the whole population must not be offered
+    `clinical_population` as a rejection code. Leaving an unusable code in the
+    enum is how a policy gets applied by a stage that was never asked to apply
+    it — the model sees a code, infers a rule, and quietly narrows a corpus the
+    operator wanted whole.
+
+    The unscoped default returns the shared FILTER_SCHEMA object rather than a
+    copy of it. That is load-bearing: callers and test doubles identify this
+    stage by `schema is cli.FILTER_SCHEMA`, and handing back an equal-but-
+    distinct dict would break them silently.
+    """
+    if corpus_policy.scope(cfg) == corpus_policy.SCOPE_ALL:
+        return FILTER_SCHEMA
+    schema = copy.deepcopy(FILTER_SCHEMA)
+    schema["properties"]["records"]["items"]["properties"][
+        "rejection_reasons"]["items"]["enum"] = list(SCOPED_REJECTION_REASONS)
+    return schema
 
 DEDUP_SCHEMA = {
     "type": "object",
@@ -1640,6 +1669,7 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
 
     production, audit, seen_ids = [], [], set()
     subreddit_count = thread_count = 0
+    held_back = Counter()
     for position, source in enumerate(source_rows, 1):
         if not isinstance(source, dict):
             raise ValueError(f"VOC record {position} is not an object")
@@ -1657,7 +1687,19 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
         subreddit = subreddit or source.get("subreddit") or None
         thread_id = thread_id or source.get("thread_id") or None
         tier = segmentation.evidence_tier(source)
+        # Both corpus policies are applied here rather than at ingest, because
+        # this stage is deterministic and free: changing a project's scope or
+        # re-tuning the corroboration bar is a re-run of refine-voc, not another
+        # pass over 5,000 records at model prices. Held-back rows keep their
+        # place in the audit file with the rule that held them, so the decision
+        # is explainable and every one of them is recoverable.
+        held = None
         if tier is not None:
+            if corpus_policy.subreddit_excluded(subreddit, cfg):
+                held = corpus_policy.OUT_OF_SCOPE_SUBREDDIT
+            else:
+                held = corpus_policy.corroboration_cut(source)
+        if tier is not None and held is None:
             subreddit_count += int(subreddit is not None)
             thread_count += int(thread_id is not None)
             production.append({
@@ -1667,6 +1709,8 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
                 "subreddit": subreddit,
                 "tier": tier,
             })
+        elif held is not None:
+            held_back[held] += 1
 
         audit_row = {
             "id": source["id"],
@@ -1684,6 +1728,8 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
         for key, value in source.items():
             if key not in reserved:
                 audit_row[key] = value
+        if held is not None:
+            audit_row["production_excluded"] = held
         if groups_by_canonical.get(source["id"]):
             # Preserve the exact Stage 02 group objects and field names. The
             # envelope only associates them with their surviving canonical row.
@@ -1705,6 +1751,8 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
         "production_path": production_path,
         "audit_path": audit_path,
         "tiers": tiers,
+        "held_back": dict(held_back),
+        "audience_scope": corpus_policy.scope(cfg),
     }
     prompt_metrics = voc_prompt_view_metrics(production)
     summary.update(prompt_metrics)
@@ -1712,6 +1760,13 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
         print("\n  refine-voc (deterministic local export)")
         print(f"  Source:     {input_path}")
         print(f"  Input:      {summary['input']:,} deduplicated evidence items")
+        if held_back:
+            total_held = sum(held_back.values())
+            print(f"  Held back:  {total_held:,} record(s) "
+                  f"({total_held / max(len(source_rows), 1) * 100:.1f}%) — "
+                  f"kept in the audit file, withheld from research:")
+            for line in corpus_policy.summarise_exclusions(held_back):
+                print(line)
         print(f"  Production: {summary['production']:,} records")
         print(f"    -> {production_path}")
         print("  Evidence tiers:")
@@ -1762,13 +1817,23 @@ def cmd_ingest(cfg, args):
     voc = paths.voc(cfg["_dir"]); os.makedirs(voc, exist_ok=True)
 
     # ---- deterministic pre-pass: chrome + byte-identical captures ------------
+    # Out-of-scope communities are dropped here rather than left for skill 01 to
+    # judge. Membership of a diagnosis subreddit is a fact about the URL, not a
+    # reading of the comment, and paying a model to re-derive it costs tokens on
+    # every record the project has already decided it does not want.
     pre, seen, dropped = [], {}, Counter()
+    excluded_communities = Counter()
     for item in blocks:
         text = re.sub(r"\s+", " ", item["text"]).strip()
         if len(text.split()) < cfg["filter"].get("min_words", 8):
             dropped["too_short"] += 1; continue
         if BOILER.search(text):
             dropped["interface_chrome"] += 1; continue
+        subreddit, _thread = reddit_source_fields(item.get("url"))
+        if corpus_policy.subreddit_excluded(subreddit, cfg):
+            dropped[corpus_policy.OUT_OF_SCOPE_SUBREDDIT] += 1
+            excluded_communities[f"r/{subreddit}"] += 1
+            continue
         h = hashlib.sha256(text.lower().encode()).hexdigest()
         if h in seen:
             dropped["exact_duplicate"] += 1; continue
@@ -1777,6 +1842,12 @@ def cmd_ingest(cfg, args):
                     "url": item.get("url", ""), "title": item.get("title", "")})
 
     print(f"  parsed {len(blocks):,} records")
+    if excluded_communities:
+        print(f"  audience scope '{corpus_policy.scope(cfg)}' excluded "
+              f"{sum(excluded_communities.values()):,} record(s) from "
+              f"{len(excluded_communities)} community/ies:")
+        for line in corpus_policy.summarise_exclusions(excluded_communities):
+            print(line)
     for k, n in dropped.most_common():
         print(f"    pre-pass dropped {k:18} {n:,}")
     print(f"  {len(pre):,} records to judge")
@@ -1791,6 +1862,9 @@ def cmd_ingest(cfg, args):
 
     c = client(cfg, args)
     ctx = (f"MARKET CONTEXT: {cfg.get('product', '')} — {cfg.get('market', '')}\n")
+    scope_rule = corpus_policy.scope_prompt(cfg)
+    if scope_rule:
+        ctx += "\n" + scope_rule + "\n"
 
     # ---- skill 01 -----------------------------------------------------------
     # Judgement sections only: the record shape, the duplicate pass and the
@@ -1806,7 +1880,7 @@ def cmd_ingest(cfg, args):
                         + "\n\n".join(f"[{r['id']}] {r['text']}" for r in ch)),
                 # Stage 01 starts generously and learns a persistent floor from
                 # live route behaviour. Only max_tokens changes on promotion.
-                max_tokens=ADAPTIVE_TOKEN_TIERS[0], schema=FILTER_SCHEMA,
+                max_tokens=ADAPTIVE_TOKEN_TIERS[0], schema=filter_schema(cfg),
                 expected_ids=tuple(r["id"] for r in ch),
                 # Skill 01 is the bouncer at the door: retain or reject, with
                 # reasons drawn from a closed list. It is judgement, but it is
@@ -1952,6 +2026,19 @@ def validation_schema(segment_ids):
         "segment_id"]["enum"] = list(segment_ids)
     return schema
 
+# Mirrored from skills/05_assign_primary_segment.md § How to score an assignment.
+# The skill lists "the score/margin thresholds were ignored" as a run-failure
+# condition, but the thresholds lived only in prose: on the montisella run 118
+# rows were assigned below them and nothing noticed, because `score` and
+# `winning_margin` were read solely as sort keys. A declared contract that no
+# code checks is a suggestion.
+ASSIGN_MIN_SCORE = 6
+ASSIGN_MIN_MARGIN = 2
+# Above this share of assignments, the model is not slipping on edge cases — it
+# is working to a different rule than the one it was given, and quietly
+# repairing that many rows would hide a broken stage behind a clean output.
+ASSIGN_VIOLATION_LIMIT = 0.05
+
 ASSIGN_SCHEMA = {
     "type": "object",
     "properties": {"assignments": {"type": "array", "items": {
@@ -1959,8 +2046,8 @@ ASSIGN_SCHEMA = {
         "properties": {
             "evidence_id": {"type": "integer"},
             "primary_segment_id": {"type": "string"},
-            "score": {"type": "integer"},
-            "winning_margin": {"type": "integer"},
+            "score": {"type": "integer", "minimum": 0},
+            "winning_margin": {"type": "integer", "minimum": 0},
             "cue_types": {"type": "array", "items": {"type": "string"}},
             "primary_cues": {"type": "array", "items": {"type": "string"}},
             "rationale": {"type": "string"},
@@ -1984,6 +2071,154 @@ def assignment_schema(evidence_ids, segment_ids):
     row["evidence_id"]["enum"] = list(evidence_ids)
     row["primary_segment_id"]["enum"] = [""] + list(segment_ids)
     return schema
+
+
+def _demote(decisions, segment_id, failure):
+    """Record a floor demotion on the persisted Stage 04 decision."""
+    for decision in decisions:
+        if decision.get("segment_id") != segment_id:
+            continue
+        decision["status"] = "needs_more_research"
+        decision["rationale"] = (
+            f"{decision.get('rationale', '').rstrip()} "
+            f"[demoted by evidence floor: {failure}]").strip()
+        return
+
+
+def _apply_segment_floors(validated, decisions, cfg, verbose=True):
+    """Demote validated candidates too thin to be audiences, before assignment.
+
+    Skill 04 already rules that a single thread is a conversation rather than an
+    audience, but a rule stated only in prose is one the model can weigh against
+    everything else and decide it liked the candidate anyway.
+
+    These are *discovery* counts — how much of the corpus the candidate was
+    drawn from — so they are an upper bound on the segment's real support and
+    this gate only catches candidates that were hopeless from the start. The
+    floor that does the work runs after assignment, below.
+
+    Demotion is to `needs_more_research`, not `rejected`: a thin candidate is
+    usually a real audience the corpus under-samples, and it should come back if
+    a later scrape finds it.
+    """
+    min_threads, min_evidence = corpus_policy.segment_floors(cfg)
+    kept, demoted = [], []
+    for candidate in validated:
+        failure = corpus_policy.floor_failure(candidate, min_threads, min_evidence)
+        if failure is None:
+            kept.append(candidate)
+            continue
+        demoted.append((candidate, failure))
+        _demote(decisions, candidate["segment_id"], failure)
+    if demoted and verbose:
+        print(f"  04 floors: {len(demoted)} validated candidate(s) below "
+              f"{min_threads} threads / {min_evidence} items -> needs_more_research")
+        for candidate, failure in demoted:
+            print(f"    {candidate['slug']:44} {failure}")
+    return kept
+
+
+def _apply_assigned_floors(validated, decisions, rows, by_id, cfg, verbose=True):
+    """Demote segments whose *assigned* evidence is too thin, after Stage 05.
+
+    This is the floor that matters, and applying it earlier cannot work. A
+    Stage 03 candidate card counts the threads that contributed to discovering
+    the candidate, which is systematically larger than the threads Stage 05
+    ultimately assigns to it: on the montisella run `fitness_overuse_rotator_cuff`
+    carried 16 threads on its card and two in the finished segment. Gating on the
+    card caught 1 of 70 segments; gating here catches the 19 that actually rest
+    on three conversations or fewer.
+
+    Evidence from a demoted segment returns to the unassigned pool rather than
+    being deleted — it was never wrong, it just has nowhere strong enough to sit.
+    Stage 06 and Stage 07 are then handed the same taxonomy, which is the point:
+    a segment with no evidence file must not reach commercial coalescing.
+    """
+    min_threads, min_evidence = corpus_policy.segment_floors(cfg)
+    assigned = defaultdict(list)
+    for row in rows:
+        if row.get("assignment_status") == "assigned":
+            assigned[row.get("primary_segment_id")].append(row)
+
+    kept, demoted = [], []
+    for segment in validated:
+        segment_rows = assigned.get(segment["segment_id"], [])
+        threads = {(by_id.get(row["evidence_id"], {}).get("thread_id")
+                    or by_id.get(row["evidence_id"], {}).get("url"))
+                   for row in segment_rows}
+        threads.discard(None)
+        failure = corpus_policy.floor_failure(
+            {"unique_thread_count": len(threads),
+             "unique_evidence_count": len(segment_rows)},
+            min_threads, min_evidence)
+        if failure is None:
+            kept.append(segment)
+            continue
+        demoted.append((segment, failure, len(segment_rows)))
+        _demote(decisions, segment["segment_id"], failure)
+        for row in segment_rows:
+            row["assignment_status"] = "unassigned_insufficient_evidence"
+            row["primary_segment_id"] = ""
+    if demoted and verbose:
+        released = sum(count for _s, _f, count in demoted)
+        print(f"  05 floors: {len(demoted)} segment(s) below {min_threads} "
+              f"threads / {min_evidence} assigned items -> needs_more_research "
+              f"({released:,} item(s) returned to unassigned)")
+        for segment, failure, _count in demoted:
+            print(f"    {segment['slug']:44} {failure}")
+    return kept
+
+
+def _enforce_assignment_thresholds(rows, diagnostics_dir, verbose=True):
+    """Demote assignments that did not clear skill 05's own bar.
+
+    JSON Schema can bound one field at a time but cannot express "assigned
+    implies score >= 6 and margin >= 2", so the contract is enforced here
+    instead. Demotion rather than deletion: the model's score, cues and
+    rationale are all preserved, and the row simply rejoins the unassigned
+    audit set where a below-threshold judgement belongs.
+
+    Returns the violations, so the caller can report them beside the tally
+    rather than discovering them in a file nobody opens.
+    """
+    violations = []
+    for row in rows:
+        if row.get("assignment_status") != "assigned":
+            continue
+        score = row.get("score") or 0
+        margin = row.get("winning_margin") or 0
+        if score >= ASSIGN_MIN_SCORE and margin >= ASSIGN_MIN_MARGIN:
+            continue
+        violations.append({
+            "evidence_id": row.get("evidence_id"),
+            "primary_segment_id": row.get("primary_segment_id"),
+            "score": score, "winning_margin": margin,
+            "rationale": row.get("rationale"),
+            "required": {"score": ASSIGN_MIN_SCORE, "margin": ASSIGN_MIN_MARGIN},
+        })
+        row["assignment_status"] = "unassigned_insufficient_evidence"
+        row["primary_segment_id"] = ""
+    if not violations:
+        return violations
+
+    os.makedirs(diagnostics_dir, exist_ok=True)
+    path = os.path.join(diagnostics_dir, "threshold_violations.jsonl")
+    with open(path, "w", encoding="utf-8") as fh:
+        for violation in violations:
+            fh.write(json.dumps(violation, ensure_ascii=False) + "\n")
+    share = len(violations) / max(len(rows), 1)
+    if verbose:
+        print(f"  ! {len(violations):,} assignment(s) fell below skill 05's "
+              f"score>={ASSIGN_MIN_SCORE}/margin>={ASSIGN_MIN_MARGIN} bar and "
+              f"were demoted to unassigned -> {path}")
+    if share > ASSIGN_VIOLATION_LIMIT:
+        sys.exit(
+            f"  Stage 05 broke its own assignment threshold on "
+            f"{len(violations):,} of {len(rows):,} rows ({share * 100:.1f}%, "
+            f"limit {ASSIGN_VIOLATION_LIMIT * 100:.0f}%).\n"
+            f"  Audited to {path}. The stage is not applying the rule it was "
+            f"given; re-run it with --reassign rather than building on this.")
+    return violations
 
 
 def _stage03_corpus_text(items, limit=None):
@@ -3116,6 +3351,9 @@ def _completed_segmentation_inputs(cfg, voc):
                  if (row.get("status") == "validated"
                      and row.get("segment_id") in by_segment_id)]
     assignments = _read_jsonl(assignments_path)
+    # The resume path must see the same taxonomy the full run would, or Stage 07
+    # coalesces a segment set that Stage 05 never assigned against.
+    validated = _apply_segment_floors(validated, decisions, cfg)
     if not validated:
         sys.exit("Cannot start Stage 07: no validated Stage-04 segments found.")
     return validated, decisions, assignments
@@ -3477,6 +3715,14 @@ def cmd_segment(cfg, args):
         validated, decisions, rows = _completed_segmentation_inputs(cfg, voc)
         expected = {row["id"] for row in items}
         _require_exact_ids(rows, expected, "persisted Stage 05 assignment")
+        # The resume path must reach Stage 07 with the taxonomy the full run
+        # would have produced, floors and thresholds included, or it coalesces
+        # a segment set that no evidence file was ever built for.
+        _enforce_assignment_thresholds(
+            rows, paths.voc(cfg["_dir"], "_model_failures", "05_assign"))
+        validated = _apply_assigned_floors(validated, decisions, rows, by_id, cfg)
+        if not validated:
+            sys.exit("  No segment cleared the evidence floor after assignment.")
         stage_client = (None if args.from_stage == "09" else client(cfg, args))
         _run_commercial_layers(
             stage_client, cfg, args, items, by_id, validated, decisions, rows)
@@ -3926,12 +4172,25 @@ def cmd_segment(cfg, args):
     else:
         _, s04 = skill(4)
         packet = segmentation.stage04_packet(candidates, items)
+        min_threads, min_evidence = corpus_policy.segment_floors(cfg)
+        floor_rule = (
+            f"FLOORS — a candidate resting on fewer than {min_threads} unique "
+            f"threads, or carrying fewer than {min_evidence} unique evidence "
+            "items, cannot be validated. Those counts are on every card and are "
+            "enforced in code after you decide; validating below them only "
+            "moves the decision, it does not make the segment.\n\n")
+        scope_rule = corpus_policy.scope_prompt(cfg)
         validation_job = Job(
             id="04_validate",
             prompt=("Apply skill 04 to every compact candidate card below. The "
                     "metrics were computed in code and the evidence excerpts are a "
                     "bounded representative sample, not the whole corpus. Give every "
-                    "candidate exactly one decision.\n\n" + packet),
+                    "candidate exactly one decision.\n\n"
+                    + floor_rule
+                    + ((scope_rule + "\nA candidate whose defining trait is a "
+                        "diagnosis is out of scope: reject it, however coherent "
+                        "its evidence.\n\n") if scope_rule else "")
+                    + packet),
             max_tokens=STAGE04_TOKEN_TIERS[0],
             schema=validation_schema(
                 [row["segment_id"] for row in candidates]),
@@ -3960,6 +4219,7 @@ def cmd_segment(cfg, args):
     validated = [by_segment_id[row["segment_id"]] for row in decisions
                  if (row["status"] == "validated"
                      and row["segment_id"] in by_segment_id)]
+    validated = _apply_segment_floors(validated, decisions, cfg)
     if not validated:
         sys.exit("  No segment survived validation. Nothing to build.\n"
                  f"  Review {val_p} — every candidate has a written rationale.")
@@ -4013,12 +4273,20 @@ def cmd_segment(cfg, args):
         rows = [row for artifact in artifacts05
                 for row in artifact["assignments"]]
         _require_exact_ids(rows, {row["id"] for row in items}, "skill 05 assignment")
+        # Enforced before the rows are persisted, so the saved contract and the
+        # reused-from-cache path can never disagree about what was assigned.
+        _enforce_assignment_thresholds(
+            rows, os.path.join(diagnostics, "05_assign"))
         _write_jsonl_atomic(asg_p, rows)
         _json_atomic(asg_meta, {"input_fingerprint": assignment_fingerprint})
         tally = Counter(row["assignment_status"] for row in rows)
         print("  05 assign: " + " · ".join(
             f"{key} {value}" for key, value in tally.most_common()))
 
+    validated = _apply_assigned_floors(validated, decisions, rows, by_id, cfg)
+    if not validated:
+        sys.exit("  No segment cleared the evidence floor after assignment.\n"
+                 f"  Review {asg_p} — every item kept its score and rationale.")
     build_evidence_files(cfg, validated, rows, by_id, voc)
     _run_commercial_layers(
         c, cfg, args, items, by_id, validated, decisions, rows)
