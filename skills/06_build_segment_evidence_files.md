@@ -117,15 +117,39 @@ counts; Supporting corroborates or enriches; Context remains traceable but must 
 drive core frequency. Tier is evidence strength, not segment membership, so never drop
 an assigned item merely because it is Supporting or Context.
 
-Every extraction skill must: receive one segment evidence file, read it in full
+Every extraction skill must: receive one segment file, read it in full
 independently, extract only its one dimension, preserve traceability to evidence IDs,
-and write a segment-prefixed output — and it must **always read the evidence file, never
+and write a segment-prefixed output — and it must **always read a segment file, never
 another extraction's output.**
 
 ```
 Correct:   evidence/desk_workers.txt → 08_extract_pain_moments → desk_workers_pain_moments.md
 Wrong:     desk_workers_pain_points.md → 08_extract_pain_moments   (never chain extractions)
 ```
+
+## The two layers
+
+What you build here is Layer 1, and it is **the count**: immutable, one primary
+segment per comment, nothing borrowed. Every number anyone reports traces to it.
+
+Layer 2 (`research/segments/packs/{slug}.txt`) is built from it and answers a
+different question. A fifteen-comment segment starves on Layer 1 while two hundred
+comments of directly relevant context sit one edge away, so a pack carries the same
+primary evidence in full *plus* evidence borrowed from related segments — parent,
+children, siblings, declared neighbours, measured neighbours — each item labelled
+with where it came from and why.
+
+The separation is the whole point. Retrieval gets to be generous because counting
+stays strict:
+
+```
+evidence/{slug}.txt   Layer 1 · the count · never borrows
+packs/{slug}.txt      Layer 2 · the language · borrows, labels, counts nothing
+```
+
+An extraction reading Layer 2 must headline the primary count, report anything drawn
+from borrowed context separately, and never add the two together. Borrowed evidence
+tells you how these people talk. It never tells you how many of them there are.
 
 ## Fail the build if… / Warn if…
 

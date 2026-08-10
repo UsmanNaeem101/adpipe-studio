@@ -237,8 +237,9 @@ class CooccurrenceTallyTests(unittest.TestCase):
 
     def tally(self, rows):
         with tempfile.TemporaryDirectory() as tmp:
-            path = cli._write_cooccurrence_tally(rows, self.validated, tmp)
-            with open(path, encoding="utf-8") as fh:
+            cli._measure_segment_graph(rows, self.validated, None, tmp)
+            with open(os.path.join(tmp, "segment_cooccurrence.json"),
+                      encoding="utf-8") as fh:
                 return json.load(fh)
 
     def test_pairs_are_undirected_and_counted(self):
@@ -248,15 +249,15 @@ class CooccurrenceTallyTests(unittest.TestCase):
             self.row("seg_001", "seg_003"),
         ])
         self.assertEqual(result["measured_from_assignments"], 3)
-        self.assertEqual(result["pairs"][0]["segment_ids"], ["seg_001", "seg_002"])
-        self.assertEqual(result["pairs"][0]["count"], 2)
-        self.assertEqual(result["pairs"][0]["slugs"],
+        self.assertEqual(result["raw_pairs"][0]["segment_ids"], ["seg_001", "seg_002"])
+        self.assertEqual(result["raw_pairs"][0]["count"], 2)
+        self.assertEqual(result["raw_pairs"][0]["slugs"],
                          ["desk_workers", "side_sleepers"])
 
     def test_rows_that_were_never_asked_are_excluded(self):
         result = self.tally([self.row("seg_001", "seg_002", recorded=False)])
         self.assertEqual(result["measured_from_assignments"], 0)
-        self.assertEqual(result["pairs"], [])
+        self.assertEqual(result["raw_pairs"], [])
 
     def test_unassigned_and_demoted_segments_are_excluded(self):
         result = self.tally([
@@ -265,7 +266,7 @@ class CooccurrenceTallyTests(unittest.TestCase):
             self.row("seg_001", ""),
             self.row("seg_001", "seg_001"),
         ])
-        self.assertEqual(result["pairs"], [])
+        self.assertEqual(result["raw_pairs"], [])
 
 
 class HarvestMigrationTests(unittest.TestCase):
@@ -587,8 +588,34 @@ class RegisterPipelineIntegrationTests(unittest.TestCase):
                       encoding="utf-8") as fh:
                 tally = json.load(fh)
             # One validated segment, so every runner-up is honestly empty.
-            self.assertEqual(tally["pairs"], [])
+            self.assertEqual(tally["raw_pairs"], [])
             self.assertEqual(tally["measured_from_assignments"], 0)
+
+    def test_layer_two_packs_are_built_and_readable_by_extract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_pipeline(tmp)
+            cfg = {"_dir": tmp, "name": "test", "segmentation": {}}
+            pack = cli.research_pack_path(cfg, "desk_workers")
+            with open(pack, encoding="utf-8") as fh:
+                text = fh.read()
+            # No relationships in this fixture, so Layer 2 is Layer 1 plus a
+            # header — and the counts still say so explicitly.
+            self.assertIn("Primary evidence items (this segment only): 5", text)
+            self.assertNotIn("BORROWED CONTEXT", text)
+
+            with open(os.path.join(tmp, "research", "voc",
+                                   "research_pack_manifest.json"),
+                      encoding="utf-8") as fh:
+                manifest = json.load(fh)
+            self.assertEqual(manifest["packs"][0]["borrowed_item_count"], 0)
+            self.assertEqual(manifest["context_budget_tokens"], 8000)
+
+    def test_a_missing_pack_names_the_fix_rather_than_falling_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {"_dir": tmp, "name": "test", "segmentation": {}}
+            with self.assertRaises(SystemExit) as caught:
+                cli.research_pack_path(cfg, "desk_workers")
+            self.assertIn("--pack", str(caught.exception))
 
     def test_the_graph_is_persisted_and_reused_without_a_model_call(self):
         with tempfile.TemporaryDirectory() as tmp:

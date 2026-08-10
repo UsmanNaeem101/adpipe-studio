@@ -44,6 +44,7 @@ import presets  # noqa: E402
 import segmentation  # noqa: E402
 import commercial  # noqa: E402
 import corpus_policy  # noqa: E402
+import researchpack  # noqa: E402
 from llm import BatchResult, NO_RETRY_STOP_REASONS  # noqa: E402
 
 SKILLS = os.path.join(ROOT, "skills")
@@ -4104,6 +4105,8 @@ def cmd_segment(cfg, args):
                                            graph=graph)
         if not validated:
             sys.exit("  No segment cleared the evidence floor after assignment.")
+        measured = _measure_segment_graph(rows, validated, graph, voc)
+        build_research_packs(cfg, validated, rows, by_id, graph, measured, voc)
         stage_client = (None if args.from_stage == "09" else client(cfg, args))
         _run_commercial_layers(
             stage_client, cfg, args, items, by_id, validated, decisions, rows)
@@ -4753,51 +4756,80 @@ def cmd_segment(cfg, args):
     if not validated:
         sys.exit("  No segment cleared the evidence floor after assignment.\n"
                  f"  Review {asg_p} — every item kept its score and rationale.")
-    _write_cooccurrence_tally(rows, validated, voc)
+    measured = _measure_segment_graph(rows, validated, graph, voc)
     build_evidence_files(cfg, validated, rows, by_id, voc, facets)
+    build_research_packs(cfg, validated, rows, by_id, graph, measured, voc)
     _run_commercial_layers(
         c, cfg, args, items, by_id, validated, decisions, rows)
 
 
-def _write_cooccurrence_tally(rows, validated, voc):
-    """Tally how often each pair of segments came first and second.
+def _measure_segment_graph(rows, validated, graph, voc):
+    """Stage 06B — derive co-occurrence edges and audit them against Stage 04.
 
-    This is raw measurement, not a graph: no edge is declared, no threshold is
-    applied, and nothing downstream reads it yet. It exists because `winning_margin`
-    was already being computed against *some* segment and then discarded, and
-    because two audiences that repeatedly place first and second in the same
-    comments overlap in the market whatever the taxonomy says about them.
+    Measurement, not declaration: these edges come from what Stage 05 actually
+    did, so nothing here asks a model whether two audiences are related. The
+    audit is the useful part. Where a declared adjacency has no measured support,
+    or a strong measured overlap was never declared, an operator wants to know —
+    and neither is an error, so neither changes the declared graph.
     """
     known = {row["segment_id"]: row["slug"] for row in validated}
-    pairs = Counter()
-    measured = 0
-    for row in rows:
-        if not row.get("runner_up_recorded"):
-            continue
-        winner, runner_up = row.get("primary_segment_id"), row.get("runner_up_segment_id")
-        if row.get("assignment_status") != "assigned" or not runner_up:
-            continue
-        if winner not in known or runner_up not in known or winner == runner_up:
-            continue
-        measured += 1
-        pairs[tuple(sorted((winner, runner_up)))] += 1
+    pairs, sizes, measured_from = segmentation.measure_cooccurrence(rows, known)
+    edges = segmentation.measured_edges(pairs, sizes)
+    audit = segmentation.audit_graph(graph, edges)
     path = os.path.join(voc, "segment_cooccurrence.json")
     _json_atomic(path, {
-        "measured_from_assignments": measured,
-        "note": ("Raw first-and-second counts from Stage 05. Not edges, not "
-                 "thresholded, not yet consumed downstream."),
-        "pairs": [{"segment_ids": list(pair), "slugs": [known[pair[0]], known[pair[1]]],
-                   "count": count}
-                  for pair, count in sorted(pairs.items(),
-                                            key=lambda kv: (-kv[1], kv[0]))],
+        "measured_from_assignments": measured_from,
+        "note": ("First-and-second counts from Stage 05. `rate` is against the "
+                 "smaller segment, because that is the one an overlap would "
+                 "change the message for."),
+        "raw_pairs": [{"segment_ids": list(pair),
+                       "slugs": [known[pair[0]], known[pair[1]]],
+                       "count": count}
+                      for pair, count in sorted(pairs.items(),
+                                                key=lambda kv: (-kv[1], kv[0]))],
+        "co_occurs_edges": [
+            {**edge, "slugs": [known[edge["segment_ids"][0]],
+                               known[edge["segment_ids"][1]]]}
+            for edge in edges],
+        "graph_audit": {
+            key: [[known.get(left, left), known.get(right, right)]
+                  for left, right in value]
+            for key, value in audit.items()},
     })
-    if pairs:
-        top = ", ".join(f"{known[a]}↔{known[b]} {count}"
-                        for (a, b), count in sorted(
-                            pairs.items(), key=lambda kv: (-kv[1], kv[0]))[:3])
-        print(f"  05 co-occurrence: {len(pairs)} segment pair(s) from {measured:,} "
-              f"assignments ({top}) -> {path}")
-    return path
+    if measured_from:
+        print(f"  06B graph: {len(edges)} co-occurrence edge(s) from "
+              f"{measured_from:,} runner-up(s) -> {path}")
+        if audit["measured_not_declared"]:
+            print(f"    {len(audit['measured_not_declared'])} measured overlap(s) "
+                  "Stage 04 did not declare: " + ", ".join(
+                      f"{known.get(a, a)}↔{known.get(b, b)}"
+                      for a, b in audit["measured_not_declared"][:3]))
+        if audit["declared_not_measured"]:
+            print(f"    {len(audit['declared_not_measured'])} declared "
+                  "adjacency(ies) the evidence does not support")
+    return edges
+
+
+def build_research_packs(cfg, validated, rows, by_id, graph, measured, voc):
+    """Stage 06C — Layer 2, one weighted research pack per segment."""
+    settings = researchpack.pack_settings(cfg)
+    rows_by_segment = defaultdict(list)
+    for row in rows:
+        if row.get("assignment_status") == "assigned":
+            rows_by_segment[row["primary_segment_id"]].append(row)
+    directory = paths.research(cfg["_dir"], "segments", "packs")
+    manifest = researchpack.write_packs(
+        directory, validated, rows_by_segment, by_id, graph, measured, settings)
+    _json_atomic(os.path.join(voc, "research_pack_manifest.json"), {
+        "context_budget_tokens": settings["context_budget_tokens"],
+        "relation_weights": settings["relation_weights"],
+        "strength_factors": settings["strength_factors"],
+        "packs": manifest,
+    })
+    borrowed = sum(row["borrowed_item_count"] for row in manifest)
+    print(f"  06C packs: {len(manifest)} research pack(s), {borrowed:,} borrowed "
+          f"context item(s) -> {directory}/")
+    return manifest
 
 
 def build_evidence_files(cfg, validated, rows, by_id, voc, facets=()):
@@ -4973,6 +5005,18 @@ def evidence_path(cfg, segment):
     return p
 
 
+def research_pack_path(cfg, segment):
+    directory = paths.research(cfg["_dir"], "segments", "packs")
+    path = os.path.join(directory, f"{segment}.txt")
+    if not os.path.exists(path):
+        available = ([name[:-4] for name in sorted(os.listdir(directory))
+                      if name.endswith(".txt")] if os.path.isdir(directory) else [])
+        sys.exit(f"No research pack for {segment!r}. Run `segment` to build "
+                 f"Layer 2, or drop --pack to read the evidence file.\n"
+                 f"  Available packs: {', '.join(available) or 'none'}")
+    return path
+
+
 def cmd_extract(cfg, args):
     """Skills 07-26 against one evidence file. The corpus is identical across all
     20, so it goes in a cached system block and only the skill varies — then the
@@ -4980,8 +5024,12 @@ def cmd_extract(cfg, args):
     from llm import Job, confirm
     warn_if_imported(cfg, args.segment)
     c = client(cfg, args)
-    with open(evidence_path(cfg, args.segment), encoding="utf-8") as fh:
+    source = (research_pack_path(cfg, args.segment)
+              if getattr(args, "pack", False) else evidence_path(cfg, args.segment))
+    with open(source, encoding="utf-8") as fh:
         corpus = fh.read()
+    if getattr(args, "pack", False):
+        print(f"  reading the Layer-2 research pack: {source}")
     out = paths.extractions(cfg["_dir"], args.segment); os.makedirs(out, exist_ok=True)
 
     picked = chosen_extractors(args)
@@ -5584,6 +5632,10 @@ def main():
             s.add_argument("--preset", choices=sorted(PRESETS),
                            help="extraction depth: fast, standard, or deep (default: deep)")
             s.add_argument("--skills", help="explicit list, e.g. 7,8,14,18,24,25")
+            s.add_argument("--pack", action="store_true",
+                           help="read the Layer-2 research pack (primary evidence "
+                                "plus weighted borrowed context) instead of the "
+                                "evidence file")
         if name in ("picc", "concepts", "brief", "run"):
             s.add_argument("--product", help="which product in this project to "
                                              "build on (default: the only one)")

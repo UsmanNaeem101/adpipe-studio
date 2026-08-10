@@ -832,6 +832,85 @@ def finalize_segment_graph(edges, eligible_ids):
     }, dropped
 
 
+def measure_cooccurrence(rows, eligible_ids):
+    """Count how often each pair of segments placed first and second.
+
+    Stage 05 already computed a winner and a margin, and a margin is a margin
+    against *something*. Keeping which segment that was turns a discarded
+    intermediate into the one relationship signal in the pipeline that nobody
+    has to assert: two audiences that repeatedly come first and second in the
+    same comments overlap, whatever the taxonomy says.
+
+    Rows that predate runner-up recording are skipped rather than read as an
+    honest "nothing scored second".
+    """
+    eligible = set(eligible_ids)
+    pairs, sizes, measured = Counter(), Counter(), 0
+    for row in rows:
+        if row.get("assignment_status") != "assigned":
+            continue
+        winner = row.get("primary_segment_id")
+        if winner in eligible:
+            sizes[winner] += 1
+        if not row.get("runner_up_recorded"):
+            continue
+        runner_up = row.get("runner_up_segment_id")
+        if winner not in eligible or runner_up not in eligible:
+            continue
+        if winner == runner_up:
+            continue
+        measured += 1
+        pairs[tuple(sorted((winner, runner_up)))] += 1
+    return pairs, sizes, measured
+
+
+def measured_edges(pairs, sizes, min_count=3, min_rate=0.05):
+    """Promote raw co-occurrence counts to edges, with a rate as well as a count.
+
+    Count alone is biased toward large segments: a big audience places second
+    everywhere simply by being big. The rate is taken against the *smaller* of
+    the two segments, which is the one for which the overlap would actually
+    change a message.
+    """
+    edges = []
+    for (left, right), count in pairs.items():
+        floor = min(sizes.get(left, 0), sizes.get(right, 0))
+        rate = (count / floor) if floor else 0.0
+        if count < min_count or rate < min_rate:
+            continue
+        edges.append({
+            "segment_ids": [left, right],
+            "edge_type": "co_occurs",
+            "count": count,
+            "rate": round(rate, 4),
+        })
+    return sorted(edges, key=lambda edge: (-edge["count"], edge["segment_ids"]))
+
+
+def audit_graph(graph, edges):
+    """Compare what Stage 04 declared against what Stage 05 measured.
+
+    Disagreement is the point. An adjacency nobody's comments support, or an
+    overlap nobody declared, is each worth an operator's attention -- and
+    neither is an error, so nothing here changes the graph. Parent/child pairs
+    are expected to co-occur and are reported separately rather than as
+    undeclared discoveries.
+    """
+    declared = {tuple(sorted(edge["segment_ids"]))
+                for edge in (graph or {}).get("adjacent", [])}
+    hierarchy = {tuple(sorted((edge["from_segment_id"], edge["to_segment_id"])))
+                 for edge in (graph or {}).get("specialises", [])}
+    seen = {tuple(edge["segment_ids"]): edge for edge in edges}
+    return {
+        "confirmed": sorted(list(pair) for pair in declared & set(seen)),
+        "declared_not_measured": sorted(list(pair) for pair in declared - set(seen)),
+        "measured_not_declared": sorted(
+            list(pair) for pair in set(seen) - declared - hierarchy),
+        "explained_by_hierarchy": sorted(
+            list(pair) for pair in set(seen) & hierarchy),
+    }
+
+
 def parent_map(graph):
     """child segment ID -> parent segment ID."""
     return {edge["from_segment_id"]: edge["to_segment_id"]
