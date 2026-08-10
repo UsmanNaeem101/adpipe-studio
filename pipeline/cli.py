@@ -291,6 +291,85 @@ TITLE_HDR = re.compile(r"^\s*TITLE:\s*(.+)$", re.I | re.M)
 # Reddit dumps commonly number comments "[1] ", "[2] " — optionally with a
 # classification tag the previous pipeline stage added.
 COMMENT_MARK = re.compile(r"^\s*\[\d+\]\s*(?:\[[A-Z_]+\]\s*)?", re.M)
+# What the scraper leaves behind once the [n] marker is split off. 6,013 items in
+# the montisella dump opened with it, so every one of those was sent to the model
+# with scrape furniture standing where the customer's first words should be.
+SCRAPE_PREFIX = re.compile(r"^\?\s*\(score:\s*-?\d+\)\s*", re.I)
+# The scraper's own section banners — `--- POST BODY ---`, `--- COMMENTS (21) ---`.
+# Left in, blank-line splitting turns each one into its own evidence record.
+SECTION_HDR = re.compile(r"^\s*-{2,}\s*[A-Z][A-Z ()\d/]*\s*-{2,}\s*$", re.M)
+
+# old.reddit renders a whole thread as one unbroken line: every comment is
+# introduced by a collapse marker, a username, a triple score, a relative time
+# and a child count, and closed by its action links. Nothing is on its own line,
+# so a blank-line or [n] split sees the entire thread as a single item.
+#
+# That is not a cosmetic problem. Before this existed, one montisella "evidence
+# item" was 107,187 characters containing 184 separate people, and the run-
+# together dumps held 76% of the corpus text — which the chrome filter then
+# deleted wholesale, because `permalinkembedsave` looked like page furniture
+# rather than the separator between two customers speaking.
+#
+# `_NOT_NEXT` is a tempered token: it lets each part of the header skip over
+# usernames, flair and moderator tags without ever running past the start of the
+# following comment, which a plain `.*?` will happily do on a malformed dump.
+_NOT_NEXT = r"(?:(?!\[[–\-]\]).)"
+OLD_REDDIT_HEAD = re.compile(
+    r"\[[–\-]\]"                                            # collapse marker
+    + _NOT_NEXT + r"{0,200}?"                               # username + flair
+    + r"(?:\d+\s*points?|score hidden)"                     # score, or hidden
+    + _NOT_NEXT + r"{0,160}?"
+    + r"\d+\s*(?:year|month|week|day|hour|minute)s?\s*ago"  # relative time
+    + _NOT_NEXT + r"{0,80}?\(\d+\s*child(?:ren)?\)",        # reply count
+    re.I | re.S)
+# The action links that close a comment, and everything after them up to the next
+# comment, are furniture rather than anything a customer wrote.
+OLD_REDDIT_TAIL = re.compile(
+    r"permalink(?:embed)?(?:save)?(?:parent)?(?:report)?(?:reply)?", re.I)
+# Everything before the first comment is the post body followed by the thread's
+# own chrome — the comment count, the sort bar, the signup prompt — run together
+# on the same line. This marks where the customer stops and the page starts.
+# The comment-count is the first token of that furniture run, so it has to be
+# matched with the run behind it — a bare `\d+ comments` would also truncate a
+# post body that happens to mention reading the comments.
+OLD_REDDIT_LEAD_END = re.compile(
+    r"(?:SPOILER)?\s*\d+\s*comments?(?=sharesavehidereport)"
+    r"|sharesavehidereport|sorted by:|all \d+ comments"
+    r"|Want to add to the discussion", re.I)
+
+
+def split_old_reddit(text):
+    """Split one old.reddit run-together dump into post body and comments.
+
+    Returns [] when the text is not that layout, so the caller can keep whatever
+    it already had. A dump that yields nothing usable is also [] — never a list
+    of empty strings, which would show up downstream as evidence with no text.
+
+    The post body leads the dump and is worth the extra care: it is the original
+    poster stating their problem in full, the richest evidence in any thread.
+    942 of them were in the montisella scrape.
+    """
+    heads = list(OLD_REDDIT_HEAD.finditer(text))
+    if not heads:
+        return []
+    comments = []
+    lead = text[:heads[0].start()]
+    chrome = OLD_REDDIT_LEAD_END.search(lead)
+    if chrome:
+        lead = lead[:chrome.start()]
+    lead = SCRAPE_PREFIX.sub("", lead.strip()).strip()
+    if lead:
+        comments.append(lead)
+    for index, head in enumerate(heads):
+        end = heads[index + 1].start() if index + 1 < len(heads) else len(text)
+        body = text[head.end():end]
+        tail = OLD_REDDIT_TAIL.search(body)
+        if tail:
+            body = body[:tail.start()]
+        body = body.strip()
+        if body:
+            comments.append(body)
+    return comments
 
 
 def parse_voc(raw):
@@ -322,12 +401,22 @@ def parse_voc(raw):
         body = TITLE_HDR.sub("", body)
         body = re.sub(r"^\s*(SUBREDDIT|KEPT COMMENTS/REPLIES|COMMENTS?):.*$", "",
                       body, flags=re.I | re.M)
+        body = SECTION_HDR.sub("", body)
         parts = COMMENT_MARK.split(body) if COMMENT_MARK.search(body) else \
             re.split(r"\n\s*\n", body)
         for part in parts:
             s = part.strip(" \t\n=-_")
-            if s:
-                items.append({"text": s, "url": p["url"], "title": p["title"]})
+            if not s:
+                continue
+            # Second pass, because the two layouts co-occur inside one post: a
+            # scrape can carry a [n]-marked post body AND an old.reddit thread
+            # dump. Splitting again is additive — a part with no old.reddit
+            # header is kept exactly as the first pass produced it.
+            for comment in split_old_reddit(s) or [s]:
+                comment = SCRAPE_PREFIX.sub("", comment).strip()
+                if comment:
+                    items.append({"text": comment, "url": p["url"],
+                                  "title": p["title"]})
     return items
 
 
@@ -1607,10 +1696,19 @@ def _require_exact_ids(rows, expected_ids, label):
 
 # Interface chrome. Skill 01 explicitly permits stripping junk AROUND a comment,
 # so removing these deterministically costs nothing and never touches customer words.
+# Substring match against a whole item, so every pattern here must be one that
+# cannot appear inside something a customer wrote. `permalinkembedsave` and
+# `sharesavehidereport` used to be on this list and are not, deliberately: they
+# are the separators *between* old.reddit comments, not page furniture, so
+# matching them condemned an entire thread rather than a line of chrome. They
+# deleted 11.8M of 16.2M characters — whole subreddits at 100% — before
+# split_old_reddit existed to cut them out properly. Anything the splitter
+# leaves behind is one item's worth of junk, which skill 01 rejects as
+# `interface_chrome` at a cost of one record instead of a thread.
 BOILER = re.compile(
     r"welcome to reddit|become a redditor|create an account|sign up|log in|"
-    r"this is an archived post|i am a bot|automoderator|permalinkembedsave|"
-    r"sharesavehidereport|privacy policy|user agreement|content policy|"
+    r"this is an archived post|i am a bot|automoderator|"
+    r"privacy policy|user agreement|content policy|"
     r"submission guidelines|weekly thread|link to wiki", re.I)
 
 
