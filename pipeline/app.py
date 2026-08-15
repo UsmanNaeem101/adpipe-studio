@@ -1142,6 +1142,22 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
  .stage.on{border-color:var(--accent);background:var(--accent-soft)}
  .stage b{display:block;font-size:14px}.stage small{color:var(--soft);font-size:12.5px}
  .stage .costs{color:var(--signal);font-size:11px;font-weight:700;letter-spacing:.05em}
+ /* which skills a stage actually runs — collapsed until asked for, so the
+    stage list stays scannable but a sub-skill is never invisible again */
+ .stageskills{margin-top:7px}
+ .skilltoggle{font-size:11.5px;color:var(--soft);border-bottom:1px dotted var(--line);
+   cursor:pointer;user-select:none}
+ .skilltoggle:hover{color:var(--accent);border-color:var(--accent)}
+ .stageskills .skillrows{display:none;margin-top:7px}
+ .stageskills.open .skillrows{display:block}
+ .skillrow{display:grid;grid-template-columns:1fr auto;gap:2px 10px;
+   padding:5px 0;border-top:1px solid var(--line);font-size:11.5px}
+ .skillrow code{color:var(--ink);font-size:11px;word-break:break-all}
+ .skillrow em{color:var(--soft);font-style:normal;text-align:right;white-space:nowrap}
+ .skillrow span{color:var(--accent);font-weight:600}
+ .skillrow small{grid-column:1/-1;color:var(--soft);font-size:11px}
+ .skillrow.bad code,.skillrow.bad em{color:var(--signal);font-weight:700}
+ .bad{color:var(--signal)}
  .hide{display:none}
  /* lever pickers */
  .lev{margin-bottom:11px}
@@ -1708,7 +1724,7 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-var LIB,LSEL,LDUPE,SKILLS;
+var LIB,LSEL,LDUPE,SKILLS,SKILLMAP={};
 
 // ---------- tabs ----------
 $$('.tab').forEach(b=>b.onclick=()=>{
@@ -2788,7 +2804,8 @@ const STAGES=__STAGES__;
 (function(){ const el=$('#stages');
   STAGES.forEach(s=>{ const d=document.createElement('div'); d.className='stage';
     d.innerHTML=`<b>${s.name}</b><small>${s.desc}</small>`+
-      (s.costs?'<div class=costs>COSTS API CREDIT</div>':'');
+      (s.costs?'<div class=costs>COSTS API CREDIT</div>':'')+
+      `<div class=stageskills id=sk-${s.name}></div>`;
     d.onclick=()=>{ stage=s; $$('.stage').forEach(x=>x.classList.remove('on'));
       d.classList.add('on'); $('#ingestbox').classList.toggle('hide',!s.source);
       const showSeg = s.name==='segment';
@@ -3006,6 +3023,24 @@ function describeExtractPreset(){
 $('#preset')&&($('#preset').onchange=describeExtractPreset);
 describeExtractPreset();
 fetch('/skills').then(r=>r.json()).then(j=>{
+  SKILLMAP = j.stage_skills || {};
+  Object.keys(SKILLMAP).forEach(name=>{
+    const box=$('#sk-'+name); if(!box) return;
+    const rows=SKILLMAP[name]||[]; if(!rows.length) return;
+    const missing=rows.filter(r=>!r.present).length;
+    box.innerHTML =
+      `<span class=skilltoggle>${rows.length} skill${rows.length>1?'s':''}`+
+      (missing?` · <b class=bad>${missing} missing</b>`:'')+`</span>`+
+      `<div class=skillrows>`+rows.map(r=>
+        `<div class=skillrow${r.present?'':' bad'}>`+
+        `<code>${r.file||'(not found)'}</code>`+
+        `<span>${r.label}</span>`+
+        `<small>${r.purpose||''}</small>`+
+        `<em>${r.present?r.lines+' lines':'MISSING'}</em></div>`).join('')+
+      `</div>`;
+    box.querySelector('.skilltoggle').onclick=e=>{
+      e.stopPropagation(); box.classList.toggle('open'); };
+  });
   const s=$('#extractskill');
   (j.extractors||[]).forEach(x=>{
     const o=document.createElement('option');
@@ -3599,9 +3634,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "bytes": os.path.getsize(full)}))
         if u.path == "/skills":
             import cli
+            extractors = cli.extractor_skill_manifest()
+            by_stage = {name: cli.stage_skill_manifest(name)
+                        for name in cli.STAGE_SKILLS}
+            # The extract stage's skills are the 20 dimensions themselves, so it
+            # is assembled here rather than duplicated into STAGE_SKILLS.
+            by_stage["extract"] = [
+                {"file": row["file"], "label": f"{row['n']:02d} {row['title']}",
+                 "purpose": "one dimension, read from the segment file",
+                 "present": row["present"], "lines": row["lines"]}
+                for row in extractors]
+            by_stage["run"] = by_stage["extract"] + by_stage.get("picc", [])
             return self._send(200, json.dumps({
-                "extractors": [{"n": n, "title": cli.SKILL_TITLES.get(n, str(n))}
-                               for n in cli.EXTRACTORS],
+                "extractors": [{"n": r["n"], "title": r["title"]}
+                               for r in extractors],
+                "stage_skills": by_stage,
                 "presets": {k: v for k, v in cli.PRESETS.items()}}))
         if u.path == "/keys":
             try:

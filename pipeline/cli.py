@@ -79,6 +79,78 @@ SKILL_TITLES = {
 }
 
 
+# Which skills each stage actually loads, in the order it loads them.
+#
+# The sub-skills were invisible everywhere but the source. Stage 03 alone runs
+# five files -- an orchestration contract plus four workers that exist because
+# the corpus has to be chunked -- and the UI described the whole thing as one
+# line, so a skill could be edited, or fail to be edited, with nothing showing
+# it was in play. This is the one place that mapping is written down; app.py
+# renders from it rather than keeping a second copy that can drift.
+STAGE_SKILLS = {
+    "ingest": [
+        ("01_filter_voc.md", "01 filter", "keep real customer signal, bin the rest"),
+        ("02_deduplicate_voc.md", "02 deduplicate",
+         "collapse repeats, protect independent voices"),
+    ],
+    "segment": [
+        ("03_discover_segments.md", "03 orchestration",
+         "the fixed sequence stage 03 runs"),
+        ("03a_discover_segment_candidates.md", "03A harvest",
+         "high-recall discovery per chunk, sorted into four registers"),
+        ("03b_consolidate_segment_candidates.md", "03B consolidate",
+         "merge candidates globally into one map"),
+        ("03e_expand_segment_evidence.md", "03E expand",
+         "classify all evidence against the candidate map"),
+        ("03c_audit_segment_coverage.md", "03C novelty audit",
+         "look for audiences the map missed"),
+        ("04_validate_segments.md", "04 validate",
+         "the sceptic: floors, registers, facets and the segment graph"),
+        ("05_assign_primary_segment.md", "05 assign",
+         "one comment, one audience -- or none"),
+        ("06_build_segment_evidence_files.md", "06 build",
+         "one evidence file per audience, assembled in code"),
+        ("commercial_07_coalesce.md", "07 coalesce",
+         "research clusters into commercial audiences"),
+        ("commercial_08a_extract_signals.md", "08A signals",
+         "structure the extractions into VOC signals"),
+        ("commercial_08b_coalesce_signals.md", "08B synthesise",
+         "signals into per-audience themes"),
+    ],
+    "picc": [
+        ("27_rank_buying_barriers.md", "27 buying barriers",
+         "one ranked stack of what blocks the sale"),
+    ],
+}
+
+
+def stage_skill_manifest(stage):
+    """The skills a stage runs, with whether each file is actually present."""
+    rows = []
+    for filename, label, purpose in STAGE_SKILLS.get(stage, []):
+        path = os.path.join(SKILLS, filename)
+        rows.append({"file": filename, "label": label, "purpose": purpose,
+                     "present": os.path.isfile(path),
+                     "lines": (len(open(path, encoding="utf-8").read().split("\n"))
+                               if os.path.isfile(path) else 0)})
+    return rows
+
+
+def extractor_skill_manifest():
+    """Skills 07-26, the per-dimension extractors, with their real filenames."""
+    rows = []
+    for number in EXTRACTORS:
+        match = next((f for f in sorted(os.listdir(SKILLS))
+                      if f.startswith(f"{number:02d}_") and f.endswith(".md")), None)
+        path = os.path.join(SKILLS, match) if match else None
+        rows.append({
+            "n": number, "title": SKILL_TITLES.get(number, str(number)),
+            "file": match or "", "present": bool(match),
+            "lines": (len(open(path, encoding="utf-8").read().split("\n"))
+                      if path else 0)})
+    return rows
+
+
 def chosen_extractors(args):
     """--skills wins; else the requested preset; else all 20 extractors."""
     if getattr(args, "skills", None):
