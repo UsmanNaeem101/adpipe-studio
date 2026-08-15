@@ -26,10 +26,11 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import auditlog
 import credentials
+import modeloutput
 
 MODEL = "claude-opus-5"
 
@@ -72,6 +73,11 @@ class Job:
     prompt: str
     max_tokens: int = 16000
     schema: dict | None = None
+    # Optional provider reasoning control. Reasoning is billed from the same
+    # output allowance as the answer, so high-volume structured stages turn it
+    # off. Honoured by the OpenRouter client; the Anthropic path uses adaptive
+    # thinking, which does not have the same starve-the-answer failure mode.
+    reasoning: dict | None = None
     # Per-record stages use this to prove that a response covered the complete
     # input chunk before any output is accepted or written.
     expected_ids: tuple[int, ...] | None = None
@@ -89,9 +95,10 @@ class Job:
 
 # Providers spell "I ran out of output room" differently: Anthropic returns a
 # stop_reason of "max_tokens", OpenAI-compatible routes a finish_reason of
-# "length". Defined once here because llm.py, openrouter.py and presets.py all
-# have to recognise the same condition.
-BUDGET_STOP_REASONS = ("max_tokens", "length")
+# "length". One definition, in modeloutput, because llm.py, openrouter.py,
+# cli.py and presets.py all have to recognise the same condition -- and two
+# branches independently proved that a second copy drifts.
+BUDGET_STOP_REASONS = modeloutput.LENGTH_FINISHES
 
 # A refusal or a content-filter block is a decision, not a shortfall. Re-running
 # it spends money to be blocked again, so neither is ever retryable.
@@ -519,6 +526,7 @@ class Client:
             raise
 
         out, failed = {}, []
+        by_id = {j.id: j for j in jobs}
         try:
             for res in self.client.messages.batches.results(batch.id):
                 if res.result.type == "succeeded":
@@ -530,6 +538,11 @@ class Client:
                         batch_id=batch.id)
                     if m.stop_reason == "refusal":
                         failed.append(f"{res.custom_id}: refused by safety classifiers")
+                    elif modeloutput.is_budget_exhaustion(text, m.stop_reason):
+                        failed.append(f"{res.custom_id}: " + modeloutput.budget_message(
+                            (by_id.get(res.custom_id).max_tokens
+                             if by_id.get(res.custom_id) else 0),
+                            m.stop_reason, res.custom_id))
                     elif m.stop_reason == "max_tokens":
                         failed.append(
                             f"{res.custom_id}: hit max_tokens before finishing")
@@ -578,6 +591,8 @@ class Client:
                 audit.error(e, phase="batch_results", batch_id=batch.id)
             raise
 
+        self.failures = {f.split(":", 1)[0]: f.split(":", 1)[1].strip()
+                         for f in failed if ":" in f}
         for f in failed:
             print(f"  ! {f}")
         return out

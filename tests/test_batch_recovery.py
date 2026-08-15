@@ -515,8 +515,12 @@ class IngestStage01Tests(unittest.TestCase):
 class SharedBudgetVocabularyTests(unittest.TestCase):
     """The single-call and batched paths must agree on what a budget stop is."""
 
-    def test_presets_uses_the_shared_stop_reason_set(self):
-        self.assertIs(presets.BUDGET_STOP_REASONS, llm.BUDGET_STOP_REASONS)
+    def test_one_definition_of_the_budget_stop_reasons(self):
+        """Two branches each grew their own copy; there is now exactly one."""
+        import modeloutput
+        self.assertIs(llm.BUDGET_STOP_REASONS, modeloutput.LENGTH_FINISHES)
+        self.assertIs(presets.modeloutput.LENGTH_FINISHES,
+                      modeloutput.LENGTH_FINISHES)
 
     def test_single_call_path_still_detects_the_same_condition(self):
         for stop in llm.BUDGET_STOP_REASONS:

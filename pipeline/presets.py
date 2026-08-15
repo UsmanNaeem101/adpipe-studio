@@ -37,7 +37,7 @@ import urllib.error
 import urllib.request
 
 import auditlog
-from llm import BUDGET_STOP_REASONS
+import modeloutput
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEVERS_MD = os.environ.get(
@@ -86,12 +86,13 @@ class PresetError(Exception):
     """Raised instead of exiting — the web app returns it as JSON, the CLI prints."""
 
 
-class OutputBudgetError(PresetError):
+class OutputBudgetError(PresetError, modeloutput.OutputBudgetExhausted):
     """The model hit its max_tokens while reasoning, before writing content.
 
     Raised instead of a generic "didn't return JSON" so the caller can tell a
     truncated-for-token-budget reply (which a retry with more room can fix)
-    apart from a reply that genuinely contains no JSON.
+    apart from a reply that genuinely contains no JSON. Subclasses the shared
+    modeloutput type so the detection rule lives in exactly one place.
     """
 
 
@@ -619,11 +620,9 @@ def _post_text(provider, keys, model, system, prompt, max_tokens, timeout, label
         text = ((payload.get("choices") or [{}])[0].get("message") or {}).get(
             "content", "") or ""
         finish = (payload.get("choices") or [{}])[0].get("finish_reason")
-    if not text.strip() and finish in BUDGET_STOP_REASONS:
+    if modeloutput.is_budget_exhaustion(text, finish):
         raise OutputBudgetError(
-            f"the model hit its output token budget ({max_tokens}) during "
-            f"reasoning and stopped before writing any JSON (finish_reason="
-            f"{finish!r}). Retrying with a larger budget usually fixes this.")
+            modeloutput.budget_message(max_tokens, finish, label))
     return text
 
 
@@ -649,7 +648,7 @@ def model_json(provider, keys, model, system, prompt, max_tokens=10000,
         try:
             return extract_json(_post_text(
                 provider, keys, model, system, prompt,
-                max_tokens * 3, timeout, label))
+                max_tokens * modeloutput.RETRY_MULTIPLIER, timeout, label))
         except PresetError as e:
             raise PresetError(
                 f"{label}: the model hit its output token budget and the retry "
