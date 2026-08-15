@@ -1870,7 +1870,7 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
             if corpus_policy.subreddit_excluded(subreddit, cfg):
                 held = corpus_policy.OUT_OF_SCOPE_SUBREDDIT
             else:
-                held = corpus_policy.corroboration_cut(source)
+                held = corpus_policy.corroboration_cut(source, cfg)
         if tier is not None and held is None:
             subreddit_count += int(subreddit is not None)
             thread_count += int(thread_id is not None)

@@ -57,22 +57,40 @@ SINGLE_SIGNAL = "single_uncorroborated_signal"
 UNCORROBORATED_REPORT = "uncorroborated_second_hand_report"
 
 
-def corroborated(reasons):
+DEFAULT_MIN_SIGNALS_FIRST_PERSON = 2
+DEFAULT_MIN_SIGNALS_REPORT = 3
+
+
+def corroboration_bar(cfg):
+    """(first-hand minimum, report minimum) for this project."""
+    settings = (cfg or {}).get("audience") or {}
+    return (int(settings.get("min_signals_first_person",
+                             DEFAULT_MIN_SIGNALS_FIRST_PERSON)),
+            int(settings.get("min_signals_report", DEFAULT_MIN_SIGNALS_REPORT)))
+
+
+def corroborated(reasons, cfg=None):
     """True when a retained Stage 01 record has enough signal to research on.
 
     Two ways to clear the bar, because they fail differently. A first-person
     account is the strongest evidence the corpus holds, so it needs only one
     other signal to show it is about something. Everything else — observation,
     advice, commentary about a third party — is a report, and a report needs
-    three independent signals before it is worth a segment's attention.
+    more independent signals before it is worth a segment's attention.
+
+    Both numbers are per-project. This stage is deterministic and free, so
+    re-tuning the bar is a re-run of refine-voc rather than another pass over
+    thousands of records at model prices — which is only true if the numbers can
+    actually be changed without editing code.
     """
+    first_person_bar, report_bar = corroboration_bar(cfg)
     reasons = set(reasons or [])
     if FIRST_PERSON in reasons:
-        return len(reasons) >= 2
-    return len(reasons) >= 3
+        return len(reasons) >= first_person_bar
+    return len(reasons) >= report_bar
 
 
-def corroboration_cut(record):
+def corroboration_cut(record, cfg=None):
     """The code explaining why this record is held out, or None if it stays.
 
     A record with no `retention_reasons` key at all predates Stage 01's reason
@@ -84,7 +102,7 @@ def corroboration_cut(record):
     if "retention_reasons" not in record:
         return None
     reasons = set(record.get("retention_reasons") or [])
-    if corroborated(reasons):
+    if corroborated(reasons, cfg):
         return None
     return SINGLE_SIGNAL if len(reasons) <= 1 else UNCORROBORATED_REPORT
 

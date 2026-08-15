@@ -43,7 +43,8 @@ import presets  # noqa: E402
 import levers  # noqa: E402
 import briefs  # noqa: E402
 import products  # noqa: E402
-import paths  # noqa: E402
+import paths
+import settings  # noqa: E402
 import enrich  # noqa: E402
 import synth  # noqa: E402
 import auditlog  # noqa: E402
@@ -1144,6 +1145,25 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
  .stage .costs{color:var(--signal);font-size:11px;font-weight:700;letter-spacing:.05em}
  /* which skills a stage actually runs — collapsed until asked for, so the
     stage list stays scannable but a sub-skill is never invisible again */
+ /* project settings — every knob that changes what a stage does, in the place
+    where you choose the stage */
+ .settingsbar{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+ .ghost{background:transparent;color:var(--accent);border:1.5px solid var(--line);
+   border-radius:9px;padding:6px 12px;font-size:12.5px;cursor:pointer}
+ .ghost:hover{border-color:var(--accent)}
+ #settingsbox{border:1.5px solid var(--line);border-radius:11px;padding:14px;
+   margin-bottom:14px;background:var(--paper)}
+ .setgroup{margin-bottom:16px}
+ .setgroup>h4{margin:0 0 8px;font-size:12px;letter-spacing:.06em;
+   text-transform:uppercase;color:var(--soft)}
+ .setfield{margin-bottom:11px}
+ .setfield label{display:block;font-size:12.5px;font-weight:600;margin-bottom:3px}
+ .setfield input,.setfield select,.setfield textarea{width:100%;box-sizing:border-box}
+ .setfield textarea{min-height:62px;font-family:inherit;font-size:12.5px}
+ .setfield .sethelp{color:var(--soft);font-size:11.5px;margin-top:3px}
+ .setfield.changed label{color:var(--accent)}
+ .settingsactions{display:flex;align-items:center;gap:12px;
+   border-top:1px solid var(--line);padding-top:12px}
  .stageskills{margin-top:7px}
  .skilltoggle{font-size:11.5px;color:var(--soft);border-bottom:1px dotted var(--line);
    cursor:pointer;user-select:none}
@@ -1480,6 +1500,17 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
       <div><label>Project</label><select id=proj></select></div>
       <div><label>Segment</label><select id=seg></select></div>
       <div id=prodwrap class="hide"><label>Product</label><select id=prod></select></div>
+    </div>
+    <div class=settingsbar>
+      <button class=ghost id=settingstoggle type=button>Project settings</button>
+      <span class=hint id=settingspath></span>
+    </div>
+    <div id=settingsbox class=hide>
+      <div id=settingsfields></div>
+      <div class=settingsactions>
+        <button id=settingssave type=button>Save settings</button>
+        <span id=settingsmsg class=hint></span>
+      </div>
     </div>
     <div class=stagelist id=stages></div>
     <div id=ingestbox class="hide" style="margin-top:16px">
@@ -3022,6 +3053,69 @@ function describeExtractPreset(){
 }
 $('#preset')&&($('#preset').onchange=describeExtractPreset);
 describeExtractPreset();
+
+/* ---------------- project settings ---------------- */
+var SETSCHEMA=[],SETVALUES={};
+function settingsField(f){
+  const v=SETVALUES[f.key], id='set-'+f.key.replace(/\./g,'-');
+  let input;
+  if(f.kind==='choice'){
+    input=`<select id="${id}">`+f.options.map(o=>
+      `<option value="${o}"${String(v)===o?' selected':''}>${o}</option>`).join('')+`</select>`;
+  }else if(f.kind==='list'){
+    input=`<textarea id="${id}" placeholder="one per line">${(v||[]).join('\n')}</textarea>`;
+  }else if(f.kind==='longtext'){
+    input=`<textarea id="${id}">${v==null?'':v}</textarea>`;
+  }else if(f.kind==='int'||f.kind==='float'){
+    const step=f.kind==='float'?'0.01':'1';
+    input=`<input id="${id}" type=number step="${step}"`+
+      (f.min!=null?` min="${f.min}"`:'')+(f.max!=null?` max="${f.max}"`:'')+
+      ` value="${v==null?'':v}">`;
+  }else{
+    input=`<input id="${id}" type=text value="${v==null?'':String(v).replace(/"/g,'&quot;')}">`;
+  }
+  return `<div class=setfield data-key="${f.key}"><label for="${id}">${f.label}</label>`+
+    input+(f.help?`<div class=sethelp>${f.help}</div>`:'')+`</div>`;
+}
+function readSetting(f){
+  const el=$('#set-'+f.key.replace(/\./g,'-'));
+  return el?el.value:null;
+}
+function loadSettings(){
+  const p=$('#proj').value; if(!p) return;
+  fetch('/settings?project='+encodeURIComponent(p)).then(r=>r.json()).then(j=>{
+    if(j.error){ $('#settingsfields').innerHTML='<p class=hint>'+j.error+'</p>'; return; }
+    SETSCHEMA=j.schema; SETVALUES=j.values;
+    $('#settingspath').textContent=j.path;
+    const groups=[];
+    SETSCHEMA.forEach(f=>{ let g=groups.find(x=>x.name===f.group);
+      if(!g){ g={name:f.group,fields:[]}; groups.push(g); } g.fields.push(f); });
+    $('#settingsfields').innerHTML=groups.map(g=>
+      `<div class=setgroup><h4>${g.name}</h4>`+
+      g.fields.map(settingsField).join('')+`</div>`).join('');
+    $('#settingsmsg').textContent='';
+  });
+}
+$('#settingstoggle').onclick=()=>{
+  const box=$('#settingsbox'), opening=box.classList.contains('hide');
+  box.classList.toggle('hide');
+  if(opening) loadSettings();
+};
+$('#settingssave').onclick=()=>{
+  const values={};
+  SETSCHEMA.forEach(f=>{ const raw=readSetting(f); if(raw!==null) values[f.key]=raw; });
+  $('#settingsmsg').textContent='Saving…';
+  fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({project:$('#proj').value,values})})
+  .then(r=>r.json().then(j=>({ok:r.ok,j})))
+  .then(({ok,j})=>{
+    if(!ok){ $('#settingsmsg').innerHTML='<b class=bad>'+(j.error||'save failed')+'</b>';
+             return; }
+    SETVALUES=j.values;
+    $('#settingsmsg').textContent='Saved — takes effect on the next run.';
+  });
+};
+
 fetch('/skills').then(r=>r.json()).then(j=>{
   SKILLMAP = j.stage_skills || {};
   Object.keys(SKILLMAP).forEach(name=>{
@@ -3632,6 +3726,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(
                 {"text": data[:200_000], "clipped": clipped,
                  "bytes": os.path.getsize(full)}))
+        if u.path == "/settings":
+            q = urllib.parse.parse_qs(u.query)
+            project = (q.get("project") or [""])[0]
+            path = os.path.join(ROOT, "projects", project, "project.json")
+            if not SAFE_NAME.match(project or "") or not os.path.isfile(path):
+                return self._send(404, json.dumps({"error": "unknown project"}))
+            cfg = json.load(open(path, encoding="utf-8"))
+            return self._send(200, json.dumps({
+                "schema": settings.schema(),
+                "values": settings.current(cfg),
+                "path": os.path.relpath(path, ROOT)}))
         if u.path == "/skills":
             import cli
             extractors = cli.extractor_skill_manifest()
@@ -3673,6 +3778,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ----------------------------------------------------------------- POST
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if path == "/settings":
+            req = self._json()
+            project = req.get("project") or ""
+            full = os.path.join(ROOT, "projects", project, "project.json")
+            if not SAFE_NAME.match(project) or not os.path.isfile(full):
+                return self._send(404, json.dumps({"error": "unknown project"}))
+            try:
+                with _lock:
+                    cfg = json.load(open(full, encoding="utf-8"))
+                    # All-or-nothing: one bad value writes none of them, so a run
+                    # can never start against a half-applied config.
+                    updated = settings.apply(cfg, req.get("values") or {})
+                    settings.write(full, updated)
+            except settings.SettingsError as error:
+                return self._send(400, json.dumps({"error": str(error)}))
+            except (OSError, ValueError) as error:
+                return self._send(500, json.dumps({"error": str(error)}))
+            return self._send(200, json.dumps({
+                "saved": True, "values": settings.current(updated)}))
         if path == "/keys":
             req = self._json()
             values = {key: req[key] for key in credentials.PROVIDER_ENV if key in req}
