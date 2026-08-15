@@ -45,6 +45,7 @@ import segmentation  # noqa: E402
 import commercial  # noqa: E402
 import corpus_policy  # noqa: E402
 import researchpack  # noqa: E402
+import stagereport  # noqa: E402
 from llm import BatchResult, NO_RETRY_STOP_REASONS  # noqa: E402
 
 SKILLS = os.path.join(ROOT, "skills")
@@ -4671,6 +4672,11 @@ def cmd_segment(cfg, args):
     }
     summary03_p = os.path.join(discovery, "03_run_summary.json")
     _json_atomic(summary03_p, summary03)
+    reports_dir = paths.research(cfg["_dir"], "segments", "reports")
+    stagereport.write(reports_dir, "03_discovery.md", stagereport.discovery_report(
+        cfg.get("name", "project"), _load_json(registers_p), catalogue,
+        candidates, by_id))
+    print(f"  Stage 03 report -> {os.path.join(reports_dir, '03_discovery.md')}")
     print(f"  Stage 03 complete: {len(candidates)} discovered candidates · "
           f"{len(novelty)} recurring novelty proposal(s) -> {discovered_p}")
     usage = summary03["model_usage"]["stage03_total"]["usage"]
@@ -4800,6 +4806,14 @@ def cmd_segment(cfg, args):
     if not validated:
         sys.exit("  No segment survived validation. Nothing to build.\n"
                  f"  Review {val_p} — every candidate has a written rationale.")
+    min_threads, min_evidence = corpus_policy.segment_floors(cfg)
+    child_rules = corpus_policy.child_floors(cfg)
+    stagereport.write(
+        paths.research(cfg["_dir"], "segments", "reports"), "04_validation.md",
+        stagereport.validation_report(
+            cfg.get("name", "project"), decisions, validated, facets, graph,
+            (min_threads, min_evidence,
+             child_rules["min_threads"], child_rules["min_evidence"])))
     print(f"  {len(validated)} validated segment(s): " +
           ", ".join(row["slug"] for row in validated))
 
@@ -4880,7 +4894,12 @@ def cmd_segment(cfg, args):
         sys.exit("  No segment cleared the evidence floor after assignment.\n"
                  f"  Review {asg_p} — every item kept its score and rationale.")
     measured = _measure_segment_graph(rows, validated, graph, voc)
-    build_evidence_files(cfg, validated, rows, by_id, voc, facets)
+    reports_dir = paths.research(cfg["_dir"], "segments", "reports")
+    stagereport.write(reports_dir, "05_assignment.md", stagereport.assignment_report(
+        cfg.get("name", "project"), rows, validated,
+        ASSIGN_MIN_SCORE, ASSIGN_MIN_MARGIN))
+    build_evidence_files(cfg, validated, rows, by_id, voc, facets,
+                         reports_dir=reports_dir, total_evidence=len(items))
     build_research_packs(cfg, validated, rows, by_id, graph, measured, voc)
     _run_commercial_layers(
         c, cfg, args, items, by_id, validated, decisions, rows)
@@ -4955,7 +4974,8 @@ def build_research_packs(cfg, validated, rows, by_id, graph, measured, voc):
     return manifest
 
 
-def build_evidence_files(cfg, validated, rows, by_id, voc, facets=()):
+def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
+                        reports_dir=None, total_evidence=None):
     """Skill 06 — pure assembly, deterministic, plus the audit set.
 
     The skill file is loaded and written beside the output as the build contract:
@@ -5106,6 +5126,11 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=()):
         fh.write(f"unassigned_count: {len(unassigned)}\n")
         fh.write(f"missing_count: {len(missing)}\n")
 
+    if reports_dir:
+        stagereport.write(reports_dir, "06_build.md", stagereport.build_report(
+            cfg.get("name", "project"), report, len(unassigned), len(missing),
+            total_evidence if total_evidence is not None
+            else sum(n for _, _, n, _, _ in report) + len(unassigned)))
     total = sum(n for _, _, n, _, _ in report)
     print(f"\n  06 build: {total:,} assigned · {len(unassigned):,} unassigned"
           + (f" · {len(missing)} missing" if missing else ""))
