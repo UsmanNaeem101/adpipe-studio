@@ -2737,7 +2737,7 @@ def _legacy_stage03_benchmark(cfg, candidate_path):
         })
     log_root = os.path.join(cfg["_dir"], "logs", "model")
     newest = None
-    if store.exists(log_root):
+    if os.path.isdir(log_root):
         for base, _dirs, files in os.walk(log_root):
             if "request.json" not in files or "response.json" not in files:
                 continue
@@ -3164,7 +3164,7 @@ def _03b_audit_recovery(project_dir, job_id, catalogue):
     response is eligible; truncated or failed calls remain diagnostics only.
     """
     log_root = os.path.join(project_dir, "logs", "model")
-    if not store.exists(log_root):
+    if not os.path.isdir(log_root):
         return None
     candidates = []
     for root, _dirs, files in os.walk(log_root):
@@ -3478,7 +3478,7 @@ def _stage05_audit_recoveries(project_dir, jobs, corpus, preamble):
     if not wanted:
         return {}, {}
     log_root = os.path.join(project_dir, "logs", "model")
-    if not store.exists(log_root):
+    if not os.path.isdir(log_root):
         return {}, {}
     roots = []
     for root, _dirs, files in os.walk(log_root):
