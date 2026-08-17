@@ -51,7 +51,12 @@ import auditlog  # noqa: E402
 import credentials  # noqa: E402
 
 REFS = os.path.join(ROOT, "references")
-PORT = int(os.environ.get("STUDIO_PORT", "8765"))
+PORT = int(os.environ.get("STUDIO_PORT") or os.environ.get("PORT") or "8765")
+# Loopback by default: on a laptop this app is for the person sitting at it, and
+# binding wider would put an app with no login of its own on the local network.
+# A container has to bind 0.0.0.0 to be reachable at all, and there it sits on a
+# private network behind Topic Atlas, which is what checks the session.
+HOST = os.environ.get("STUDIO_HOST", "127.0.0.1")
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 SIZES = {"4:5 portrait": "1024x1536", "1:1 square": "1024x1024",
          "1.91:1 landscape": "1536x1024"}
@@ -4283,18 +4288,21 @@ def main():
         sys.exit(f"No references/ folder at {REFS}")
     n = sum(len(v) for v in list_references().values())
     url = f"http://localhost:{PORT}"
-    print(f"\n  adpipe studio  →  {url}")
+    print(f"\n  adpipe studio  →  {url}" if HOST == "127.0.0.1"
+          else f"\n  adpipe studio  →  {HOST}:{PORT}")
     print(f"  {n} reference ads · {len(projects())} project(s)")
     print("  Add your API keys on the Settings tab. Ctrl-C to stop.\n")
     # Double-clicking Ad Studio.command should pop the browser; a supervisor that
-    # opens its own preview pane should not get a second stray window.
-    if os.environ.get("STUDIO_NO_BROWSER") not in ("1", "true", "yes"):
+    # opens its own preview pane should not get a second stray window, and a
+    # container has no browser to open at all.
+    remote = HOST != "127.0.0.1"
+    if os.environ.get("STUDIO_NO_BROWSER") not in ("1", "true", "yes") and not remote:
         try:
             webbrowser.open(url)
         except Exception:
             pass
     try:
-        Server(("127.0.0.1", PORT), Handler).serve_forever()
+        Server((HOST, PORT), Handler).serve_forever()
     except KeyboardInterrupt:
         print("  stopped.")
 

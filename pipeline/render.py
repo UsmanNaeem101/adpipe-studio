@@ -138,6 +138,14 @@ def template_slots(path):
 # ---------------------------------------------------------------- rendering
 
 def find_chrome():
+    # The error below has always told people to set CHROME, and nothing ever
+    # read it. On a container that is the only way to name a browser that is
+    # neither in /Applications nor first on PATH.
+    override = str(os.environ.get("CHROME") or "").strip()
+    if override:
+        if os.path.exists(override) or shutil.which(override):
+            return override
+        sys.exit(f"CHROME is set to {override!r}, which is not there.")
     for c in CHROME_CANDIDATES:
         if os.path.exists(c):
             return c
