@@ -206,6 +206,14 @@ class SupabaseStore:
         self.key = service_key
         self.table = table
         self.bucket = bucket
+        # The image underneath.
+        #
+        # Templates, the reference ads, the skills markdown and brand.json all
+        # ship inside the container and are read-only; a project's state lives
+        # up here. So a read that misses falls through to the disk, and a write
+        # never does — which is what stops "is this file there?" having a
+        # different answer depending on which layer somebody was thinking of.
+        self.underlay = LocalStore()
 
     # -- plumbing ---------------------------------------------------------
 
@@ -230,12 +238,27 @@ class SupabaseStore:
     # -- reads ------------------------------------------------------------
 
     def exists(self, key):
-        key = normalise(key)
-        if is_binary_key(key):
-            status, _ = self._request("GET", self._object_path(key))
-            return status == 200
-        status, payload = self._rest("GET", "?key=eq.%s&select=key" % urllib.parse.quote(key, safe=""))
-        return status == 200 and payload.strip() not in (b"[]", b"")
+        """
+        Is there anything here?
+
+        A prefix counts, because callers ask this about directories as often as
+        about files — `if os.path.isdir(d): listdir(d)` is the shape all over
+        the pipeline, and a store has no directories, only keys with a common
+        beginning.
+        """
+        tidy = normalise(key)
+        if is_binary_key(tidy):
+            status, _ = self._request("GET", self._object_path(tidy))
+            if status == 200:
+                return True
+        else:
+            status, payload = self._rest(
+                "GET", "?key=eq.%s&select=key" % urllib.parse.quote(tidy, safe=""))
+            if status == 200 and payload.strip() not in (b"[]", b""):
+                return True
+            if self.list_keys(tidy):
+                return True
+        return self.underlay.exists(key)
 
     def read_text(self, key):
         key = normalise(key)
@@ -246,9 +269,9 @@ class SupabaseStore:
             "GET", "?key=eq.%s&select=content" % urllib.parse.quote(key, safe="")
         )
         if status != 200:
-            return None
+            return self.underlay.read_text(key)
         rows = json.loads(payload or b"[]")
-        return rows[0]["content"] if rows else None
+        return rows[0]["content"] if rows else self.underlay.read_text(key)
 
     def read_bytes(self, key):
         key = normalise(key)
@@ -256,7 +279,7 @@ class SupabaseStore:
             text = self.read_text(key)
             return None if text is None else text.encode("utf-8")
         status, payload = self._request("GET", self._object_path(key))
-        return payload if status == 200 else None
+        return payload if status == 200 else self.underlay.read_bytes(key)
 
     # -- writes -----------------------------------------------------------
 
@@ -485,3 +508,31 @@ def open_key(key, mode="r", encoding="utf-8", errors=None, newline=None):
     yield buffer
     value = buffer.getvalue()
     write_bytes(key, value) if binary else write_text(key, value)
+
+
+def dirs_in(prefix):
+    """
+    The children of a prefix that have something under them.
+
+    `os.listdir(d)` filtered by `os.path.isdir` was how this pipeline found its
+    projects, its segments and its stages. A store has no directories, so the
+    equivalent question is which names are the start of a longer key — and it
+    has to be asked deliberately, because "does this exist" answers yes for a
+    stray file and would list it as a project.
+    """
+    given = str(prefix).replace("\\", "/").rstrip("/")
+    tidy = normalise(given)
+    names = set()
+    for key in list_keys(prefix):
+        text = str(key).replace("\\", "/")
+        rest = None
+        for head in (given, tidy):
+            if head and text.startswith(head + "/"):
+                rest = text[len(head) + 1:]
+                break
+        if rest is None:
+            rest = text
+        # A name only counts if the key continues past it.
+        if "/" in rest:
+            names.add(rest.split("/")[0])
+    return sorted(names)

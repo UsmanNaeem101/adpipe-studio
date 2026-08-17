@@ -107,10 +107,9 @@ def projects():
         for p, moves in paths.migrate_all().items():
             print(f"  [{p}] layout updated: " + ", ".join(moves))
     d = os.path.join(ROOT, "projects")
-    if not os.path.isdir(d):
+    if not store.exists(d):
         return []
-    return sorted(p for p in os.listdir(d)
-                  if os.path.isdir(os.path.join(d, p)) and not p.startswith(("_", ".")))
+    return [p for p in store.dirs_in(d) if not p.startswith(("_", "."))]
 
 
 def segments(project):
@@ -124,11 +123,11 @@ def segments(project):
     base = os.path.join(ROOT, "projects", project)
     out = set()
     ev = paths.evidence(base)
-    if os.path.isdir(ev):
-        out |= {f[:-4] for f in os.listdir(ev) if f.endswith(".txt")}
+    if store.exists(ev):
+        out |= {f[:-4] for f in store.names_in(ev) if f.endswith(".txt")}
     ex = paths.extractions(base)
-    if os.path.isdir(ex):
-        out |= {d for d in os.listdir(ex) if os.path.isdir(os.path.join(ex, d))}
+    if store.exists(ex):
+        out |= set(store.dirs_in(ex))
     return sorted(out)
 
 
@@ -204,7 +203,7 @@ def ensure_project(name, product="", market=""):
         raise ValueError("name must be lowercase letters, digits, - or _ (2-41 chars)")
     dest = os.path.join(ROOT, "projects", name)
     existing = os.path.join(dest, "project.json")
-    if os.path.exists(existing):
+    if store.exists(existing):
         return json.load(open(existing, encoding="utf-8")), False
 
     cfg = json.loads(json.dumps(TEMPLATE_PROJECT))
@@ -269,7 +268,7 @@ def move_product(project, product, to):
     # silently re-point its research at the destination project.
     pinned = 0
     seg_path = os.path.join(src, "segments.json")
-    if os.path.exists(seg_path):
+    if store.exists(seg_path):
         try:
             rows = json.load(open(seg_path, encoding="utf-8"))
         except (ValueError, OSError):
@@ -319,7 +318,7 @@ def create_project(name, product, market):
     if not SAFE_NAME.match(name or ""):
         raise ValueError("name must be lowercase letters, digits, - or _ (2-41 chars)")
     dest = os.path.join(ROOT, "projects", name)
-    if os.path.exists(dest):
+    if store.exists(dest):
         raise ValueError(f"project {name!r} already exists")
 
     cfg = json.loads(json.dumps(TEMPLATE_PROJECT))   # deep copy
@@ -341,7 +340,7 @@ def project_summary(name):
     """What a project actually contains — so a delete confirmation can state the
     cost of the mistake rather than asking 'are you sure?' about an unknown."""
     root = os.path.join(ROOT, "projects", name)
-    if not os.path.isdir(root):
+    if not store.exists(root):
         return None
     counts = {"evidence": 0, "extractions": 0, "renders": 0, "voc_files": 0,
               "bytes": 0, "segments": []}
@@ -385,11 +384,11 @@ def project_outputs(project):
     """Everything every stage has produced, so the UI can show real artefacts
     rather than just a log tail."""
     root = os.path.join(ROOT, "projects", project)
-    if not os.path.isdir(root):
+    if not store.exists(root):
         return {}
     prov = {}
     pp = paths.evidence(root, "_provenance.json")
-    if os.path.exists(pp):
+    if store.exists(pp):
         try:
             prov = json.load(open(pp, encoding="utf-8"))
         except Exception:
@@ -397,7 +396,7 @@ def project_outputs(project):
     out = {"stages": [], "provenance": prov}
 
     def entry(stage, label, path, kind="text", role=None):
-        if os.path.exists(path):
+        if store.exists(path):
             stat = os.stat(path)
             rel = os.path.relpath(path, ROOT)
             out["stages"].append({"stage": stage, "label": label, "path": rel,
@@ -429,7 +428,7 @@ def project_outputs(project):
         entry("segment", lbl, os.path.join(voc, f))
 
     discovery = paths.research(root, "segments", "discovery")
-    if os.path.isdir(discovery):
+    if store.exists(discovery):
         for base, _dirs, files in os.walk(discovery):
             for f in sorted(files):
                 if f.endswith((".json", ".md")):
@@ -440,7 +439,7 @@ def project_outputs(project):
     for folder, prefix in (("commercial", "07-08 commercial"),
                            ("final", "09 research pack")):
         stage_dir = paths.research(root, "segments", folder)
-        if os.path.isdir(stage_dir):
+        if store.exists(stage_dir):
             for base, _dirs, files in os.walk(stage_dir):
                 for f in sorted(files):
                     if f.startswith(".") or f.endswith(".meta.json"):
@@ -451,24 +450,24 @@ def project_outputs(project):
                           role="final" if folder == "final" else None)
 
     ed = paths.evidence(root)
-    if os.path.isdir(ed):
-        for f in sorted(os.listdir(ed)):
+    if store.exists(ed):
+        for f in store.names_in(ed):
             if f.endswith(".txt"):
                 entry("segment", f"06 evidence · {f[:-4]}", os.path.join(ed, f))
 
     xd = paths.extractions(root)
-    if os.path.isdir(xd):
-        for seg in sorted(os.listdir(xd)):
+    if store.exists(xd):
+        for seg in store.dirs_in(xd):
             d = os.path.join(xd, seg)
-            if os.path.isdir(d):
-                for f in sorted(os.listdir(d)):
+            if store.exists(d):
+                for f in store.names_in(d):
                     entry("extract", f"{seg} · {f[:-3]}", os.path.join(d, f))
 
     od = paths.assets(root)
-    if os.path.isdir(od):
-        for seg in sorted(os.listdir(od)):
+    if store.exists(od):
+        for seg in store.dirs_in(od):
             d = os.path.join(od, seg)
-            if not os.path.isdir(d):
+            if not store.exists(d):
                 continue
             for f, st in (("01_picc_card.md", "picc"), ("02_concepts.md", "concepts"),
                           ("concepts.json", "concepts"),
@@ -476,13 +475,13 @@ def project_outputs(project):
                           ("plates.json", "brief"), ("remix.json", "brief")):
                 entry(st, f"{seg} · {f}", os.path.join(d, f))
             rd = os.path.join(d, "renders")
-            if os.path.isdir(rd):
-                for f in sorted(os.listdir(rd)):
+            if store.exists(rd):
+                for f in store.names_in(rd):
                     if f.lower().endswith(IMG_EXT):
                         entry("render", f"{seg} · {f}", os.path.join(rd, f), "image")
 
     ld = os.path.join(root, "logs", "model")
-    if os.path.isdir(ld):
+    if store.exists(ld):
         for base, _dirs, files in os.walk(ld):
             for f in sorted(files):
                 if f.endswith((".json", ".jsonl", ".png")):
@@ -546,7 +545,7 @@ def log_runs(project):
     """
     root = os.path.join(ROOT, "projects", project, "logs", "model")
     runs = []
-    if not os.path.isdir(root):
+    if not store.exists(root):
         return runs
     for base, _dirs, files in os.walk(root):
         if "request.json" not in files:
@@ -655,7 +654,7 @@ def segment_voc_files(project):
     files = []
     for name in SEGMENT_VOC_FILES:
         path = os.path.join(voc_dir, name)
-        if os.path.isfile(path):
+        if store.exists(path):
             stat = os.stat(path)
             files.append({
                 "name": name,
@@ -673,7 +672,7 @@ def refine_voc_files(project):
     if project not in projects():
         return []
     voc_dir = paths.voc(os.path.join(ROOT, "projects", project))
-    if not os.path.isdir(voc_dir):
+    if not store.exists(voc_dir):
         return []
     files = []
     for base, _dirs, names in os.walk(voc_dir):
@@ -821,11 +820,11 @@ def library():
     and a content hash so exact duplicates are findable rather than eyeballed."""
     import hashlib
     out, hashes, dirty = [], {}, False
-    if not os.path.isdir(REFS):
+    if not store.exists(REFS):
         return {"items": [], "duplicates": []}
     for cat in sorted(os.listdir(REFS)):
         d = os.path.join(REFS, cat)
-        if not os.path.isdir(d) or not is_ref_category(cat):
+        if not store.exists(d) or not is_ref_category(cat):
             continue
         for f in sorted(os.listdir(d)):
             if not f.lower().endswith(IMG_EXT):
@@ -874,7 +873,7 @@ def delete_reference(rel):
     os.makedirs(trash, exist_ok=True)
     dest = os.path.join(trash, rel.replace(os.sep, "__"))
     n = 1
-    while os.path.exists(dest):
+    while store.exists(dest):
         base, ext = os.path.splitext(dest)
         dest = f"{base}_{n}{ext}"; n += 1
     os.rename(full, dest)
@@ -899,7 +898,7 @@ def convert_reference(rel, quality=90):
     originals = os.path.join(REFS, "_originals")
     os.makedirs(originals, exist_ok=True)
     backup = os.path.join(originals, rel.replace(os.sep, "__"))
-    if not os.path.exists(backup):
+    if not store.exists(backup):
         with open(full, "rb") as a, open(backup, "wb") as b:
             b.write(a.read())
     before = os.path.getsize(full)
@@ -909,13 +908,13 @@ def convert_reference(rel, quality=90):
             ["sips", "-s", "format", "jpeg", "-s", "formatOptions", str(quality),
              full, "--out", tmp],
             capture_output=True, text=True, timeout=60)
-        if r.returncode != 0 or not os.path.exists(tmp):
+        if r.returncode != 0 or not store.exists(tmp):
             raise RuntimeError((r.stderr or "sips failed").strip()[:200])
         if real_format(tmp) != "jpeg":
             raise RuntimeError("sips produced a non-JPEG")
         os.replace(tmp, full)
     except Exception as e:
-        if os.path.exists(tmp):
+        if store.exists(tmp):
             os.remove(tmp)
         return {"rel": rel, "error": str(e)}
     return {"rel": rel, "from": fmt, "before": before,
@@ -926,7 +925,7 @@ def safe_project_file(rel):
     """Only ever serve files from inside projects/."""
     base = os.path.realpath(os.path.join(ROOT, "projects"))
     full = os.path.realpath(os.path.join(ROOT, rel))
-    if not full.startswith(base + os.sep) or not os.path.exists(full):
+    if not full.startswith(base + os.sep) or not store.exists(full):
         raise remix.RemixError("path outside projects/")
     return full
 
@@ -949,14 +948,14 @@ def picc_cards(project):
     aside as a variant shows up next to the generated ones.
     """
     base = paths.assets(os.path.join(ROOT, "projects", project))
-    if not os.path.isdir(base):
+    if not store.exists(base):
         return []
     out = []
-    for seg in sorted(os.listdir(base)):
+    for seg in store.dirs_in(base):
         d = os.path.join(base, seg)
-        if not os.path.isdir(d):
+        if not store.exists(d):
             continue
-        for f in sorted(os.listdir(d)):
+        for f in store.names_in(d):
             if f.endswith(".md") and "picc" in f.lower():
                 full = os.path.join(d, f)
                 out.append({
@@ -1017,11 +1016,11 @@ def is_ref_category(name):
 
 def list_references():
     out = {}
-    if not os.path.isdir(REFS):
+    if not store.exists(REFS):
         return out
     for cat in sorted(os.listdir(REFS)):
         d = os.path.join(REFS, cat)
-        if os.path.isdir(d) and is_ref_category(cat):
+        if store.exists(d) and is_ref_category(cat):
             files = sorted(f for f in os.listdir(d) if f.lower().endswith(IMG_EXT))
             if files:
                 out[cat] = files
@@ -1033,7 +1032,7 @@ def safe_ref_path(rel):
     full = os.path.realpath(os.path.join(REFS, rel))
     if not full.startswith(os.path.realpath(REFS) + os.sep):
         raise remix.RemixError("reference path escapes the library")
-    if not os.path.exists(full):
+    if not store.exists(full):
         raise remix.RemixError(f"reference not found: {rel}")
     return full
 
@@ -1048,7 +1047,7 @@ def thumbnail(full_path, rel):
     os.makedirs(THUMBS, exist_ok=True)
     key = rel.replace(os.sep, "__").rsplit(".", 1)[0] + ".jpg"
     dest = os.path.join(THUMBS, key)
-    if os.path.exists(dest) and os.path.getmtime(dest) >= os.path.getmtime(full_path):
+    if store.exists(dest) and os.path.getmtime(dest) >= os.path.getmtime(full_path):
         return dest, "image/jpeg"
     try:
         subprocess.run(
@@ -3736,7 +3735,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(u.query)
             project = (q.get("project") or [""])[0]
             path = os.path.join(ROOT, "projects", project, "project.json")
-            if not SAFE_NAME.match(project or "") or not os.path.isfile(path):
+            if not SAFE_NAME.match(project or "") or not store.exists(path):
                 return self._send(404, json.dumps({"error": "unknown project"}))
             cfg = json.load(open(path, encoding="utf-8"))
             return self._send(200, json.dumps({
@@ -3788,7 +3787,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             req = self._json()
             project = req.get("project") or ""
             full = os.path.join(ROOT, "projects", project, "project.json")
-            if not SAFE_NAME.match(project) or not os.path.isfile(full):
+            if not SAFE_NAME.match(project) or not store.exists(full):
                 return self._send(404, json.dumps({"error": "unknown project"}))
             try:
                 with _lock:
@@ -3880,7 +3879,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     failed.append(f"{name}: could not decode"); continue
                 dest = os.path.join(dest_dir, name)
                 n = 1
-                while os.path.exists(dest):
+                while store.exists(dest):
                     b, e = os.path.splitext(os.path.join(dest_dir, name))
                     dest = f"{b}_{n}{e}"; n += 1
                 open(dest, "wb").write(raw)
@@ -4225,7 +4224,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if req.get("rules_only"):
                 cmd.append("--rules-only")
             src = req.get("source") or ""
-            if not os.path.exists(src):
+            if not store.exists(src):
                 return self._send(200, f"Raw VOC file not found:\n  {src}\n",
                                   "text/plain; charset=utf-8")
             cmd.append(src)
@@ -4251,7 +4250,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif stage == "segment":
             vsrc = req.get("voc_source") or ""
             if vsrc:
-                if not os.path.exists(vsrc):
+                if not store.exists(vsrc):
                     return self._send(200, f"VOC source not found:\n  {vsrc}\n",
                                       "text/plain; charset=utf-8")
                 cmd += ["--source", vsrc]
@@ -4285,7 +4284,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    if not os.path.isdir(REFS):
+    if not store.exists(REFS):
         sys.exit(f"No references/ folder at {REFS}")
     n = sum(len(v) for v in list_references().values())
     url = f"http://localhost:{PORT}"

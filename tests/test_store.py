@@ -267,3 +267,66 @@ class ListingShapeTests(unittest.TestCase):
             self.assertEqual(store_module.names_in(outside), ["day"])
         finally:
             store_module.use(None)
+
+
+class DirectoryShapeTests(unittest.TestCase):
+    """"Directories under here" has no direct equivalent in a store.
+
+    `os.listdir(d)` filtered by `os.path.isdir` was how this pipeline found its
+    projects, its segments and its stages. Replacing that with "does this
+    exist" answers yes for a stray file, and a stray file listed as a project
+    is the kind of wrong that only shows up in front of someone.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.store = store_module.LocalStore(self.dir)
+        store_module.use(self.store)
+
+    def tearDown(self):
+        store_module.use(None)
+
+    def test_only_names_with_something_under_them_count(self):
+        self.store.write_text("projects/montisella/product.json", "{}")
+        self.store.write_text("projects/lumbar/product.json", "{}")
+        self.store.write_text("projects/stray-note.txt", "not a project")
+        self.assertEqual(store_module.dirs_in("projects"), ["lumbar", "montisella"])
+        # names_in is the unfiltered question, and still answers it.
+        self.assertIn("stray-note.txt", store_module.names_in("projects"))
+
+    def test_it_works_from_an_absolute_prefix_too(self):
+        self.store.write_text("projects/p/extractions/seg/07.md", "x")
+        absolute = os.path.join(self.dir, "projects", "p", "extractions")
+        self.assertEqual(store_module.dirs_in(absolute), ["seg"])
+
+    def test_nothing_there_is_an_empty_list(self):
+        self.assertEqual(store_module.dirs_in("projects"), [])
+
+
+class UnderlayTests(unittest.TestCase):
+    """The image underneath.
+
+    Templates, reference ads and the skills markdown ship inside the container
+    and are read-only. A read that misses the store falls through to them; a
+    write never does, so nothing can overwrite what shipped.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.store = StubSupabase()
+        self.store.underlay = store_module.LocalStore(self.dir)
+
+    def test_a_read_falls_through_to_the_image(self):
+        self.store.underlay.write_text("pipeline/templates/a.html", "<div>")
+        self.store.reply = (200, b"[]")  # not in the store
+        self.assertEqual(self.store.read_text("pipeline/templates/a.html"), "<div>")
+
+    def test_existence_falls_through_too(self):
+        self.store.underlay.write_text("references/ads/one.png", "x")
+        self.store.reply = (404, b"")
+        self.assertTrue(self.store.exists("references/ads/one.png"))
+
+    def test_a_write_never_goes_to_the_image(self):
+        self.store.reply = (201, b"")
+        self.store.write_text("projects/p/brief.md", "mine")
+        self.assertIsNone(self.store.underlay.read_text("projects/p/brief.md"))
