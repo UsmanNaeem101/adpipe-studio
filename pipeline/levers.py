@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import store
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -268,7 +269,7 @@ def extraction_dir(project: str, segment: str) -> str:
 def _file_for(directory: str, skill_n: int):
     if not os.path.isdir(directory):
         return None
-    for f in sorted(os.listdir(directory)):
+    for f in store.names_in(directory):
         if f.startswith(f"{skill_n:02d}_") and f.endswith(".md"):
             return os.path.join(directory, f)
     return None
@@ -292,7 +293,7 @@ def load(project: str, segment: str) -> dict:
             found += 1
             entry["file"] = os.path.relpath(path, ROOT)
             try:
-                text = open(path, encoding="utf-8", errors="replace").read()
+                text = store.read_text(path) or ""
             except OSError as e:
                 entry["error"] = str(e)
             else:

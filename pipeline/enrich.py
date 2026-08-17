@@ -35,6 +35,7 @@ import sys
 
 import presets
 import products
+import store
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -104,13 +105,13 @@ def read_extractions(project, slug, skills=None):
             f"No extractions for segment {slug!r}. Run the extract stage first.")
     want = {s.strip().zfill(2) for s in (skills or "").split(",") if s.strip()}
     parts = []
-    for f in sorted(os.listdir(d)):
+    for f in store.names_in(d):
         if not f.endswith(".md"):
             continue
         if want and f[:2] not in want:
             continue
         parts.append(f"## {f[:-3]}\n\n"
-                     + open(os.path.join(d, f), encoding="utf-8").read())
+                     + (store.read_text(os.path.join(d, f)) or ""))
     if not parts:
         raise EnrichError(f"No extraction files matched under {slug}.")
     return "\n\n---\n\n".join(parts)

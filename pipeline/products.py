@@ -42,6 +42,7 @@ import json
 import os
 import re
 import sys
+import store
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -507,11 +508,11 @@ def product_dir(project, product):
 
 
 def list_products(project):
-    d = products_root(project)
-    if not os.path.isdir(d):
-        return []
-    return sorted(p for p in os.listdir(d)
-                  if os.path.isdir(os.path.join(d, p)) and not p.startswith((".", "_")))
+    # "Directories under products/" becomes "first path segment under that
+    # prefix" — a store has prefixes, not folders, and an empty one does not
+    # exist at all rather than existing and being empty.
+    return [name for name in store.names_in(products_root(project))
+            if not name.startswith((".", "_"))]
 
 
 def resolve_product(project, product=None):
@@ -540,19 +541,22 @@ def migrate_legacy(project):
     legacy = os.path.join(root, "product.json")
     if not os.path.exists(legacy) or list_products(project):
         return None
-    try:
-        stored = json.load(open(legacy, encoding="utf-8"))
-    except ValueError:
+    stored = store.read_json(legacy)
+    if stored is None:
         return None
     name = value_of((stored.get("identity") or {}).get("name")) or project
     slug = slugify(name)[:40] or "product"
     d = product_dir(project, slug)
-    os.makedirs(d, exist_ok=True)
-    os.replace(legacy, os.path.join(d, "product.json"))
+    # A move is a copy and a delete: `os.replace` has no equivalent in a store,
+    # and this runs once per project on an old layout.
+    store.write_json(os.path.join(d, "product.json"), stored)
+    store.delete(legacy)
     for fn in ("product_sheet.md", "product_sheet.previous.md", "segments.json"):
         src = os.path.join(root, fn)
-        if os.path.exists(src):
-            os.replace(src, os.path.join(d, fn))
+        carried = store.read_text(src)
+        if carried is not None:
+            store.write_text(os.path.join(d, fn), carried)
+            store.delete(src)
     return slug
 
 
@@ -582,9 +586,10 @@ def slugify(name):
 def load(project, product):
     doc = blank_product()
     p = doc_path(project, product)
-    if os.path.exists(p):
+    raw = store.read_text(p)
+    if raw is not None:
         try:
-            stored = json.load(open(p, encoding="utf-8"))
+            stored = json.loads(raw)
         except ValueError as e:
             raise ProductError(f"product.json is not valid JSON: {e}")
         doc = _clean(stored, PRODUCT_SECTIONS)
@@ -593,10 +598,11 @@ def load(project, product):
 
 def load_segments(project, product):
     p = segments_path(project, product)
-    if not os.path.exists(p):
+    raw = store.read_text(p)
+    if raw is None:
         return []
     try:
-        rows = json.load(open(p, encoding="utf-8"))
+        rows = json.loads(raw)
     except ValueError as e:
         raise ProductError(f"segments.json is not valid JSON: {e}")
     out = []
@@ -609,24 +615,21 @@ def load_segments(project, product):
 
 def save(project, product, doc):
     d = product_dir(project, product)
-    os.makedirs(d, exist_ok=True)
     sheet, docp = sheet_path(project, product), doc_path(project, product)
     # A hand-written sheet predates the form. The render is built only from the
     # form, so keep a copy rather than discovering the loss afterwards.
-    if os.path.exists(sheet) and not os.path.exists(docp):
+    if store.exists(sheet) and not store.exists(docp):
         backup = os.path.join(d, "product_sheet.previous.md")
-        if not os.path.exists(backup):
-            open(backup, "w", encoding="utf-8").write(
-                open(sheet, encoding="utf-8").read())
+        if not store.exists(backup):
+            store.write_text(backup, store.read_text(sheet) or "")
     clean = _clean(doc, PRODUCT_SECTIONS)
-    json.dump(clean, open(docp, "w", encoding="utf-8"), indent=2)
-    open(sheet, "w", encoding="utf-8").write(product_markdown(clean, product))
+    store.write_json(docp, clean)
+    store.write_text(sheet, product_markdown(clean, product))
     return clean
 
 
 def save_segments(project, product, rows):
     d = product_dir(project, product)
-    os.makedirs(d, exist_ok=True)
     out, seen = [], set()
     for r in (rows or []):
         doc = _clean(r.get("doc") or {}, SEGMENT_SECTIONS)
@@ -638,14 +641,10 @@ def save_segments(project, product, rows):
             slug += "_2"
         seen.add(slug)
         out.append({"slug": slug, "doc": doc})
-    json.dump(out, open(segments_path(project, product), "w", encoding="utf-8"), indent=2)
-
-    sd = os.path.join(d, "segments")
-    os.makedirs(sd, exist_ok=True)
+    store.write_json(segments_path(project, product), out)
     for r in out:
-        open(segment_sheet_path(project, product, r["slug"]), "w",
-             encoding="utf-8").write(
-            segment_markdown(r["doc"], load(project, product), r["slug"]))
+        store.write_text(segment_sheet_path(project, product, r["slug"]),
+                         segment_markdown(r["doc"], load(project, product), r["slug"]))
     return out
 
 

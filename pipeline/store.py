@@ -327,10 +327,12 @@ def build_store(environ=None):
     if url and key:
         return SupabaseStore(url, key)
 
+    # No root of its own unless one is named: LocalStore then follows
+    # `paths.ROOT`, which is what the test suite moves per test and what the
+    # rest of the pipeline already treats as "where things are". Pinning a root
+    # here would quietly resolve every relative key against the repo instead.
     root = (environ.get("ADPIPE_DATA_ROOT") or "").strip()
-    if not root:
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return LocalStore(root)
+    return LocalStore(root or None)
 
 
 _store = None

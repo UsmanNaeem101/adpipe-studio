@@ -31,6 +31,7 @@ import urllib.request
 import credentials
 
 import auditlog
+import store
 
 API_URL = os.environ.get("IMAGE_API_URL", "https://api.openai.com/v1/images/generations")
 MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-1")
@@ -119,10 +120,9 @@ def main():
         if n + 1 < len(parts):
             auditlog.set_context(project=parts[n + 1], stage="plates", source="plates_cli")
 
-    doc = json.load(open(args.plates, encoding="utf-8"))
+    doc = store.read_json(args.plates)
     base = os.path.dirname(os.path.abspath(args.plates))
     out = os.path.join(base, "plates")
-    os.makedirs(out, exist_ok=True)
 
     jobs = doc["plates"]
     if args.only:
@@ -171,18 +171,18 @@ def main():
             before = len(data)
             data, removed = exifstrip.strip(data)
             note = "  " + exifstrip.describe(removed, before, len(data))
-        open(dest, "wb").write(data)
+        store.write_bytes(dest, data)
         print(f"      -> plates/{j['file']}{note}")
 
     if args.wire:
         cp = os.path.join(base, "concepts.json")
-        cdoc = json.load(open(cp, encoding="utf-8"))
+        cdoc = store.read_json(cp)
         by_id = {c["id"]: c for c in cdoc["concepts"]}
         for j, _ in todo:
             c = by_id.get(j["concept"])
             if c:
                 c["slots"][j["slot"]] = f"plates/{j['file']}"
-        json.dump(cdoc, open(cp, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+        store.write_json(cp, cdoc)
         print(f"\n  wired {len(todo)} plates into concepts.json")
 
     print("\n  Now re-render:  ./adpipe render <segment>")

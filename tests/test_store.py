@@ -183,6 +183,33 @@ class BuildStoreTests(unittest.TestCase):
         built = store_module.build_store({})
         self.assertEqual(built.kind, "local")
 
+    def test_the_local_store_follows_paths_root(self):
+        """No root of its own unless one is named.
+
+        The rest of the pipeline treats `paths.ROOT` as where things are, and
+        the test suite moves it per test. A store that pinned a root at first
+        use would resolve every relative key against the repository instead —
+        which looked, from the outside, like products vanishing the moment they
+        were created.
+        """
+        import paths
+
+        built = store_module.build_store({})
+        with tempfile.TemporaryDirectory() as moved:
+            original = paths.ROOT
+            paths.ROOT = moved
+            try:
+                self.assertEqual(built.root, os.path.abspath(moved))
+                built.write_text("projects/p/a.json", "{}")
+                self.assertTrue(os.path.exists(os.path.join(moved, "projects", "p", "a.json")))
+            finally:
+                paths.ROOT = original
+
+    def test_a_named_root_wins(self):
+        with tempfile.TemporaryDirectory() as named:
+            built = store_module.build_store({"ADPIPE_DATA_ROOT": named})
+            self.assertEqual(built.root, os.path.abspath(named))
+
     def test_half_a_configuration_is_not_supabase(self):
         # A URL with no key would fail on every call; better to stay local and
         # be obviously local than to fail obscurely on the first write.

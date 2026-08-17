@@ -38,6 +38,7 @@ import urllib.request
 
 import auditlog
 import modeloutput
+import store
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEVERS_MD = os.environ.get(
@@ -118,7 +119,7 @@ def parse(path=None):
         raise PresetError(
             f"execution lever library not found at {path} — it ships in "
             f"reference_docs/. Set LEVERS_MD to point somewhere else.")
-    text = open(path, encoding="utf-8").read()
+    text = store.read_text(path) or ""
 
     presets, cur, section = [], None, None
     for line in text.splitlines():
@@ -214,7 +215,7 @@ def _categories(path=None):
     """
     path = path or LEVERS_MD
     cats, cur = [], None
-    for line in open(path, encoding="utf-8"):
+    for line in (store.read_text(path) or "").splitlines():
         if line.startswith("# "):
             m = _SCHEMA_CAT.match(line)
             if not m:
