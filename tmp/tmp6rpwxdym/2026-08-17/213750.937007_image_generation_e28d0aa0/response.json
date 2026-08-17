@@ -1,0 +1,20 @@
+{
+  "completed_at": "2026-08-17T21:37:50.937+00:00",
+  "elapsed_seconds": 0.0,
+  "text": null,
+  "text_bytes": null,
+  "empty_text": false,
+  "metadata": {
+    "binary_file": "response.png",
+    "mime_type": "image/png",
+    "binary_bytes": 15,
+    "binary_sha256": "024c0b24fbf10f83a0c8d445d8765ac802f63b1de6aa6b021f5f29f73e48b4b4"
+  },
+  "provider_response": {
+    "data": [
+      {
+        "b64_json": "[stored]"
+      }
+    ]
+  }
+}

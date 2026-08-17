@@ -47,6 +47,7 @@ import corpus_policy  # noqa: E402
 import researchpack  # noqa: E402
 import stagereport  # noqa: E402
 from llm import BatchResult, NO_RETRY_STOP_REASONS  # noqa: E402
+import store
 
 SKILLS = os.path.join(ROOT, "skills")
 
@@ -130,9 +131,9 @@ def stage_skill_manifest(stage):
     for filename, label, purpose in STAGE_SKILLS.get(stage, []):
         path = os.path.join(SKILLS, filename)
         rows.append({"file": filename, "label": label, "purpose": purpose,
-                     "present": os.path.isfile(path),
-                     "lines": (len(open(path, encoding="utf-8").read().split("\n"))
-                               if os.path.isfile(path) else 0)})
+                     "present": store.exists(path),
+                     "lines": (len((store.read_text(path) or "").split("\n"))
+                               if store.exists(path) else 0)})
     return rows
 
 
@@ -140,13 +141,13 @@ def extractor_skill_manifest():
     """Skills 07-26, the per-dimension extractors, with their real filenames."""
     rows = []
     for number in EXTRACTORS:
-        match = next((f for f in sorted(os.listdir(SKILLS))
+        match = next((f for f in store.names_in(SKILLS)
                       if f.startswith(f"{number:02d}_") and f.endswith(".md")), None)
         path = os.path.join(SKILLS, match) if match else None
         rows.append({
             "n": number, "title": SKILL_TITLES.get(number, str(number)),
             "file": match or "", "present": bool(match),
-            "lines": (len(open(path, encoding="utf-8").read().split("\n"))
+            "lines": (len((store.read_text(path) or "").split("\n"))
                       if path else 0)})
     return rows
 
@@ -170,10 +171,10 @@ def chosen_extractors(args):
 
 def load_project(name):
     p = os.path.join(ROOT, "projects", name, "project.json")
-    if not os.path.exists(p):
-        avail = os.listdir(os.path.join(ROOT, "projects"))
+    if not store.exists(p):
+        avail = store.names_in(os.path.join(ROOT, "projects"))
         sys.exit(f"No project {name!r}. Available: {', '.join(sorted(avail))}")
-    cfg = json.load(open(p, encoding="utf-8"))
+    cfg = store.read_json(p)
     cfg["_dir"] = os.path.dirname(p)
     # Fold a flat project into research/products/assets the first time it is
     # touched, so an old checkout keeps working without a manual step.
@@ -195,7 +196,7 @@ def provenance_path(cfg):
 
 def read_provenance(cfg):
     p = provenance_path(cfg)
-    return json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+    return store.read_json(p) if store.exists(p) else {}
 
 
 def record_provenance(cfg, segment, origin, detail):
@@ -223,7 +224,7 @@ def warn_if_imported(cfg, segment):
 
 def skill(n):
     """Read skill NN_*.md — the instruction for one pipeline stage."""
-    for f in sorted(os.listdir(SKILLS)):
+    for f in store.names_in(SKILLS):
         if f.startswith(f"{n:02d}_") and f.endswith(".md"):
             with open(os.path.join(SKILLS, f), encoding="utf-8") as fh:
                 return f[:-3], fh.read()
@@ -233,9 +234,9 @@ def skill(n):
 def skill_named(filename):
     """Read one explicitly named skill when a numbered stage has subskills."""
     path = os.path.join(SKILLS, filename)
-    if not os.path.isfile(path):
+    if not store.exists(path):
         sys.exit(f"Skill {filename} not found in {SKILLS}")
-    with open(path, encoding="utf-8") as fh:
+    with store.open_key(path, encoding="utf-8") as fh:
         return fh.read()
 
 
@@ -1468,7 +1469,7 @@ def _save_failure(diagnostics_dir, job, result, reason, suffix):
     provider_error = (json.dumps(
         result.provider_error, ensure_ascii=False, sort_keys=True)
         if result.provider_error else "none")
-    with open(os.path.join(diagnostics_dir, f"{job.id}.{suffix}.txt"), "w",
+    with store.open_key(os.path.join(diagnostics_dir, f"{job.id}.{suffix}.txt"), "w",
               encoding="utf-8") as fh:
         fh.write(f"WHY SAVED: {reason}\n"
                  f"STOP REASON: {result.stop_reason or 'unknown'}\n"
@@ -1732,7 +1733,7 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
     if unexpected:
         os.makedirs(diagnostics_dir, exist_ok=True)
         for jid in unexpected:
-            with open(os.path.join(diagnostics_dir, f"{jid}.unexpected.txt"), "w",
+            with store.open_key(os.path.join(diagnostics_dir, f"{jid}.unexpected.txt"), "w",
                       encoding="utf-8") as fh:
                 fh.write(_raw_text(results[jid]))
 
@@ -1806,7 +1807,7 @@ def reddit_source_fields(url):
 
 
 def _read_jsonl(path):
-    with open(path, encoding="utf-8") as fh:
+    with store.open_key(path, encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
 
 
@@ -1814,7 +1815,7 @@ def _write_jsonl_atomic(path, rows):
     """Write stable JSONL without leaving a half-written canonical export."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8", newline="\n") as fh:
+    with store.open_key(temporary, "w", encoding="utf-8", newline="\n") as fh:
         for row in rows:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     os.replace(temporary, path)
@@ -1827,12 +1828,12 @@ def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
     groups_path = groups_path or os.path.join(voc, "duplicate_groups.jsonl")
     production_path = os.path.join(voc, PRODUCTION_VOC_FILE)
     audit_path = os.path.join(voc, AUDIT_VOC_FILE)
-    if not os.path.exists(input_path):
+    if not store.exists(input_path):
         raise SystemExit(
             f"No completed deduplicated VOC at {input_path}. Run ingest first.")
 
     source_rows = _read_jsonl(input_path)
-    groups = _read_jsonl(groups_path) if os.path.exists(groups_path) else []
+    groups = _read_jsonl(groups_path) if store.exists(groups_path) else []
     groups_by_canonical = defaultdict(list)
     for group in groups:
         canonical_id = group.get("canonical_id")
@@ -1983,7 +1984,7 @@ def cmd_ingest(cfg, args):
     """
     from llm import Job, confirm
 
-    with open(args.source, encoding="utf-8", errors="ignore") as fh:
+    with store.open_key(args.source, encoding="utf-8", errors="ignore") as fh:
         raw = fh.read()
     blocks = parse_voc(raw)
     voc = paths.voc(cfg["_dir"]); os.makedirs(voc, exist_ok=True)
@@ -2149,7 +2150,7 @@ def cmd_ingest(cfg, args):
     _write_jsonl(os.path.join(voc, "deduplicated_voc.jsonl"), deduped)
     # The segment stage reads filtered_voc.jsonl — keep that name as the contract.
     _write_jsonl(os.path.join(voc, "filtered_voc.jsonl"), deduped)
-    with open(os.path.join(voc, "duplicate_groups.jsonl"), "w", encoding="utf-8") as fh:
+    with store.open_key(os.path.join(voc, "duplicate_groups.jsonl"), "w", encoding="utf-8") as fh:
         for g in groups:
             fh.write(json.dumps(g) + "\n")
 
@@ -2166,7 +2167,7 @@ def cmd_ingest(cfg, args):
 
 
 def _write_jsonl(path, rows):
-    with open(path, "w", encoding="utf-8") as fh:
+    with store.open_key(path, "w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r) + "\n")
 
@@ -2558,7 +2559,7 @@ def _enforce_assignment_thresholds(rows, diagnostics_dir, verbose=True):
 
     os.makedirs(diagnostics_dir, exist_ok=True)
     path = os.path.join(diagnostics_dir, "threshold_violations.jsonl")
-    with open(path, "w", encoding="utf-8") as fh:
+    with store.open_key(path, "w", encoding="utf-8") as fh:
         for violation in violations:
             fh.write(json.dumps(violation, ensure_ascii=False) + "\n")
     share = len(violations) / max(len(rows), 1)
@@ -2676,14 +2677,14 @@ def _segment_force(args, step):
 def _json_atomic(path, value):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as fh:
+    with store.open_key(temporary, "w", encoding="utf-8") as fh:
         json.dump(value, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
     os.replace(temporary, path)
 
 
 def _load_json(path):
-    with open(path, encoding="utf-8") as fh:
+    with store.open_key(path, encoding="utf-8") as fh:
         return json.load(fh)
 
 
@@ -2721,8 +2722,8 @@ def _meter_delta(before, after):
 
 def _legacy_stage03_benchmark(cfg, candidate_path):
     """Best-effort comparison data from the preserved output and audit logs."""
-    benchmark = {"available": os.path.isfile(candidate_path)}
-    if os.path.isfile(candidate_path):
+    benchmark = {"available": store.exists(candidate_path)}
+    if store.exists(candidate_path):
         candidates = _load_json(candidate_path)
         empty = sum(not row.get("representative_evidence_ids") for row in candidates)
         placeholder = re.compile(r"placeholder|tbd|lorem|unknown audience", re.I)
@@ -2736,7 +2737,7 @@ def _legacy_stage03_benchmark(cfg, candidate_path):
         })
     log_root = os.path.join(cfg["_dir"], "logs", "model")
     newest = None
-    if os.path.isdir(log_root):
+    if store.exists(log_root):
         for base, _dirs, files in os.walk(log_root):
             if "request.json" not in files or "response.json" not in files:
                 continue
@@ -2867,9 +2868,9 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
         path = os.path.join(artifact_dir, f"{job.id}.json")
         fingerprint = _job_fingerprint(
             job, chunk["evidence_ids"], corpus, contract_version)
-        if os.path.isfile(path) and not force:
+        if store.exists(path) and not force:
             try:
-                with open(path, encoding="utf-8") as fh:
+                with store.open_key(path, encoding="utf-8") as fh:
                     saved = json.load(fh)
                 acceptable = {fingerprint}
                 acceptable.update(
@@ -3163,7 +3164,7 @@ def _03b_audit_recovery(project_dir, job_id, catalogue):
     response is eligible; truncated or failed calls remain diagnostics only.
     """
     log_root = os.path.join(project_dir, "logs", "model")
-    if not os.path.isdir(log_root):
+    if not store.exists(log_root):
         return None
     candidates = []
     for root, _dirs, files in os.walk(log_root):
@@ -3477,7 +3478,7 @@ def _stage05_audit_recoveries(project_dir, jobs, corpus, preamble):
     if not wanted:
         return {}, {}
     log_root = os.path.join(project_dir, "logs", "model")
-    if not os.path.isdir(log_root):
+    if not store.exists(log_root):
         return {}, {}
     roots = []
     for root, _dirs, files in os.walk(log_root):
@@ -3603,7 +3604,7 @@ def _run_stage05_assignments(c, corpus, jobs, chunks, artifact_dir,
         expected_fingerprint = _job_fingerprint(
             job, chunks_by_id[job.id]["evidence_ids"], corpus,
             "stage05_assign_v1")
-        if os.path.isfile(path) and not force:
+        if store.exists(path) and not force:
             try:
                 saved = _load_json(path)
                 if saved.get("fingerprint") != expected_fingerprint:
@@ -3789,7 +3790,7 @@ def _completed_segmentation_inputs(cfg, voc):
     decisions_path = os.path.join(voc, "validated_segments.json")
     assignments_path = os.path.join(voc, "segment_assignments.jsonl")
     missing = [path for path in (candidates_path, decisions_path, assignments_path)
-               if not os.path.isfile(path)]
+               if not store.exists(path)]
     if missing:
         sys.exit("Cannot start the commercial synthesis layer: missing completed "
                  "Stage 03--05 artifact(s):\n  " + "\n  ".join(missing))
@@ -3805,7 +3806,7 @@ def _completed_segmentation_inputs(cfg, voc):
     # the graph: without it every child is re-judged as a root and the resume
     # quietly drops segments the full run kept.
     graph_path = os.path.join(voc, "segment_graph.json")
-    graph = (_load_json(graph_path) if os.path.isfile(graph_path)
+    graph = (_load_json(graph_path) if store.exists(graph_path)
              else {"specialises": [], "adjacent": []})
     validated = _apply_segment_floors(validated, decisions, cfg, graph=graph)
     if not validated:
@@ -3856,9 +3857,9 @@ def _extraction_documents(cfg, slugs):
     documents = []
     for slug in slugs:
         directory = paths.extractions(cfg["_dir"], slug)
-        if not os.path.isdir(directory):
+        if not store.exists(directory):
             continue
-        for name in sorted(os.listdir(directory)):
+        for name in store.names_in(directory):
             if not name.endswith(".md"):
                 continue
             try:
@@ -3869,7 +3870,7 @@ def _extraction_documents(cfg, slugs):
                 continue
             path = os.path.join(directory, name)
             try:
-                with open(path, encoding="utf-8") as handle:
+                with store.open_key(path, encoding="utf-8") as handle:
                     text = handle.read().strip()
             except OSError:
                 continue
@@ -3949,7 +3950,7 @@ def _run_commercial_layers(c, cfg, args, items, by_id, validated, decisions,
     catalogue = mapping = None
     if (not _segment_force(args, "07") and _meta_matches(
             meta07_path, fingerprint07)
-            and os.path.isfile(catalogue_path) and os.path.isfile(mapping_path)):
+            and store.exists(catalogue_path) and store.exists(mapping_path)):
         try:
             catalogue = _load_json(catalogue_path)
             mapping = _load_json(mapping_path)
@@ -4043,7 +4044,7 @@ def _run_commercial_layers(c, cfg, args, items, by_id, validated, decisions,
         meta_path = output_path + ".meta.json"
         if (not _segment_force(args, "08")
                 and _meta_matches(meta_path, fingerprint)
-                and os.path.isfile(output_path)):
+                and store.exists(output_path)):
             try:
                 synthesis = _load_json(output_path)
                 commercial.validate_synthesis(synthesis, canonical)
@@ -4223,7 +4224,7 @@ def _run_commercial_layers(c, cfg, args, items, by_id, validated, decisions,
     meta09 = os.path.join(final_dir, "09.meta.json")
     index_path = os.path.join(final_dir, "00_segment_index.txt")
     if (_segment_force(args, "09") or not _meta_matches(
-            meta09, stage09_fingerprint) or not os.path.isfile(index_path)):
+            meta09, stage09_fingerprint) or not store.exists(index_path)):
         index, _filenames = commercial.render_research_pack(
             final_dir, cfg["name"], len(items), assigned_count,
             len(items) - assigned_count, validated, catalogue, mapping,
@@ -4264,7 +4265,7 @@ def cmd_segment(cfg, args):
 
     requested_source = getattr(args, "source", None)
     src = requested_source or paths.voc(cfg["_dir"], PRODUCTION_VOC_FILE)
-    if not os.path.exists(src):
+    if not store.exists(src):
         sys.exit(f"No production VOC at {src}. Run: adpipe -p {cfg['name']} "
                  "refine-voc (or run ingest first).")
     items = _read_jsonl(src)
@@ -4275,10 +4276,10 @@ def cmd_segment(cfg, args):
                      "run refine-voc again.")
     voc = paths.voc(cfg["_dir"]); os.makedirs(voc, exist_ok=True)
     audit_path = os.path.join(voc, AUDIT_VOC_FILE)
-    if not requested_source and not os.path.exists(audit_path):
+    if not requested_source and not store.exists(audit_path):
         sys.exit(f"No audit VOC at {audit_path}. Run: adpipe -p {cfg['name']} "
                  "refine-voc before segmenting.")
-    audit_items = _read_jsonl(audit_path) if os.path.exists(audit_path) else []
+    audit_items = _read_jsonl(audit_path) if store.exists(audit_path) else []
     try:
         by_id = _join_production_audit(
             items, audit_items, require_complete=not bool(requested_source))
@@ -4322,7 +4323,7 @@ def cmd_segment(cfg, args):
     # Preserve the monolithic result before the first multi-pass run.
     cand_p = os.path.join(voc, "candidate_segments.json")
     legacy_p = os.path.join(discovery, "03_monolithic_candidate_segments.json")
-    if os.path.isfile(cand_p) and not os.path.exists(legacy_p):
+    if store.exists(cand_p) and not store.exists(legacy_p):
         try:
             prior_candidates = _load_json(cand_p)
         except (OSError, ValueError):
@@ -4466,7 +4467,7 @@ def cmd_segment(cfg, args):
                 f"./adpipe -p {project} segment") from final_error
     catalogue_p = os.path.join(discovery, "03a_candidate_catalogue.json")
     legacy_catalogue = (_load_json(catalogue_p)
-                        if os.path.isfile(catalogue_p) else None)
+                        if store.exists(catalogue_p) else None)
     _json_atomic(catalogue_p, catalogue)
     print(f"  03A harvest: {len(chunks03a)} chunks · {len(catalogue)} provisional "
           f"candidates -> {catalogue_p}")
@@ -4510,11 +4511,11 @@ def cmd_segment(cfg, args):
     catalogue_fingerprint = _value_fingerprint(catalogue)
     initial = None
     force03b = _segment_force(args, "03b")
-    if (os.path.isfile(initial_p) and not force03b
+    if (store.exists(initial_p) and not force03b
             and _meta_matches(initial_meta, catalogue_fingerprint)):
         initial = _load_json(initial_p)
         print(f"  03B consolidate: reusing {len(initial)} candidates")
-    elif os.path.isfile(initial_p) and legacy_catalogue and not force03b:
+    elif store.exists(initial_p) and legacy_catalogue and not force03b:
         try:
             initial = segmentation.migrate_legacy_consolidated(
                 _load_json(initial_p), legacy_catalogue, catalogue)
@@ -4663,7 +4664,7 @@ def cmd_segment(cfg, args):
     final03b_p = os.path.join(discovery, "03b_consolidated_candidates.json")
     final03b_meta = final03b_p + ".meta.json"
     final03b_fingerprint = _value_fingerprint({"initial": initial, "novelty": novelty})
-    if (os.path.isfile(final03b_p) and not _segment_force(args, "03c")
+    if (store.exists(final03b_p) and not _segment_force(args, "03c")
             and _meta_matches(final03b_meta, final03b_fingerprint)):
         final = _load_json(final03b_p)
     elif novelty:
@@ -4765,11 +4766,11 @@ def cmd_segment(cfg, args):
     graph_p = os.path.join(voc, "segment_graph.json")
     candidate_fingerprint = _value_fingerprint(
         {"candidates": candidates, "provisional_facets": provisional_facets})
-    if (os.path.exists(val_p) and not _segment_force(args, "04")
+    if (store.exists(val_p) and not _segment_force(args, "04")
             and _meta_matches(val_meta, candidate_fingerprint)):
         decisions = _load_json(val_p)
-        facets = _load_json(facets_p) if os.path.exists(facets_p) else []
-        graph = (_load_json(graph_p) if os.path.exists(graph_p)
+        facets = _load_json(facets_p) if store.exists(facets_p) else []
+        graph = (_load_json(graph_p) if store.exists(graph_p)
                  else {"specialises": [], "adjacent": []})
         print("  04 validate: reusing decisions")
     else:
@@ -4900,7 +4901,7 @@ def cmd_segment(cfg, args):
                     or _segment_force(args, "05"))
     redo_assign = (force_assign
                    or not _meta_matches(asg_meta, assignment_fingerprint))
-    if os.path.exists(asg_p) and not redo_assign:
+    if store.exists(asg_p) and not redo_assign:
         rows = _normalize_assignment_contract(_read_jsonl(asg_p))
         print(f"  05 assign: reusing {len(rows):,} assignments (--reassign to redo)")
         if not any(row.get("runner_up_recorded") for row in rows):
@@ -5061,7 +5062,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
     ev = paths.evidence(cfg["_dir"]); os.makedirs(ev, exist_ok=True)
     facets_by_id = {row["facet_id"]: row for row in facets or ()}
     _, s06 = skill(6)
-    with open(os.path.join(voc, "06_build_contract.md"), "w",
+    with store.open_key(os.path.join(voc, "06_build_contract.md"), "w",
               encoding="utf-8") as fh:
         fh.write(s06)
     seen, conflicts, missing = {}, [], []
@@ -5086,7 +5087,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
 
     if conflicts:
         p = os.path.join(voc, "assignment_conflicts.jsonl")
-        with open(p, "w", encoding="utf-8") as fh:
+        with store.open_key(p, "w", encoding="utf-8") as fh:
             for x in conflicts:
                 fh.write(json.dumps(x) + "\n")
         sys.exit(f"  BUILD FAILED — {len(conflicts)} item(s) carry more than one "
@@ -5114,7 +5115,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
         facet_tally = Counter(facet_id for r in rs
                               for facet_id in r.get("facet_ids") or [])
         p = os.path.join(ev, f"{s['slug']}.txt")
-        with open(p, "w", encoding="utf-8") as fh:
+        with store.open_key(p, "w", encoding="utf-8") as fh:
             fh.write(f"{s['name'].upper()}\n{'=' * 72}\n\n")
             fh.write(f"Segment ID: {s['segment_id']}\nSegment slug: {s['slug']}\n")
             fh.write("Validation status: validated\n")
@@ -5169,7 +5170,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
             tier: tiers[tier] for tier in segmentation.EVIDENCE_TIERS}))
 
     # ------------------------------------------------------------- audit set
-    with open(os.path.join(voc, "unassigned_evidence.md"), "w", encoding="utf-8") as fh:
+    with store.open_key(os.path.join(voc, "unassigned_evidence.md"), "w", encoding="utf-8") as fh:
         fh.write(f"# Unassigned evidence — {len(unassigned)} item(s)\n\n")
         fh.write("Unassigned is a valid outcome. Forcing an ambiguous comment into a "
                  "segment is worse than leaving it out.\n\n")
@@ -5181,11 +5182,11 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
             fh.write(f"{it.get('text', '')}\n\n---\n\n")
 
     if missing:
-        with open(os.path.join(voc, "missing_evidence.jsonl"), "w", encoding="utf-8") as fh:
+        with store.open_key(os.path.join(voc, "missing_evidence.jsonl"), "w", encoding="utf-8") as fh:
             for x in missing:
                 fh.write(json.dumps(x) + "\n")
 
-    with open(os.path.join(voc, "segment_evidence_manifest.yaml"), "w",
+    with store.open_key(os.path.join(voc, "segment_evidence_manifest.yaml"), "w",
               encoding="utf-8") as fh:
         fh.write("segments:\n")
         for segment_id, slug, n, t, tier_counts in report:
@@ -5213,14 +5214,14 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
 
 def evidence_path(cfg, segment):
     p = paths.evidence(cfg["_dir"], f"{segment}.txt")
-    if not os.path.exists(p):
+    if not store.exists(p):
         p2 = os.path.join(ROOT, "evidence", f"{segment}.txt")
-        if os.path.exists(p2):
+        if store.exists(p2):
             return p2
         avail = []
         for d in (paths.evidence(cfg["_dir"]), os.path.join(ROOT, "evidence")):
-            if os.path.isdir(d):
-                avail += [f[:-4] for f in os.listdir(d) if f.endswith(".txt")]
+            if store.exists(d):
+                avail += [f[:-4] for f in store.names_in(d) if f.endswith(".txt")]
         sys.exit(f"No evidence file for {segment!r}. Available: {', '.join(sorted(set(avail))) or 'none'}")
     return p
 
@@ -5228,12 +5229,12 @@ def evidence_path(cfg, segment):
 def research_pack_path(cfg, segment, required=True):
     directory = paths.research(cfg["_dir"], "segments", "packs")
     path = os.path.join(directory, f"{segment}.txt")
-    if os.path.exists(path):
+    if store.exists(path):
         return path
     if not required:
         return None
-    available = ([name[:-4] for name in sorted(os.listdir(directory))
-                  if name.endswith(".txt")] if os.path.isdir(directory) else [])
+    available = ([name[:-4] for name in store.names_in(directory)
+                  if name.endswith(".txt")] if store.exists(directory) else [])
     sys.exit(f"No research pack for {segment!r}. Run `segment` to build "
              f"Layer 2, or pass --evidence to read Layer 1 instead.\n"
              f"  Available packs: {', '.join(available) or 'none'}")
@@ -5282,7 +5283,7 @@ def cmd_extract(cfg, args):
     warn_if_imported(cfg, args.segment)
     c = client(cfg, args)
     source, layer = extraction_source(cfg, args.segment, args)
-    with open(source, encoding="utf-8") as fh:
+    with store.open_key(source, encoding="utf-8") as fh:
         corpus = fh.read()
     label = ("Layer 2 (research pack)" if layer == "pack"
              else "Layer 1 (evidence file)")
@@ -5299,9 +5300,9 @@ def cmd_extract(cfg, args):
         # A zero-byte/whitespace artefact is a failed extraction, not completed
         # work. Pick it up automatically even without --force.
         present = False
-        if os.path.exists(dest):
+        if store.exists(dest):
             try:
-                with open(dest, encoding="utf-8") as fh:
+                with store.open_key(dest, encoding="utf-8") as fh:
                     present = bool(fh.read().strip())
             except OSError:
                 present = False
@@ -5364,7 +5365,7 @@ def cmd_extract(cfg, args):
         text = results.get(job.id, "")
         if not text or not text.strip():
             continue
-        with open(names[job.id], "w", encoding="utf-8") as fh:
+        with store.open_key(names[job.id], "w", encoding="utf-8") as fh:
             fh.write(text)
         written += 1
     print(f"\n  {written}/{len(jobs)} written -> {out}   (${c.actual_usd():.2f})")
@@ -5378,10 +5379,10 @@ def cmd_extract(cfg, args):
 
 def read_extractions(cfg, segment, *want):
     d = paths.extractions(cfg["_dir"], segment)
-    if not os.path.isdir(d):
+    if not store.exists(d):
         sys.exit(f"No extractions. Run: adpipe -p {cfg['name']} extract {segment}")
     parts = []
-    for f in sorted(os.listdir(d)):
+    for f in store.names_in(d):
         if f.endswith(".md") and (not want or any(w in f for w in want)):
             parts.append(f"## {f[:-3]}\n\n{open(os.path.join(d, f), encoding='utf-8').read()}")
     return "\n\n---\n\n".join(parts)
@@ -5393,11 +5394,11 @@ def synth(cfg, args, stage, prompt, dest, max_tokens=16000, schema=None, corpus=
     """Run one synthesis stage against the evidence corpus + prior outputs."""
     from llm import Job, confirm
     c = client(cfg, args)
-    corpus = corpus if corpus is not None else open(
-        evidence_path(cfg, args.segment), encoding="utf-8").read()
-    if os.path.exists(dest) and not args.force:
+    corpus = corpus if corpus is not None else (store.read_text(
+        evidence_path(cfg, args.segment)) or "")
+    if store.exists(dest) and not args.force:
         print(f"  {os.path.basename(dest)} exists (--force to redo)")
-        return open(dest, encoding="utf-8").read()
+        return (store.read_text(dest) or "")
     job = Job(id=stage, prompt=prompt, max_tokens=max_tokens, schema=schema)
     if not confirm(c.estimate(corpus, PREAMBLE, [job]),
                    args.yes):
@@ -5558,15 +5559,15 @@ def segment_context(cfg, segment, product=None):
     try:
         prod = products.resolve_product(cfg["name"], product)
         cand = products.segment_sheet_path(cfg["name"], prod, segment)
-        if os.path.exists(cand):
+        if store.exists(cand):
             p = cand
     except products.ProductError:
         pass
-    if not os.path.exists(p):
+    if not store.exists(p):
         return ""
     return ("SEGMENT STRATEGY — this segment's customer truth and the strategy "
             "built from it. It applies to THIS segment only; do not carry it to "
-            "another.\n\n" + open(p, encoding="utf-8").read())
+            "another.\n\n" + (store.read_text(p) or ""))
 
 
 def product_context(cfg, sheet=True, product=None):
@@ -5587,23 +5588,23 @@ def product_context(cfg, sheet=True, product=None):
              f"MARKET\n{cfg.get('market') or '(unspecified)'}"]
 
     p = facts_path(cfg)
-    if os.path.exists(p):
+    if store.exists(p):
         parts.append(
             "APPROVED PRODUCT FACTS — the ONLY numbers and product claims that "
             "may appear in an ad. Anything marked NEEDS INPUT is unconfirmed: "
             "do not use it, and do not invent a value for it.\n\n"
-            + open(p, encoding="utf-8").read())
+            + (store.read_text(p) or ""))
 
     if sheet:
         p = sheet_path(cfg, product)
-        if os.path.exists(p):
+        if store.exists(p):
             parts.append(
                 "PRODUCT SHEET — background for strategy: what the product is, how "
                 "it actually works, who it suits, what it competes with, and where "
                 "the objections are. This is NOT a claims source. Any number or "
                 "claim here that is absent from the approved facts above is "
                 "unconfirmed and must not appear in an ad.\n\n"
-                + open(p, encoding="utf-8").read())
+                + (store.read_text(p) or ""))
 
     return "\n\n---\n\n".join(parts)
 
@@ -5619,7 +5620,7 @@ def picc_path(cfg, segment, chosen=None):
     """
     default = paths.assets(cfg["_dir"], segment, "01_picc_card.md")
     if not chosen:
-        if not os.path.exists(default):
+        if not store.exists(default):
             sys.exit(f"No PICC card. Run: adpipe -p {cfg['name']} picc {segment}")
         return default
 
@@ -5629,7 +5630,7 @@ def picc_path(cfg, segment, chosen=None):
     # is not a path to accept from anywhere on disk.
     if os.path.commonpath([p, os.path.realpath(cfg["_dir"])]) != os.path.realpath(cfg["_dir"]):
         sys.exit(f"--picc must point inside projects/{cfg['name']}/ — got {chosen}")
-    if not os.path.exists(p):
+    if not store.exists(p):
         sys.exit(f"PICC card not found: {chosen}")
     return p
 
@@ -5637,7 +5638,7 @@ def picc_path(cfg, segment, chosen=None):
 def cmd_concepts(cfg, args):
     """10 concepts, 2-3 in-image hooks each, each mapped to a real layout."""
     card_p = picc_path(cfg, args.segment, getattr(args, "picc", None))
-    card = open(card_p, encoding="utf-8").read()
+    card = (store.read_text(card_p) or "")
     rel = os.path.relpath(card_p, ROOT)
     print(f"  PICC card: {rel}")
     # The card is the strategy, but it is one model's compression of 20
@@ -5728,7 +5729,7 @@ def _templates():
     d = os.path.join(ROOT, "pipeline", "templates")
     import render
     lines = []
-    for f in sorted(os.listdir(d)):
+    for f in store.names_in(d):
         if f.endswith(".html") and not f.startswith("_"):
             slots = [s for s in render.template_slots(os.path.join(d, f))
                      if s not in ("logo_text",) and "image" not in s and "avatar" not in s]
@@ -5740,9 +5741,9 @@ def cmd_brief(cfg, args):
     """Production briefs for the strongest concepts — the artefact a designer or
     image model builds from."""
     cp = paths.assets(cfg["_dir"], args.segment, "concepts.json")
-    if not os.path.exists(cp):
+    if not store.exists(cp):
         sys.exit(f"No concepts. Run: adpipe -p {cfg['name']} concepts {args.segment}")
-    concepts = open(cp, encoding="utf-8").read()
+    concepts = (store.read_text(cp) or "")
     n = getattr(args, "briefs", None) or cfg["creative"]["briefs_per_run"]
 
     prompt = f"""These are the approved concepts:
@@ -5787,7 +5788,7 @@ Output Markdown.
 
 def _script(cfg, args, name, extra=()):
     cp = paths.assets(cfg["_dir"], args.segment, "concepts.json")
-    if not os.path.exists(cp):
+    if not store.exists(cp):
         sys.exit(f"No concepts.json for {args.segment}.")
     r = subprocess.run([sys.executable, os.path.join(ROOT, "pipeline", name), cp, *extra])
     return r.returncode

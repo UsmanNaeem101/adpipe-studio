@@ -13,6 +13,7 @@ import json
 import os
 import re
 from collections import Counter, defaultdict
+import store
 
 
 COMMERCIAL_CONTRACT_VERSION = "commercial-synthesis-v1"
@@ -783,11 +784,10 @@ def render_watchlist(mapping, validated_by_id):
 
 
 def _write_text_atomic(path, text):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    os.replace(temporary, path)
+    # Kept the name: callers say what they mean by it, and a store write is
+    # still all-or-nothing. What has gone is the temp file and the rename,
+    # which only ever existed to stop a reader seeing half a file.
+    store.write_text(path, text)
 
 
 def _write_json_atomic(path, value):
@@ -798,18 +798,12 @@ def render_research_pack(final_dir, project_name, refined_count, assigned_count,
                          unassigned_count, validated, catalogue, mapping,
                          synthesis_by_id, evidence_by_id):
     """Deterministically replace only files owned by Stage 09."""
-    os.makedirs(final_dir, exist_ok=True)
     machine_dir = os.path.join(final_dir, "_machine")
     synthesis_machine = os.path.join(machine_dir, "synthesis")
-    os.makedirs(synthesis_machine, exist_ok=True)
     prior_manifest = os.path.join(final_dir, ".stage09_manifest.json")
-    prior_files = []
-    if os.path.isfile(prior_manifest):
-        try:
-            with open(prior_manifest, encoding="utf-8") as handle:
-                prior_files = json.load(handle).get("generated_files", [])
-        except (OSError, ValueError, TypeError):
-            prior_files = []
+    prior_files = (store.read_json(prior_manifest) or {}).get("generated_files", [])
+    if not isinstance(prior_files, list):
+        prior_files = []
 
     canonical_rows = catalogue["canonical_segments"]
     filenames = {

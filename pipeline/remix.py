@@ -37,6 +37,7 @@ import credentials
 import uuid
 
 import auditlog
+import store
 
 EDIT_URL = os.environ.get("IMAGE_EDIT_URL", "https://api.openai.com/v1/images/edits")
 MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-1")
@@ -133,7 +134,7 @@ def remix(prompt, image_paths, key, retries=3):
     for p in image_paths:
         if not os.path.exists(p):
             raise RemixError(f"image not found: {p}")
-    images = [(os.path.basename(p), open(p, "rb").read()) for p in image_paths]
+    images = [(os.path.basename(p), store.read_bytes(p)) for p in image_paths]
     return remix_images(prompt, images, key, retries=retries)
 
 
@@ -154,10 +155,9 @@ def main():
         if n + 1 < len(parts):
             auditlog.set_context(project=parts[n + 1], stage="remix", source="remix_cli")
 
-    doc = json.load(open(args.manifest, encoding="utf-8"))
+    doc = store.read_json(args.manifest)
     base = os.path.dirname(os.path.abspath(args.manifest))
     out = os.path.join(base, "remixes")
-    os.makedirs(out, exist_ok=True)
 
     product = doc.get("product_image", "")
     prod_path = product if os.path.isabs(product) else os.path.join(base, product)
@@ -219,7 +219,7 @@ def main():
             before = len(data)
             data, removed = exifstrip.strip(data)
             note = "  " + exifstrip.describe(removed, before, len(data))
-        open(dest, "wb").write(data)
+        store.write_bytes(dest, data)
         print(f"      -> remixes/{j['id']}.png{note}")
 
     print("\n  ⚠️  COMPLIANCE: qa.py cannot read text baked into an image. Open every")

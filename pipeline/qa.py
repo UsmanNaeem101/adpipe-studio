@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import unicodedata
+import store
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -101,7 +102,7 @@ def main():
                     help="fail (not warn) on any number missing from facts/evidence")
     args = ap.parse_args()
 
-    doc = json.load(open(args.concepts, encoding="utf-8"))
+    doc = store.read_json(args.concepts)
     concepts = doc.get("concepts", doc if isinstance(doc, list) else [])
     base_dir = os.path.dirname(os.path.abspath(args.concepts))
 
@@ -110,7 +111,7 @@ def main():
     if ev_path:
         p = ev_path if os.path.isabs(ev_path) else os.path.join(ROOT, ev_path)
         if os.path.exists(p):
-            evidence = norm(open(p, encoding="utf-8", errors="ignore").read())
+            evidence = norm(store.read_text(p) or "")
         else:
             print(f"! evidence file not found: {p} - quote checks DISABLED\n")
 
@@ -128,7 +129,7 @@ def main():
             d = os.path.dirname(d)
     facts = {}
     if facts_path and os.path.exists(facts_path):
-        facts = json.load(open(facts_path, encoding="utf-8"))
+        facts = store.read_json(facts_path)
     else:
         print("! no facts.json found for this project - every number will be "
               "flagged, which is the safe default\n")

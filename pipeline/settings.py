@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import store
 
 # kind:
 #   text     one line of free text        int    whole number, with bounds
@@ -272,9 +273,7 @@ def apply(cfg, submitted):
 
 def write(path, cfg):
     """Replace project.json atomically, so a failed write cannot truncate it."""
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(cfg, handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
-    os.replace(temporary, path)
+    # One store write replaces the temp-file-and-rename: a store write does not
+    # half-happen, so there is no truncated file to protect against.
+    store.write_text(path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
     return path

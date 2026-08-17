@@ -19,6 +19,8 @@ import time
 import uuid
 
 
+import store  # noqa: E402
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _context = contextvars.ContextVar("adpipe_audit_context", default={})
 
@@ -87,7 +89,8 @@ class Audit:
         self.directory = os.path.join(_log_root(self.context),
                                       self.started.strftime("%Y-%m-%d"), ident)
         self._lock = threading.Lock()
-        os.makedirs(self.directory, exist_ok=False)
+        # No directory to make: the store creates on write, and a remote one has
+        # no directories at all. Uniqueness already comes from the uuid above.
         self._write("request.json", {
             "started_at": self.started.isoformat(timespec="milliseconds"),
             "provider": provider,
@@ -104,19 +107,21 @@ class Audit:
         return os.path.relpath(self.directory, ROOT)
 
     def _write(self, name, value):
-        path = os.path.join(self.directory, name)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(_plain(value), fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        # The write-to-temp-then-rename dance was for a half-written file being
+        # read by something else. A store write is one operation, so the dance
+        # would only add a stray key to clean up.
+        store.write_text(os.path.join(self.directory, name),
+                         json.dumps(_plain(value), ensure_ascii=False, indent=2))
 
     def event(self, kind, detail, **metadata):
         row = {"at": _stamp().isoformat(timespec="milliseconds"), "kind": kind,
                "detail": _plain(detail), **_plain(metadata)}
+        key = os.path.join(self.directory, "events.jsonl")
         with self._lock:
-            with open(os.path.join(self.directory, "events.jsonl"), "a",
-                      encoding="utf-8") as fh:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            # Append by rewriting: a store has no open-for-append, and an audit
+            # log for one call is a handful of lines, not a stream.
+            existing = store.read_text(key) or ""
+            store.write_text(key, existing + json.dumps(row, ensure_ascii=False) + "\n")
 
     def response(self, provider_response, text=None, **metadata):
         self._write("response.json", {
@@ -132,8 +137,7 @@ class Audit:
     def binary_response(self, data, provider_response=None, mime_type="image/png", **metadata):
         ext = ".png" if mime_type == "image/png" else ".bin"
         name = "response" + ext
-        with open(os.path.join(self.directory, name), "wb") as fh:
-            fh.write(data)
+        store.write_bytes(os.path.join(self.directory, name), data)
         self.response(provider_response or {}, binary_file=name, mime_type=mime_type,
                       binary_bytes=len(data), binary_sha256=hashlib.sha256(data).hexdigest(),
                       **metadata)

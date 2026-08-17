@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 import cli  # noqa: E402
 import llm  # noqa: E402
 import openrouter  # noqa: E402
+import store
 
 DEFAULT_CORPUS = os.path.join(
     ROOT, "projects", "montisella", "research", "voc", "filtered_voc.jsonl")
@@ -72,8 +73,7 @@ def approx_tokens(text: str) -> int:
 def load_records(path):
     """Accept a filtered_voc.jsonl or a raw dump, and return the texts stage 01
     would actually judge (i.e. after the deterministic pre-pass)."""
-    with open(path, encoding="utf-8", errors="ignore") as fh:
-        raw = fh.read()
+    raw = store.read_text(path) or ""
     if path.endswith(".jsonl"):
         return [json.loads(line)["text"] for line in raw.splitlines() if line.strip()]
     return [item["text"] for item in cli.parse_voc(raw)]

@@ -48,14 +48,15 @@ sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 
 import cli  # noqa: E402
 import llm  # noqa: E402
+import store
 
 DEFAULT_CORPUS = os.path.join(
     ROOT, "projects", "montisella", "research", "voc", "filtered_voc.jsonl")
 
 
 def load(path, n):
-    with open(path, encoding="utf-8") as fh:
-        rows = [json.loads(line) for line in fh if line.strip()]
+    rows = [json.loads(line)
+            for line in (store.read_text(path) or "").splitlines() if line.strip()]
     # Take a contiguous slice rather than a sample: every arm must see exactly
     # the same records in the same order, and a seeded sample is one more thing
     # that can silently differ between runs.
@@ -234,11 +235,9 @@ def main():
     compare(records, arms, results)
     out = os.path.join(ROOT, "logs", "ab",
                        f"stage{args.stage}_{'_vs_'.join(arms)}.json")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    with open(out, "w", encoding="utf-8") as fh:
-        json.dump({a: {k: v for k, v in r.items() if k != "rows"}
-                   | {"rows": {str(i): row for i, row in r["rows"].items()}}
-                   for a, r in results.items()}, fh, indent=2)
+    store.write_json(out, {a: {k: v for k, v in r.items() if k != "rows"}
+                           | {"rows": {str(i): row for i, row in r["rows"].items()}}
+                           for a, r in results.items()})
     print(f"\n  full per-record output -> {out}\n")
 
 

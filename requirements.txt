@@ -1,0 +1,6 @@
+# AdPipe has no dependencies. This file is empty on purpose.
+#
+# The whole app is the Python standard library — that is a deliberate property
+# of it, not an accident waiting to be fixed. The file exists so Railpack knows
+# this is a Python app; without it the builder cannot tell what to do with a
+# repository whose entry point is a shell script.

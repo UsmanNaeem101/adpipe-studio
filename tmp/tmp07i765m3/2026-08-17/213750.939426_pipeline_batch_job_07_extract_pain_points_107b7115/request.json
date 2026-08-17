@@ -1,0 +1,20 @@
+{
+  "started_at": "2026-08-17T21:37:50.939+00:00",
+  "provider": "openrouter",
+  "model": "test/model",
+  "operation": "pipeline_batch_job",
+  "job_id": "07_extract_pain_points",
+  "context": {
+    "project": "shoulder",
+    "stage": "extract"
+  },
+  "metadata": {},
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "full prompt"
+      }
+    ]
+  }
+}
