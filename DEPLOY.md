@@ -32,14 +32,30 @@ deploy — the container filesystem does not survive one.
 
 | Variable | Value | Why |
 |---|---|---|
-| `STUDIO_HOST` | `0.0.0.0` | already set in the image; a container bound to loopback is unreachable |
+| `STUDIO_HOST` | `0.0.0.0` | a container bound to loopback is unreachable, with no error to read |
+| `STUDIO_NO_BROWSER` | `1` | there is no browser to open and nobody to look at it |
+| `CHROME` | `/usr/bin/chromium` | names the browser installed above; `find_chrome()` looks in /Applications and on PATH otherwise |
+| `ADPIPE_CREDENTIALS_FILE` | `/app/projects/.credentials.json` | puts the credential store **on the volume**; see below |
+| `ADPIPE_SHARED_SECRET` | a long random string | must match Topic Atlas's; see below |
 | `OPENROUTER_API_KEY` | your key | `credentials.resolve()` prefers the environment over its stored file |
 | `OPENAI_API_KEY` | your key | only if you use it |
 | `ANTHROPIC_API_KEY` | your key | only if you use it |
-| `ADPIPE_SHARED_SECRET` | a long random string | must match Topic Atlas's; see below |
 
-Keys can also be pasted into the Settings tab — with the volume mounted, those
-are written to `/app/projects/.credentials.json` and survive a deploy.
+Keys can be pasted into the Settings tab instead of set here — but only if
+`ADPIPE_CREDENTIALS_FILE` points at the volume. Its default is a user-level path
+(`~/.config/adpipe/credentials.json`), which is right on a laptop and wrong here:
+that is container filesystem, so a key typed into Settings works perfectly until
+the next deploy silently discards it.
+
+The startup log settles both questions before anyone spends money on them —
+
+```
+  API keys: openrouter · store /app/projects/.credentials.json
+```
+
+— naming which providers resolved and where a new key will land. A variable
+spelled slightly wrong shows up as a missing provider here rather than as a 401
+twenty minutes into a stage.
 
 **Do not** give this service a public domain. If Railway has already generated
 one, remove it.

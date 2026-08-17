@@ -4283,6 +4283,31 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+def credential_line():
+    """Which providers have a key, and where a key typed in Settings will land.
+
+    Never the key itself — `credentials.status()` returns presence booleans for
+    exactly this reason.
+
+    On a laptop this is barely worth saying: you typed them in, and the store is
+    in your home directory. On a container it is the first thing that goes wrong
+    and the last thing anyone notices. A provider variable named slightly wrong,
+    or a store path that is not on the mounted volume and so is wiped by the next
+    deploy, both look exactly like a working studio right up until someone
+    generates. Printing it at startup puts the answer in the logs, before the
+    question.
+    """
+    try:
+        state = credentials.status()
+    except credentials.CredentialStoreError as error:
+        return f"  API keys: could not read the store — {error}"
+    have = sorted(name for name, present in state.items() if present)
+    where = credentials.store_path()
+    if not have:
+        return f"  No API keys yet — add them on the Settings tab (stored at {where})."
+    return f"  API keys: {', '.join(have)} · store {where}"
+
+
 def main():
     if not store.exists(REFS):
         sys.exit(f"No references/ folder at {REFS}")
@@ -4291,7 +4316,8 @@ def main():
     print(f"\n  adpipe studio  →  {url}" if HOST == "127.0.0.1"
           else f"\n  adpipe studio  →  {HOST}:{PORT}")
     print(f"  {n} reference ads · {len(projects())} project(s)")
-    print("  Add your API keys on the Settings tab. Ctrl-C to stop.\n")
+    print(credential_line())
+    print("  Ctrl-C to stop.\n")
     # Double-clicking Ad Studio.command should pop the browser; a supervisor that
     # opens its own preview pane should not get a second stray window, and a
     # container has no browser to open at all.

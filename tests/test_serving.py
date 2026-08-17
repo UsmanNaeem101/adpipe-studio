@@ -1,9 +1,11 @@
 """Running as a service rather than on a desk.
 
-Three things differ on a container and each one is silent when it is wrong: the
-port it listens on, the address it binds to, and the browser it screenshots ads
-with. A studio bound to loopback inside a container is simply unreachable, with
-no error to read; a missing browser fails only when someone renders.
+Four things differ on a container and each one is silent when it is wrong: the
+port it listens on, the address it binds to, the browser it screenshots ads
+with, and where its API keys are kept. A studio bound to loopback inside a
+container is simply unreachable, with no error to read; a missing browser fails
+only when someone renders; and a credential store off the mounted volume works
+perfectly until the next deploy wipes it.
 """
 
 import os
@@ -14,6 +16,8 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 
+import app  # noqa: E402
+import credentials  # noqa: E402
 import render  # noqa: E402
 
 
@@ -78,6 +82,53 @@ class ListenAddressTests(unittest.TestCase):
         # local override still wins.
         self.assertEqual(self.resolve({"PORT": "3000"})[1], 3000)
         self.assertEqual(self.resolve({"PORT": "3000", "STUDIO_PORT": "8765"})[1], 8765)
+
+
+class StartupCredentialLineTests(unittest.TestCase):
+    """The startup banner answers "are my keys here, and where do new ones go?"
+
+    Both halves were wrong on the first container deploy — the store path came
+    from a variable name nothing read — and neither is visible until somebody
+    spends money and gets a 401 back.
+    """
+
+    def test_it_names_the_providers_that_have_a_key(self):
+        with mock.patch.object(credentials, "status",
+                               return_value={"openai": False, "anthropic": True,
+                                             "openrouter": True}):
+            line = app.credential_line()
+        self.assertIn("anthropic", line)
+        self.assertIn("openrouter", line)
+        self.assertNotIn("openai", line)
+
+    def test_it_never_prints_a_key(self):
+        # status() returns presence booleans precisely so this line cannot leak,
+        # and these logs are read by whoever can see the deployment.
+        secret = "sk-do-not-log-me"
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": secret}):
+            with mock.patch.dict(os.environ, {"ADPIPE_CREDENTIALS_FILE":
+                                              "/nowhere/credentials.json"}):
+                line = app.credential_line()
+        self.assertNotIn(secret, line)
+        self.assertIn("openrouter", line)
+
+    def test_with_no_keys_it_says_where_a_settings_key_will_land(self):
+        # The container question. If this prints a path that is not on the
+        # volume, keys typed into Settings survive until the next deploy.
+        with mock.patch.dict(os.environ,
+                             {"ADPIPE_CREDENTIALS_FILE": "/app/projects/.credentials.json"},
+                             clear=True):
+            line = app.credential_line()
+        self.assertIn("/app/projects/.credentials.json", line)
+        self.assertIn("Settings", line)
+
+    def test_an_unreadable_store_is_reported_rather_than_thrown(self):
+        # A corrupt store must not stop the studio starting: every other way in
+        # still works, and the message is how anyone finds out.
+        with mock.patch.object(credentials, "status",
+                               side_effect=credentials.CredentialStoreError("bad json")):
+            line = app.credential_line()
+        self.assertIn("bad json", line)
 
 
 if __name__ == "__main__":
