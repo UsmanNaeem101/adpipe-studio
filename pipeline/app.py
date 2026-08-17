@@ -340,7 +340,7 @@ def project_summary(name):
     """What a project actually contains — so a delete confirmation can state the
     cost of the mistake rather than asking 'are you sure?' about an unknown."""
     root = os.path.join(ROOT, "projects", name)
-    if not store.exists(root):
+    if not os.path.isdir(root):
         return None
     counts = {"evidence": 0, "extractions": 0, "renders": 0, "voc_files": 0,
               "bytes": 0, "segments": []}
@@ -428,7 +428,7 @@ def project_outputs(project):
         entry("segment", lbl, os.path.join(voc, f))
 
     discovery = paths.research(root, "segments", "discovery")
-    if store.exists(discovery):
+    if os.path.isdir(discovery):
         for base, _dirs, files in os.walk(discovery):
             for f in sorted(files):
                 if f.endswith((".json", ".md")):
@@ -439,7 +439,7 @@ def project_outputs(project):
     for folder, prefix in (("commercial", "07-08 commercial"),
                            ("final", "09 research pack")):
         stage_dir = paths.research(root, "segments", folder)
-        if store.exists(stage_dir):
+        if os.path.isdir(stage_dir):
             for base, _dirs, files in os.walk(stage_dir):
                 for f in sorted(files):
                     if f.startswith(".") or f.endswith(".meta.json"):
@@ -481,7 +481,7 @@ def project_outputs(project):
                         entry("render", f"{seg} · {f}", os.path.join(rd, f), "image")
 
     ld = os.path.join(root, "logs", "model")
-    if store.exists(ld):
+    if os.path.isdir(ld):
         for base, _dirs, files in os.walk(ld):
             for f in sorted(files):
                 if f.endswith((".json", ".jsonl", ".png")):
@@ -545,7 +545,7 @@ def log_runs(project):
     """
     root = os.path.join(ROOT, "projects", project, "logs", "model")
     runs = []
-    if not store.exists(root):
+    if not os.path.isdir(root):
         return runs
     for base, _dirs, files in os.walk(root):
         if "request.json" not in files:
@@ -672,7 +672,7 @@ def refine_voc_files(project):
     if project not in projects():
         return []
     voc_dir = paths.voc(os.path.join(ROOT, "projects", project))
-    if not store.exists(voc_dir):
+    if not os.path.isdir(voc_dir):
         return []
     files = []
     for base, _dirs, names in os.walk(voc_dir):
@@ -820,11 +820,11 @@ def library():
     and a content hash so exact duplicates are findable rather than eyeballed."""
     import hashlib
     out, hashes, dirty = [], {}, False
-    if not store.exists(REFS):
+    if not os.path.isdir(REFS):
         return {"items": [], "duplicates": []}
     for cat in sorted(os.listdir(REFS)):
         d = os.path.join(REFS, cat)
-        if not store.exists(d) or not is_ref_category(cat):
+        if not os.path.isdir(d) or not is_ref_category(cat):
             continue
         for f in sorted(os.listdir(d)):
             if not f.lower().endswith(IMG_EXT):
@@ -1016,11 +1016,11 @@ def is_ref_category(name):
 
 def list_references():
     out = {}
-    if not store.exists(REFS):
+    if not os.path.isdir(REFS):
         return out
     for cat in sorted(os.listdir(REFS)):
         d = os.path.join(REFS, cat)
-        if store.exists(d) and is_ref_category(cat):
+        if os.path.isdir(d) and is_ref_category(cat):
             files = sorted(f for f in os.listdir(d) if f.lower().endswith(IMG_EXT))
             if files:
                 out[cat] = files
