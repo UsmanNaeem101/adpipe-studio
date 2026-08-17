@@ -10,8 +10,19 @@ you → topicatlas.digital/adpipe → /api/adpipe/* (session checked) → adpipe
 
 ## 1. The service
 
-Railway → **New service** → deploy from this repository. It builds from the
-`Dockerfile`; nothing else needs configuring for the build.
+Railway → **New service** → deploy from this repository. Railway's own builder
+handles it — there is no Dockerfile and no image to maintain, because the app has
+no dependencies to install. Two settings do all the work:
+
+| Setting | Value |
+|---|---|
+| Start command | `python3 pipeline/app.py` |
+| `RAILPACK_DEPLOY_APT_PACKAGES` | `chromium fonts-liberation fonts-dejavu-core` |
+
+Chromium is the only thing this app needs that Python does not bring: rendering
+an ad *is* screenshotting an HTML template. The fonts matter as much — a headless
+browser with no fonts renders every ad in tofu, and that looks like a broken
+template rather than a missing font.
 
 **Add a volume**, mounted at **`/app/projects`**. This is not optional. Without
 it every project, every brief and every rendered ad is deleted on the next
@@ -44,15 +55,6 @@ On the Topic Atlas service:
 
 Redeploy, then open **topicatlas.digital/adpipe**. Signed in, you get the studio;
 signed out, you get nothing at all.
-
-## What the image contains
-
-- **Python 3.11** and no packages. This app has no dependencies; the standard
-  library is the whole runtime.
-- **Chromium and fonts.** Rendering an ad *is* screenshotting an HTML template,
-  so without a browser the render stage cannot run — and a headless browser with
-  no fonts renders every ad in tofu, which looks like a broken template rather
-  than a missing font.
 
 ## Known limits
 
