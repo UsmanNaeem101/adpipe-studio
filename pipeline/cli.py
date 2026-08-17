@@ -47,6 +47,7 @@ import corpus_policy  # noqa: E402
 import researchpack  # noqa: E402
 import stagereport  # noqa: E402
 from llm import BatchResult, NO_RETRY_STOP_REASONS  # noqa: E402
+import store
 
 SKILLS = os.path.join(ROOT, "skills")
 
@@ -131,7 +132,7 @@ def stage_skill_manifest(stage):
         path = os.path.join(SKILLS, filename)
         rows.append({"file": filename, "label": label, "purpose": purpose,
                      "present": os.path.isfile(path),
-                     "lines": (len(open(path, encoding="utf-8").read().split("\n"))
+                     "lines": (len((store.read_text(path) or "").split("\n"))
                                if os.path.isfile(path) else 0)})
     return rows
 
@@ -140,13 +141,13 @@ def extractor_skill_manifest():
     """Skills 07-26, the per-dimension extractors, with their real filenames."""
     rows = []
     for number in EXTRACTORS:
-        match = next((f for f in sorted(os.listdir(SKILLS))
+        match = next((f for f in store.names_in(SKILLS)
                       if f.startswith(f"{number:02d}_") and f.endswith(".md")), None)
         path = os.path.join(SKILLS, match) if match else None
         rows.append({
             "n": number, "title": SKILL_TITLES.get(number, str(number)),
             "file": match or "", "present": bool(match),
-            "lines": (len(open(path, encoding="utf-8").read().split("\n"))
+            "lines": (len((store.read_text(path) or "").split("\n"))
                       if path else 0)})
     return rows
 
@@ -171,9 +172,9 @@ def chosen_extractors(args):
 def load_project(name):
     p = os.path.join(ROOT, "projects", name, "project.json")
     if not os.path.exists(p):
-        avail = os.listdir(os.path.join(ROOT, "projects"))
+        avail = store.names_in(os.path.join(ROOT, "projects"))
         sys.exit(f"No project {name!r}. Available: {', '.join(sorted(avail))}")
-    cfg = json.load(open(p, encoding="utf-8"))
+    cfg = store.read_json(p)
     cfg["_dir"] = os.path.dirname(p)
     # Fold a flat project into research/products/assets the first time it is
     # touched, so an old checkout keeps working without a manual step.
@@ -195,7 +196,7 @@ def provenance_path(cfg):
 
 def read_provenance(cfg):
     p = provenance_path(cfg)
-    return json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+    return store.read_json(p) if os.path.exists(p) else {}
 
 
 def record_provenance(cfg, segment, origin, detail):
@@ -223,7 +224,7 @@ def warn_if_imported(cfg, segment):
 
 def skill(n):
     """Read skill NN_*.md — the instruction for one pipeline stage."""
-    for f in sorted(os.listdir(SKILLS)):
+    for f in store.names_in(SKILLS):
         if f.startswith(f"{n:02d}_") and f.endswith(".md"):
             with open(os.path.join(SKILLS, f), encoding="utf-8") as fh:
                 return f[:-3], fh.read()
@@ -3858,7 +3859,7 @@ def _extraction_documents(cfg, slugs):
         directory = paths.extractions(cfg["_dir"], slug)
         if not os.path.isdir(directory):
             continue
-        for name in sorted(os.listdir(directory)):
+        for name in store.names_in(directory):
             if not name.endswith(".md"):
                 continue
             try:
@@ -5220,7 +5221,7 @@ def evidence_path(cfg, segment):
         avail = []
         for d in (paths.evidence(cfg["_dir"]), os.path.join(ROOT, "evidence")):
             if os.path.isdir(d):
-                avail += [f[:-4] for f in os.listdir(d) if f.endswith(".txt")]
+                avail += [f[:-4] for f in store.names_in(d) if f.endswith(".txt")]
         sys.exit(f"No evidence file for {segment!r}. Available: {', '.join(sorted(set(avail))) or 'none'}")
     return p
 
@@ -5232,7 +5233,7 @@ def research_pack_path(cfg, segment, required=True):
         return path
     if not required:
         return None
-    available = ([name[:-4] for name in sorted(os.listdir(directory))
+    available = ([name[:-4] for name in store.names_in(directory)
                   if name.endswith(".txt")] if os.path.isdir(directory) else [])
     sys.exit(f"No research pack for {segment!r}. Run `segment` to build "
              f"Layer 2, or pass --evidence to read Layer 1 instead.\n"
@@ -5381,7 +5382,7 @@ def read_extractions(cfg, segment, *want):
     if not os.path.isdir(d):
         sys.exit(f"No extractions. Run: adpipe -p {cfg['name']} extract {segment}")
     parts = []
-    for f in sorted(os.listdir(d)):
+    for f in store.names_in(d):
         if f.endswith(".md") and (not want or any(w in f for w in want)):
             parts.append(f"## {f[:-3]}\n\n{open(os.path.join(d, f), encoding='utf-8').read()}")
     return "\n\n---\n\n".join(parts)
@@ -5393,11 +5394,11 @@ def synth(cfg, args, stage, prompt, dest, max_tokens=16000, schema=None, corpus=
     """Run one synthesis stage against the evidence corpus + prior outputs."""
     from llm import Job, confirm
     c = client(cfg, args)
-    corpus = corpus if corpus is not None else open(
-        evidence_path(cfg, args.segment), encoding="utf-8").read()
+    corpus = corpus if corpus is not None else (store.read_text(
+        evidence_path(cfg, args.segment)) or "")
     if os.path.exists(dest) and not args.force:
         print(f"  {os.path.basename(dest)} exists (--force to redo)")
-        return open(dest, encoding="utf-8").read()
+        return (store.read_text(dest) or "")
     job = Job(id=stage, prompt=prompt, max_tokens=max_tokens, schema=schema)
     if not confirm(c.estimate(corpus, PREAMBLE, [job]),
                    args.yes):
@@ -5566,7 +5567,7 @@ def segment_context(cfg, segment, product=None):
         return ""
     return ("SEGMENT STRATEGY — this segment's customer truth and the strategy "
             "built from it. It applies to THIS segment only; do not carry it to "
-            "another.\n\n" + open(p, encoding="utf-8").read())
+            "another.\n\n" + (store.read_text(p) or ""))
 
 
 def product_context(cfg, sheet=True, product=None):
@@ -5592,7 +5593,7 @@ def product_context(cfg, sheet=True, product=None):
             "APPROVED PRODUCT FACTS — the ONLY numbers and product claims that "
             "may appear in an ad. Anything marked NEEDS INPUT is unconfirmed: "
             "do not use it, and do not invent a value for it.\n\n"
-            + open(p, encoding="utf-8").read())
+            + (store.read_text(p) or ""))
 
     if sheet:
         p = sheet_path(cfg, product)
@@ -5603,7 +5604,7 @@ def product_context(cfg, sheet=True, product=None):
                 "the objections are. This is NOT a claims source. Any number or "
                 "claim here that is absent from the approved facts above is "
                 "unconfirmed and must not appear in an ad.\n\n"
-                + open(p, encoding="utf-8").read())
+                + (store.read_text(p) or ""))
 
     return "\n\n---\n\n".join(parts)
 
@@ -5637,7 +5638,7 @@ def picc_path(cfg, segment, chosen=None):
 def cmd_concepts(cfg, args):
     """10 concepts, 2-3 in-image hooks each, each mapped to a real layout."""
     card_p = picc_path(cfg, args.segment, getattr(args, "picc", None))
-    card = open(card_p, encoding="utf-8").read()
+    card = (store.read_text(card_p) or "")
     rel = os.path.relpath(card_p, ROOT)
     print(f"  PICC card: {rel}")
     # The card is the strategy, but it is one model's compression of 20
@@ -5728,7 +5729,7 @@ def _templates():
     d = os.path.join(ROOT, "pipeline", "templates")
     import render
     lines = []
-    for f in sorted(os.listdir(d)):
+    for f in store.names_in(d):
         if f.endswith(".html") and not f.startswith("_"):
             slots = [s for s in render.template_slots(os.path.join(d, f))
                      if s not in ("logo_text",) and "image" not in s and "avatar" not in s]
@@ -5742,7 +5743,7 @@ def cmd_brief(cfg, args):
     cp = paths.assets(cfg["_dir"], args.segment, "concepts.json")
     if not os.path.exists(cp):
         sys.exit(f"No concepts. Run: adpipe -p {cfg['name']} concepts {args.segment}")
-    concepts = open(cp, encoding="utf-8").read()
+    concepts = (store.read_text(cp) or "")
     n = getattr(args, "briefs", None) or cfg["creative"]["briefs_per_run"]
 
     prompt = f"""These are the approved concepts:

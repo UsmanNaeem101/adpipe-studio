@@ -219,3 +219,51 @@ class BuildStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListingShapeTests(unittest.TestCase):
+    """Absolute in, absolute out.
+
+    Callers hold absolute paths, because that is what `paths.py` returns, and
+    some of them ask about directories outside the data root entirely. Answering
+    with keys relative to the root made the two impossible to line up, and the
+    symptom was a listing coming back empty for a directory that was plainly
+    full — which looked like the pipeline losing its own extractions.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.store = store_module.LocalStore(self.dir)
+
+    def test_an_absolute_prefix_answers_absolutely(self):
+        self.store.write_text("projects/p/extractions/s/07_pain.md", "x")
+        absolute = os.path.join(self.dir, "projects", "p", "extractions", "s")
+        keys = self.store.list_keys(absolute)
+        self.assertEqual(keys, [absolute + "/07_pain.md"])
+
+    def test_a_relative_prefix_answers_relatively(self):
+        self.store.write_text("projects/p/a.json", "{}")
+        self.assertEqual(self.store.list_keys("projects/p"), ["projects/p/a.json"])
+
+    def test_names_in_works_for_either_shape(self):
+        self.store.write_text("projects/p/one/a.md", "x")
+        self.store.write_text("projects/p/two/b.md", "x")
+        store_module.use(self.store)
+        try:
+            self.assertEqual(store_module.names_in("projects/p"), ["one", "two"])
+            self.assertEqual(
+                store_module.names_in(os.path.join(self.dir, "projects", "p")),
+                ["one", "two"])
+        finally:
+            store_module.use(None)
+
+    def test_a_directory_outside_the_root_can_still_be_listed(self):
+        outside = tempfile.mkdtemp()
+        os.makedirs(os.path.join(outside, "day"), exist_ok=True)
+        with open(os.path.join(outside, "day", "events.jsonl"), "w") as fh:
+            fh.write("{}\n")
+        store_module.use(self.store)
+        try:
+            self.assertEqual(store_module.names_in(outside), ["day"])
+        finally:
+            store_module.use(None)

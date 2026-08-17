@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import store
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PIPELINE = os.path.join(ROOT, "pipeline")
@@ -178,13 +179,24 @@ def check_overflow(chrome, html_path, w, h):
         return []
 
 
-def resolve_asset(val, base_dir):
-    """Turn a relative plate path into an absolute file:// URL Chrome can load."""
+def resolve_asset(val, base_dir, scratch=None):
+    """Turn a relative plate path into an absolute file:// URL Chrome can load.
+
+    A plate is project state, so it may not be on this disk at all — it can be a
+    row in the store. Chrome cannot read that, so a stored plate is written out
+    to `scratch` first and the URL points there.
+    """
     if not val or re.match(r"^(https?:|data:|file:)", str(val)):
         return val
     for cand in (os.path.join(base_dir, val), os.path.join(ROOT, val)):
         if os.path.exists(cand):
             return "file://" + os.path.abspath(cand)
+        data = store.read_bytes(cand)
+        if data is not None and scratch:
+            local = os.path.join(scratch, os.path.basename(str(val)))
+            with open(local, "wb") as fh:
+                fh.write(data)
+            return "file://" + local
     return val  # leave as-is; QA will flag the missing plate
 
 
@@ -221,7 +233,7 @@ def main():
 
     concepts_path = os.path.abspath(args.concepts)
     base_dir = os.path.dirname(concepts_path)
-    doc = json.load(open(concepts_path, encoding="utf-8"))
+    doc = store.read_json(concepts_path)
     concepts = doc.get("concepts", doc if isinstance(doc, list) else [])
 
     if args.only:
@@ -231,7 +243,6 @@ def main():
             sys.exit(f"No concepts matched --only {args.only}")
 
     out_dir = args.out or os.path.join(base_dir, "renders")
-    os.makedirs(out_dir, exist_ok=True)
     chrome = os.environ.get("CHROME") or find_chrome()
     css = brand_css(brand)
 
@@ -254,10 +265,14 @@ def main():
             continue
         w, h = dims["w"], dims["h"]
 
+        # Made before the slots are resolved, because a plate that lives in the
+        # store has to be written out into it for Chrome to be able to load it.
+        scratch_dir = tempfile.mkdtemp(prefix="adpipe_render_")
+
         slots = dict(c.get("slots", {}))
         for k, v in list(slots.items()):
             if k in ("image", "plate", "bg", "logo", "product_image") or str(k).endswith("_image"):
-                slots[k] = resolve_asset(v, base_dir)
+                slots[k] = resolve_asset(v, base_dir, scratch_dir)
 
         data = {
             **slots,
@@ -270,12 +285,15 @@ def main():
 
         filled = wrap_document(render_template(open(tpl_path, encoding="utf-8").read(), data), css, w, h)
 
-        # Temp HTML lives beside the assets so relative refs still resolve.
-        fd, tmp_html = tempfile.mkstemp(suffix=".html", dir=out_dir)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        # Assets are resolved to absolute file:// URLs above, so the page does
+        # not have to sit beside them any more — and must not, because the
+        # directory it would sit in may only exist in the store.
+        tmp_html = os.path.join(scratch_dir, "page.html")
+        with open(tmp_html, "w", encoding="utf-8") as fh:
             fh.write(filled)
 
-        png = os.path.join(out_dir, f"{cid}_{tpl_name}_{fmt}.png")
+        png_key = os.path.join(out_dir, f"{cid}_{tpl_name}_{fmt}.png")
+        png = os.path.join(scratch_dir, "shot.png")
         try:
             if not args.no_overflow_check:
                 for slot in check_overflow(chrome, tmp_html, w, h):
@@ -284,13 +302,15 @@ def main():
 
             res = chrome_run(chrome, tmp_html, [f"--screenshot={png}", f"--window-size={w},{h}"])
             if os.path.exists(png):
-                print(f"  [{cid}] {os.path.basename(png)}  ({w}x{h}, {tpl_name})")
+                with open(png, "rb") as fh:
+                    store.write_bytes(png_key, fh.read())
+                print(f"  [{cid}] {os.path.basename(png_key)}  ({w}x{h}, {tpl_name})")
                 ok += 1
             else:
                 print(f"  [{cid}] FAILED\n{res.stderr[-400:]}")
                 failed += 1
         finally:
-            os.remove(tmp_html)
+            shutil.rmtree(scratch_dir, ignore_errors=True)
 
     if warnings:
         print("\nLayout warnings:")

@@ -164,14 +164,26 @@ class LocalStore:
             shutil.rmtree(path)
 
     def list_keys(self, prefix=""):
+        """
+        Every file under a prefix, in the same shape the prefix was given in.
+
+        Absolute in, absolute out. A caller that asked with an absolute path is
+        holding absolute paths, and handing it keys relative to the data root
+        makes the two impossible to line up — the more so because callers can
+        ask about a directory outside the root entirely.
+        """
         base = self._path(prefix) if prefix else self.root
         if not os.path.isdir(base):
             return []
+        absolute = bool(prefix) and os.path.isabs(str(prefix))
+        relative_to = base if absolute else self.root
+
         found = []
         for dirpath, _dirs, files in os.walk(base):
             for name in files:
                 full = os.path.join(dirpath, name)
-                found.append(os.path.relpath(full, self.root).replace(os.sep, "/"))
+                rest = os.path.relpath(full, relative_to).replace(os.sep, "/")
+                found.append(str(prefix).rstrip("/") + "/" + rest if absolute else rest)
         return sorted(found)
 
 
@@ -412,12 +424,26 @@ def write_json(key, value, indent=2):
 
 
 def names_in(prefix):
-    """The immediate children of a prefix, like os.listdir once did."""
-    prefix = normalise(prefix)
-    head = prefix + "/" if prefix else ""
+    """
+    The immediate children of a prefix, like os.listdir once did.
+
+    Deliberately matched against the prefix as given rather than a normalised
+    one: list_keys answers in the shape it was asked in, and normalising only
+    one side is how a listing comes back empty for a directory that is plainly
+    full.
+    """
+    given = str(prefix).replace("\\", "/").rstrip("/")
+    tidy = normalise(given)
     names = set()
     for key in list_keys(prefix):
-        rest = key[len(head):] if key.startswith(head) else key
+        text = str(key).replace("\\", "/")
+        rest = None
+        for head in (given, tidy):
+            if head and text.startswith(head + "/"):
+                rest = text[len(head) + 1:]
+                break
+        if rest is None:
+            rest = text
         if rest:
             names.add(rest.split("/")[0])
     return sorted(names)
