@@ -1,0 +1,15 @@
+{
+  "started_at": "2026-08-17T21:38:05.659+00:00",
+  "provider": "openai",
+  "model": "image",
+  "operation": "image_generation",
+  "job_id": null,
+  "context": {
+    "project": null,
+    "stage": null
+  },
+  "metadata": {},
+  "request": {
+    "prompt": "make an image"
+  }
+}

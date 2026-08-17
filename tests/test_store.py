@@ -82,6 +82,26 @@ class LocalStoreTests(unittest.TestCase):
         self.store.delete("never/existed.json")
         self.store.delete_prefix("never/existed")
 
+    def test_an_absolute_path_is_used_as_given(self):
+        """Not every caller writes under the data root.
+
+        The audit log can be pointed anywhere and did that long before this
+        store existed. Rewriting an absolute path into the root would silently
+        move a user's logs somewhere they would never look.
+        """
+        elsewhere = tempfile.mkdtemp()
+        target = os.path.join(elsewhere, "day", "call", "request.json")
+        self.store.write_text(target, "{}")
+        self.assertTrue(os.path.exists(target))
+        self.assertEqual(self.store.read_text(target), "{}")
+
+    def test_a_path_under_the_root_is_the_same_file_either_way(self):
+        # This is what lets a call site keep `paths.voc(project, "raw.jsonl")`
+        # and change only the opening of it.
+        self.store.write_text("projects/p/a.json", "one")
+        absolute = os.path.join(self.dir, "projects", "p", "a.json")
+        self.assertEqual(self.store.read_text(absolute), "one")
+
     def test_a_key_cannot_escape_the_root(self):
         outside = os.path.join(self.dir, "..", "escaped.txt")
         self.store.write_text("../escaped.txt", "no")

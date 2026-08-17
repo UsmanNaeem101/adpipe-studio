@@ -46,7 +46,24 @@ def is_binary_key(key):
     return key.lower().endswith(BINARY_SUFFIXES)
 
 
-def normalise(key):
+def data_root():
+    """
+    The directory keys are relative to.
+
+    Read from `paths.ROOT` on every call rather than captured once, because the
+    test suite swaps it for a temp directory per test — 561 tests depend on that
+    working, and a root frozen at import time would quietly write every one of
+    them into the repo.
+    """
+    try:
+        import paths  # local import: paths imports nothing from here
+
+        return os.path.abspath(paths.ROOT)
+    except Exception:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def normalise(key, root=None):
     """
     One spelling per file.
 
@@ -54,9 +71,19 @@ def normalise(key):
     `a//b`, `./a/b` or `a/b/`. A store that treats those as three files loses
     writes in ways that are very hard to see, so they are collapsed here rather
     than trusted to every caller.
+
+    An absolute path under the data root is accepted and reduced to a key. That
+    is what lets a call site keep saying `paths.voc(project, "raw.jsonl")` and
+    change only `open(...)` to `store.read_text(...)`, instead of every path
+    expression in the pipeline having to be rewritten at the same time.
     """
+    text = str(key).replace("\\", "/")
+    base = (root if root is not None else data_root()).replace("\\", "/").rstrip("/")
+    if base and (text == base or text.startswith(base + "/")):
+        text = text[len(base):]
+
     parts = []
-    for part in str(key).replace("\\", "/").split("/"):
+    for part in text.split("/"):
         if part in ("", "."):
             continue
         if part == "..":
@@ -72,14 +99,33 @@ class LocalStore:
 
     kind = "local"
 
-    def __init__(self, root):
-        self.root = os.path.abspath(root)
+    def __init__(self, root=None):
+        # None means "whatever paths.ROOT is now" — the test suite moves it.
+        self._root = os.path.abspath(root) if root else None
+
+    @property
+    def root(self):
+        return self._root or data_root()
 
     def _path(self, key):
-        path = os.path.join(self.root, normalise(key))
+        """
+        Where this key lives on disk.
+
+        An absolute path is used as given. Not every caller writes under the
+        data root — the audit log can be pointed anywhere, and did that long
+        before this store existed — and rewriting those into the root would
+        silently move a user's logs. Relative keys are joined to the root and
+        may not climb out of it.
+        """
+        text = str(key)
+        if os.path.isabs(text):
+            return text
+
+        root = self.root
+        path = os.path.join(root, normalise(text, root))
         # normalise() already refuses to climb, but a store is exactly the wrong
         # place to take that on trust.
-        if not os.path.abspath(path).startswith(self.root):
+        if not os.path.abspath(path).startswith(root):
             raise ValueError("key escapes the store root: %r" % key)
         return path
 
@@ -303,3 +349,73 @@ def use(replacement):
     global _store
     _store = replacement
     return _store
+
+
+# ── What call sites use ──────────────────────────────────────────────────
+#
+# `store.read_text(paths.voc(project, "raw.jsonl"))` — the path expression is
+# unchanged, only the opening of it.
+
+
+def read_text(key):
+    return store().read_text(key)
+
+
+def read_bytes(key):
+    return store().read_bytes(key)
+
+
+def write_text(key, text):
+    return store().write_text(key, text)
+
+
+def write_bytes(key, data):
+    return store().write_bytes(key, data)
+
+
+def exists(key):
+    return store().exists(key)
+
+
+def delete(key):
+    return store().delete(key)
+
+
+def delete_prefix(prefix):
+    return store().delete_prefix(prefix)
+
+
+def list_keys(prefix=""):
+    return store().list_keys(prefix)
+
+
+def read_json(key, default=None):
+    """Read and parse, tolerating both absence and rubbish.
+
+    Every caller of this in the pipeline wants the same thing: the object if it
+    is there and parses, the default otherwise. A half-written file from an
+    interrupted run should not take down the next stage.
+    """
+    raw = read_text(key)
+    if raw is None:
+        return default
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+def write_json(key, value, indent=2):
+    write_text(key, json.dumps(value, indent=indent, ensure_ascii=False) + "\n")
+
+
+def names_in(prefix):
+    """The immediate children of a prefix, like os.listdir once did."""
+    prefix = normalise(prefix)
+    head = prefix + "/" if prefix else ""
+    names = set()
+    for key in list_keys(prefix):
+        rest = key[len(head):] if key.startswith(head) else key
+        if rest:
+            names.add(rest.split("/")[0])
+    return sorted(names)

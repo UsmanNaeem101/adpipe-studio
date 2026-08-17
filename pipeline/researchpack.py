@@ -31,6 +31,7 @@ Standard library only.
 from __future__ import annotations
 
 import os
+import store
 
 # How much of the borrowed-context budget each kind of relationship may claim.
 # A parent is worth most: it is the same problem described by more people, and
@@ -255,7 +256,6 @@ def build_pack(segment, segments_by_id, rows_by_segment, evidence_by_id,
 def write_packs(directory, segments, rows_by_segment, evidence_by_id, graph,
                 measured, settings):
     """Write one pack per segment and return the manifest, sorted by segment ID."""
-    os.makedirs(directory, exist_ok=True)
     segments_by_id = {row["segment_id"]: row for row in segments}
     manifest = []
     for segment in sorted(segments, key=lambda row: row["segment_id"]):
@@ -263,10 +263,7 @@ def write_packs(directory, segments, rows_by_segment, evidence_by_id, graph,
             segment, segments_by_id, rows_by_segment, evidence_by_id, graph,
             measured, settings)
         path = os.path.join(directory, f"{segment['slug']}.txt")
-        temporary = path + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        os.replace(temporary, path)
+        store.write_text(path, text)
         report["path"] = path
         manifest.append(report)
     return manifest

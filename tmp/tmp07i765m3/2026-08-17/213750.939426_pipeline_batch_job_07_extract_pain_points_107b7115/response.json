@@ -1,0 +1,23 @@
+{
+  "completed_at": "2026-08-17T21:37:50.939+00:00",
+  "elapsed_seconds": 0.0,
+  "text": "",
+  "text_bytes": 0,
+  "empty_text": true,
+  "metadata": {
+    "stop_reason": "stop"
+  },
+  "provider_response": {
+    "choices": [
+      {
+        "message": {
+          "content": ""
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 0
+    }
+  }
+}

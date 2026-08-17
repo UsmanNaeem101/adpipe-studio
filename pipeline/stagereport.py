@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+import store
 
 
 def _table(headers, rows, aligns=None):
@@ -245,10 +246,8 @@ def build_report(project, report, unassigned_count, missing_count, total_evidenc
 
 
 def write(directory, name, text):
-    os.makedirs(directory, exist_ok=True)
+    # No makedirs and no temp-then-rename: the store creates on write, and a
+    # store write does not half-happen, so there is no truncated file to guard.
     path = os.path.join(directory, name)
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    os.replace(temporary, path)
+    store.write_text(path, text)
     return path
