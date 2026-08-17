@@ -49,6 +49,7 @@ import enrich  # noqa: E402
 import synth  # noqa: E402
 import auditlog  # noqa: E402
 import credentials  # noqa: E402
+import store
 
 REFS = os.path.join(ROOT, "references")
 PORT = int(os.environ.get("STUDIO_PORT") or os.environ.get("PORT") or "8765")
@@ -508,7 +509,7 @@ def _run_stage(request_json):
     than a slow one, because it is missing from the export you go looking in.
     """
     try:
-        with open(request_json, encoding="utf-8", errors="replace") as fh:
+        with store.open_key(request_json, encoding="utf-8", errors="replace") as fh:
             head = fh.read(4096)
     except OSError:
         return None
@@ -528,7 +529,7 @@ def _run_stage(request_json):
         if len(head) < 4096 or '"metadata"' in head or '"request"' in head:
             return None
     try:
-        with open(request_json, encoding="utf-8", errors="replace") as fh:
+        with store.open_key(request_json, encoding="utf-8", errors="replace") as fh:
             return ((json.load(fh).get("context") or {}).get("stage")) or None
     except (ValueError, OSError):
         return None
@@ -612,7 +613,7 @@ def export_logs(project, stage=""):
             row = {"path": run["rel"], "stage": run["stage"],
                    "bytes": run["bytes"], "files": run["files"]}
             try:
-                with open(os.path.join(run["dir"], "request.json"),
+                with store.open_key(os.path.join(run["dir"], "request.json"),
                           encoding="utf-8", errors="replace") as fh:
                     req = json.load(fh)
                 row.update({k: req.get(k) for k in
@@ -681,7 +682,7 @@ def refine_voc_files(project):
                 continue
             path = os.path.join(base, name)
             try:
-                with open(path, encoding="utf-8") as fh:
+                with store.open_key(path, encoding="utf-8") as fh:
                     first = next((json.loads(line) for line in fh if line.strip()), None)
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
@@ -734,7 +735,7 @@ def real_format(path):
     A lot of saved ad creative is AVIF or WebP wearing a .jpg extension, which the
     image APIs reject even though macOS and Chrome open it happily."""
     try:
-        with open(path, "rb") as f:
+        with store.open_key(path, "rb") as f:
             h = f.read(16)
     except Exception:
         return "unknown"
@@ -776,7 +777,7 @@ def image_dims(path):
     """Width/height from the file header — no Pillow, no full decode.
     Returns (w, h) or (0, 0) if the format isn't recognised."""
     try:
-        with open(path, "rb") as f:
+        with store.open_key(path, "rb") as f:
             head = f.read(32)
             if head[:8] == b"\x89PNG\r\n\x1a\n":
                 w = int.from_bytes(head[16:20], "big")

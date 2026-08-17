@@ -25,6 +25,8 @@ none is added.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -447,3 +449,39 @@ def names_in(prefix):
         if rest:
             names.add(rest.split("/")[0])
     return sorted(names)
+
+
+@contextlib.contextmanager
+def open_key(key, mode="r", encoding="utf-8", errors=None, newline=None):
+    """
+    `open()` against the store.
+
+    A file object rather than a set of read/write helpers, because that is what
+    lets a call site change one token and keep its body: `json.load(fh)`,
+    iterating lines, several `fh.write(...)` calls in a row all still work. The
+    alternative — rewriting two hundred bodies by hand — is where this migration
+    would have introduced its bugs.
+
+    Writes buffer and land once, on a clean exit. An exception inside the block
+    leaves the previous value alone, which is what the temp-file-and-rename
+    dance used to buy and is now simply how it works. `encoding`, `errors` and
+    `newline` are accepted and ignored: the store speaks UTF-8 and bytes.
+    """
+    binary = "b" in mode
+    writing = any(flag in mode for flag in ("w", "a", "x", "+"))
+
+    if not writing:
+        data = read_bytes(key) if binary else read_text(key)
+        if data is None:
+            raise FileNotFoundError(key)
+        yield io.BytesIO(data) if binary else io.StringIO(data)
+        return
+
+    buffer = io.BytesIO() if binary else io.StringIO()
+    if "a" in mode:
+        existing = read_bytes(key) if binary else read_text(key)
+        if existing:
+            buffer.write(existing)
+    yield buffer
+    value = buffer.getvalue()
+    write_bytes(key, value) if binary else write_text(key, value)

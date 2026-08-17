@@ -236,7 +236,7 @@ def skill_named(filename):
     path = os.path.join(SKILLS, filename)
     if not os.path.isfile(path):
         sys.exit(f"Skill {filename} not found in {SKILLS}")
-    with open(path, encoding="utf-8") as fh:
+    with store.open_key(path, encoding="utf-8") as fh:
         return fh.read()
 
 
@@ -1469,7 +1469,7 @@ def _save_failure(diagnostics_dir, job, result, reason, suffix):
     provider_error = (json.dumps(
         result.provider_error, ensure_ascii=False, sort_keys=True)
         if result.provider_error else "none")
-    with open(os.path.join(diagnostics_dir, f"{job.id}.{suffix}.txt"), "w",
+    with store.open_key(os.path.join(diagnostics_dir, f"{job.id}.{suffix}.txt"), "w",
               encoding="utf-8") as fh:
         fh.write(f"WHY SAVED: {reason}\n"
                  f"STOP REASON: {result.stop_reason or 'unknown'}\n"
@@ -1733,7 +1733,7 @@ def _batch_rows(results, jobs, key, diagnostics_dir, repair=None, rerun=None,
     if unexpected:
         os.makedirs(diagnostics_dir, exist_ok=True)
         for jid in unexpected:
-            with open(os.path.join(diagnostics_dir, f"{jid}.unexpected.txt"), "w",
+            with store.open_key(os.path.join(diagnostics_dir, f"{jid}.unexpected.txt"), "w",
                       encoding="utf-8") as fh:
                 fh.write(_raw_text(results[jid]))
 
@@ -1807,7 +1807,7 @@ def reddit_source_fields(url):
 
 
 def _read_jsonl(path):
-    with open(path, encoding="utf-8") as fh:
+    with store.open_key(path, encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
 
 
@@ -1815,7 +1815,7 @@ def _write_jsonl_atomic(path, rows):
     """Write stable JSONL without leaving a half-written canonical export."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8", newline="\n") as fh:
+    with store.open_key(temporary, "w", encoding="utf-8", newline="\n") as fh:
         for row in rows:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     os.replace(temporary, path)
@@ -1984,7 +1984,7 @@ def cmd_ingest(cfg, args):
     """
     from llm import Job, confirm
 
-    with open(args.source, encoding="utf-8", errors="ignore") as fh:
+    with store.open_key(args.source, encoding="utf-8", errors="ignore") as fh:
         raw = fh.read()
     blocks = parse_voc(raw)
     voc = paths.voc(cfg["_dir"]); os.makedirs(voc, exist_ok=True)
@@ -2150,7 +2150,7 @@ def cmd_ingest(cfg, args):
     _write_jsonl(os.path.join(voc, "deduplicated_voc.jsonl"), deduped)
     # The segment stage reads filtered_voc.jsonl — keep that name as the contract.
     _write_jsonl(os.path.join(voc, "filtered_voc.jsonl"), deduped)
-    with open(os.path.join(voc, "duplicate_groups.jsonl"), "w", encoding="utf-8") as fh:
+    with store.open_key(os.path.join(voc, "duplicate_groups.jsonl"), "w", encoding="utf-8") as fh:
         for g in groups:
             fh.write(json.dumps(g) + "\n")
 
@@ -2167,7 +2167,7 @@ def cmd_ingest(cfg, args):
 
 
 def _write_jsonl(path, rows):
-    with open(path, "w", encoding="utf-8") as fh:
+    with store.open_key(path, "w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r) + "\n")
 
@@ -2559,7 +2559,7 @@ def _enforce_assignment_thresholds(rows, diagnostics_dir, verbose=True):
 
     os.makedirs(diagnostics_dir, exist_ok=True)
     path = os.path.join(diagnostics_dir, "threshold_violations.jsonl")
-    with open(path, "w", encoding="utf-8") as fh:
+    with store.open_key(path, "w", encoding="utf-8") as fh:
         for violation in violations:
             fh.write(json.dumps(violation, ensure_ascii=False) + "\n")
     share = len(violations) / max(len(rows), 1)
@@ -2677,14 +2677,14 @@ def _segment_force(args, step):
 def _json_atomic(path, value):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as fh:
+    with store.open_key(temporary, "w", encoding="utf-8") as fh:
         json.dump(value, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
     os.replace(temporary, path)
 
 
 def _load_json(path):
-    with open(path, encoding="utf-8") as fh:
+    with store.open_key(path, encoding="utf-8") as fh:
         return json.load(fh)
 
 
@@ -2870,7 +2870,7 @@ def _run_persisted_segment_jobs(c, corpus, jobs, chunks, key, artifact_dir,
             job, chunk["evidence_ids"], corpus, contract_version)
         if os.path.isfile(path) and not force:
             try:
-                with open(path, encoding="utf-8") as fh:
+                with store.open_key(path, encoding="utf-8") as fh:
                     saved = json.load(fh)
                 acceptable = {fingerprint}
                 acceptable.update(
@@ -3870,7 +3870,7 @@ def _extraction_documents(cfg, slugs):
                 continue
             path = os.path.join(directory, name)
             try:
-                with open(path, encoding="utf-8") as handle:
+                with store.open_key(path, encoding="utf-8") as handle:
                     text = handle.read().strip()
             except OSError:
                 continue
@@ -5062,7 +5062,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
     ev = paths.evidence(cfg["_dir"]); os.makedirs(ev, exist_ok=True)
     facets_by_id = {row["facet_id"]: row for row in facets or ()}
     _, s06 = skill(6)
-    with open(os.path.join(voc, "06_build_contract.md"), "w",
+    with store.open_key(os.path.join(voc, "06_build_contract.md"), "w",
               encoding="utf-8") as fh:
         fh.write(s06)
     seen, conflicts, missing = {}, [], []
@@ -5087,7 +5087,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
 
     if conflicts:
         p = os.path.join(voc, "assignment_conflicts.jsonl")
-        with open(p, "w", encoding="utf-8") as fh:
+        with store.open_key(p, "w", encoding="utf-8") as fh:
             for x in conflicts:
                 fh.write(json.dumps(x) + "\n")
         sys.exit(f"  BUILD FAILED — {len(conflicts)} item(s) carry more than one "
@@ -5115,7 +5115,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
         facet_tally = Counter(facet_id for r in rs
                               for facet_id in r.get("facet_ids") or [])
         p = os.path.join(ev, f"{s['slug']}.txt")
-        with open(p, "w", encoding="utf-8") as fh:
+        with store.open_key(p, "w", encoding="utf-8") as fh:
             fh.write(f"{s['name'].upper()}\n{'=' * 72}\n\n")
             fh.write(f"Segment ID: {s['segment_id']}\nSegment slug: {s['slug']}\n")
             fh.write("Validation status: validated\n")
@@ -5170,7 +5170,7 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
             tier: tiers[tier] for tier in segmentation.EVIDENCE_TIERS}))
 
     # ------------------------------------------------------------- audit set
-    with open(os.path.join(voc, "unassigned_evidence.md"), "w", encoding="utf-8") as fh:
+    with store.open_key(os.path.join(voc, "unassigned_evidence.md"), "w", encoding="utf-8") as fh:
         fh.write(f"# Unassigned evidence — {len(unassigned)} item(s)\n\n")
         fh.write("Unassigned is a valid outcome. Forcing an ambiguous comment into a "
                  "segment is worse than leaving it out.\n\n")
@@ -5182,11 +5182,11 @@ def build_evidence_files(cfg, validated, rows, by_id, voc, facets=(),
             fh.write(f"{it.get('text', '')}\n\n---\n\n")
 
     if missing:
-        with open(os.path.join(voc, "missing_evidence.jsonl"), "w", encoding="utf-8") as fh:
+        with store.open_key(os.path.join(voc, "missing_evidence.jsonl"), "w", encoding="utf-8") as fh:
             for x in missing:
                 fh.write(json.dumps(x) + "\n")
 
-    with open(os.path.join(voc, "segment_evidence_manifest.yaml"), "w",
+    with store.open_key(os.path.join(voc, "segment_evidence_manifest.yaml"), "w",
               encoding="utf-8") as fh:
         fh.write("segments:\n")
         for segment_id, slug, n, t, tier_counts in report:
@@ -5283,7 +5283,7 @@ def cmd_extract(cfg, args):
     warn_if_imported(cfg, args.segment)
     c = client(cfg, args)
     source, layer = extraction_source(cfg, args.segment, args)
-    with open(source, encoding="utf-8") as fh:
+    with store.open_key(source, encoding="utf-8") as fh:
         corpus = fh.read()
     label = ("Layer 2 (research pack)" if layer == "pack"
              else "Layer 1 (evidence file)")
@@ -5302,7 +5302,7 @@ def cmd_extract(cfg, args):
         present = False
         if os.path.exists(dest):
             try:
-                with open(dest, encoding="utf-8") as fh:
+                with store.open_key(dest, encoding="utf-8") as fh:
                     present = bool(fh.read().strip())
             except OSError:
                 present = False
@@ -5365,7 +5365,7 @@ def cmd_extract(cfg, args):
         text = results.get(job.id, "")
         if not text or not text.strip():
             continue
-        with open(names[job.id], "w", encoding="utf-8") as fh:
+        with store.open_key(names[job.id], "w", encoding="utf-8") as fh:
             fh.write(text)
         written += 1
     print(f"\n  {written}/{len(jobs)} written -> {out}   (${c.actual_usd():.2f})")
