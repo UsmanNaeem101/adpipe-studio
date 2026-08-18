@@ -88,6 +88,13 @@ before Postgres would care. It is also a quota question, since the database is
 metered in hundreds of megabytes and the bucket in gigabytes. Override with
 `ADPIPE_TEXT_MAX_BYTES` if you need to.
 
+**API keys do not move with it.** The credential store is a `0600` file written
+straight to disk on purpose — a secret does not belong in a shared table or
+bucket — so with no volume it is wiped on every deploy. Set `OPENROUTER_API_KEY`
+(and the others) as service variables instead of typing them into Settings;
+`credentials.resolve()` prefers the environment, and the startup log names which
+providers resolved.
+
 ### Reclaiming the corpora
 
 Stages 01–06 build several copies of the corpus, and stage 06 is the end of that
