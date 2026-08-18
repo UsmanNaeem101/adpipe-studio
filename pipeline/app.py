@@ -4330,7 +4330,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"error": "unknown project"}))
         name = os.path.basename(req.get("filename", "voc.txt")) or "voc.txt"
         if not name.lower().endswith((".txt", ".jsonl", ".json", ".csv", ".md", ".zip")):
-            name += ".txt"
+            # An import is a zip whatever the browser called it, and the suffix
+            # is what decides table or bucket. Called .txt it would be stored as
+            # text, and a zip does not survive being decoded as one.
+            name += ".zip" if req.get("kind") == "import" else ".txt"
         blob = req.get("data", "")
         if blob.startswith("data:") and "," in blob:
             blob = blob.split(",", 1)[1]
@@ -4535,8 +4538,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 cmd += ["--product", str(req["product"])]
         if stage == "import":
             source = req.get("source") or ""
-            # Filesystem, matching where _upload put it and how the CLI reads it.
-            if not (os.path.isfile(source) or os.path.isdir(source)):
+            # Asked of the store, matching where _upload put it and how the CLI
+            # now reads it. This was the filesystem, and once the upload started
+            # going to the store the answer was always no: the browser showed a
+            # correct plan for a zip it had just parsed, and pressing Run said
+            # nothing had been uploaded.
+            if not (source and (store.exists(source) or os.path.isdir(source))):
                 return self._send(200, "Nothing uploaded to import yet.\n",
                                   "text/plain; charset=utf-8")
             # The browser has already been shown the plan and pressed Run, so

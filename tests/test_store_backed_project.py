@@ -248,6 +248,135 @@ class ImportAndExtractTests(StoreBackedProject):
         self.assertIn("3pm", merged)
 
 
+class UploadThenImportTests(StoreBackedProject):
+    """The browser's route from a ChatGPT export to evidence files.
+
+    Upload parses the zip and shows a plan; Run imports it. Those are two
+    requests, and the second has to find what the first wrote — which stopped
+    being true the moment the upload started going to the store while the guard
+    still asked the filesystem. The browser showed a correct plan for a zip it
+    had just read, and pressing Run answered "nothing uploaded to import yet".
+    """
+
+    def setUp(self):
+        super().setUp()
+        app.create_project("probe", "lumbar cushions", "desk workers")
+        self.zip_bytes = export_zip(("Desk Workers", 12), ("New Parents", 8))
+
+    def upload(self, filename="stage06.zip"):
+        captured = {}
+
+        class Recorder(app.Handler):
+            def __init__(self):
+                pass
+
+            def _send(self, code, body, ctype="application/json", download=None):
+                captured.update(json.loads(body))
+
+        Recorder()._upload({"project": "probe", "kind": "import",
+                            "filename": filename,
+                            "data": __import__("base64").b64encode(
+                                self.zip_bytes).decode()})
+        return captured
+
+    def test_the_upload_lands_in_the_store(self):
+        reply = self.upload()
+        self.assertTrue(reply.get("ok"), reply)
+        self.assertTrue(store_module.exists(reply["path"]))
+        self.assertEqual(self.on_disk(), [])
+
+    def test_the_plan_is_shown_before_anything_is_written(self):
+        reply = self.upload()
+        self.assertEqual([row["slug"] for row in reply["plan"]],
+                         ["01_desk_workers", "02_new_parents"])
+        # Nothing written yet — the plan is what the browser confirms against.
+        self.assertEqual([k for k in self.supabase.rows if "/evidence/" in k], [])
+
+    def test_a_zip_survives_being_stored(self):
+        # Routed as text it would be decoded as UTF-8, which a zip does not
+        # survive — and the failure is a UnicodeDecodeError from inside the
+        # store rather than anything naming the upload.
+        reply = self.upload()
+        self.assertEqual(store_module.read_bytes(reply["path"]), self.zip_bytes)
+
+    def test_a_zip_with_no_extension_is_still_kept_as_one(self):
+        reply = self.upload(filename="stage06export")
+        self.assertTrue(reply.get("ok"), reply)
+        self.assertTrue(reply["path"].endswith(".zip"))
+        self.assertEqual(store_module.read_bytes(reply["path"]), self.zip_bytes)
+
+    def test_the_run_route_finds_what_the_upload_wrote(self):
+        import subprocess
+        from unittest import mock
+
+        reply = self.upload()
+        captured = {}
+
+        class Recorder(app.Handler):
+            """Enough of an HTTP handler to get past the guard and no further."""
+
+            def __init__(self):
+                self.wfile = io.BytesIO()
+
+            def _send(self, code, body, ctype="application/json", download=None):
+                captured["refused"] = body
+
+            def send_response(self, *a, **k):
+                captured["streaming"] = True
+
+            def send_header(self, *a, **k):
+                pass
+
+            def end_headers(self):
+                pass
+
+        with mock.patch.object(subprocess, "Popen",
+                               side_effect=RuntimeError("would have spawned")):
+            Recorder()._run({"project": "probe", "stage": "import",
+                             "source": reply["path"], "approve": True})
+        # It began streaming rather than answering with the refusal, which is
+        # what says the guard found the uploaded zip. The runner it then tried
+        # to start is stubbed; getting that far is the whole assertion.
+        self.assertTrue(captured.get("streaming"))
+        self.assertNotIn("Nothing uploaded", str(captured.get("refused", "")))
+
+    def test_the_run_route_still_refuses_when_nothing_was_uploaded(self):
+        captured = {}
+
+        class Recorder(app.Handler):
+            def __init__(self):
+                self.wfile = io.BytesIO()
+
+            def _send(self, code, body, ctype="application/json", download=None):
+                captured["refused"] = body
+
+            def send_response(self, *a, **k):
+                captured["streaming"] = True
+
+        Recorder()._run({"project": "probe", "stage": "import",
+                         "source": os.path.join(self.project(), "research",
+                                                "imports", "never-uploaded.zip")})
+        self.assertIn("Nothing uploaded", str(captured.get("refused")))
+        self.assertFalse(captured.get("streaming"))
+
+    def test_the_command_imports_it_out_of_the_store(self):
+        import cli
+
+        reply = self.upload()
+
+        class Args:
+            source = reply["path"]
+            yes = True
+
+        cli.cmd_import({"_dir": self.project(), "name": "probe"}, Args())
+        self.assertEqual(
+            sorted(k for k in self.supabase.rows if "/evidence/" in k),
+            ["projects/probe/research/evidence/01_desk_workers.txt",
+             "projects/probe/research/evidence/02_new_parents.txt",
+             "projects/probe/research/evidence/_provenance.json"])
+        self.assertEqual(self.on_disk(), [])
+
+
 class ProductAndRenderTests(StoreBackedProject):
     def setUp(self):
         super().setUp()
