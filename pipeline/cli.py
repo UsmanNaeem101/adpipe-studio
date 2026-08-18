@@ -252,8 +252,9 @@ def skill(n):
     """Read skill NN_*.md — the instruction for one pipeline stage."""
     for f in store.names_in(SKILLS):
         if f.startswith(f"{n:02d}_") and f.endswith(".md"):
-            with open(os.path.join(SKILLS, f), encoding="utf-8") as fh:
-                return f[:-3], fh.read()
+            body = store.read_text(os.path.join(SKILLS, f))
+            if body is not None:
+                return f[:-3], body
     sys.exit(f"Skill {n:02d} not found in {SKILLS}")
 
 
@@ -5519,7 +5520,12 @@ def read_extractions(cfg, segment, *want):
     parts = []
     for f in store.names_in(d):
         if f.endswith(".md") and (not want or any(w in f for w in want)):
-            parts.append(f"## {f[:-3]}\n\n{open(os.path.join(d, f), encoding='utf-8').read()}")
+            # Listed through the store and read through it too. Mixed, this
+            # found every extraction and then read none of them, because the
+            # names came from Postgres and the open() went to a disk that had
+            # never held them.
+            body = store.read_text(os.path.join(d, f)) or ""
+            parts.append(f"## {f[:-3]}\n\n{body}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -5545,8 +5551,7 @@ def synth(cfg, args, stage, prompt, dest, max_tokens=16000, schema=None, corpus=
         text = json.dumps(decoded, indent=2)
     else:
         text = c.one(corpus, PREAMBLE, prompt, max_tokens, schema)
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    open(dest, "w", encoding="utf-8").write(text)
+    store.write_text(dest, text)
     print(f"  -> {dest}   (${c.actual_usd():.2f})")
     return text
 
@@ -5855,8 +5860,8 @@ Set "evidence_file" to "{os.path.relpath(evidence_path(cfg, args.segment), ROOT)
             md.append("- **Hooks:**")
             md += [f"  {i}. {h}" for i, h in enumerate(c["hooks"], 1)]
             md.append("")
-        open(os.path.join(os.path.dirname(dest), "02_concepts.md"), "w",
-             encoding="utf-8").write("\n".join(md))
+        store.write_text(os.path.join(os.path.dirname(dest), "02_concepts.md"),
+                         "\n".join(md))
         print(f"  -> {os.path.dirname(dest)}/02_concepts.md")
 
 

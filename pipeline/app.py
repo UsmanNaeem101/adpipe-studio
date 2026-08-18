@@ -27,6 +27,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import socketserver
 import subprocess
 import sys
@@ -267,19 +268,19 @@ def ensure_project(name, product="", market=""):
         raise ValueError(problem)
     dest = os.path.join(ROOT, "projects", name)
     existing = os.path.join(dest, "project.json")
-    if store.exists(existing):
-        return json.load(open(existing, encoding="utf-8")), False
+    found = store.read_json(existing)
+    if found is not None:
+        return found, False
 
     cfg = json.loads(json.dumps(TEMPLATE_PROJECT))
     cfg = {"_comment": cfg.pop("_comment"), "name": name,
            "product": product or name, "market": market or "", **cfg}
     paths.scaffold(name)
-    json.dump(cfg, open(existing, "w", encoding="utf-8"), indent=2)
+    store.write_json(existing, cfg)
 
     facts = json.loads(json.dumps(BLANK_FACTS))
     facts["product"] = product or name
-    json.dump(facts, open(os.path.join(dest, "facts.json"), "w", encoding="utf-8"),
-              indent=2)
+    store.write_json(os.path.join(dest, "facts.json"), facts)
     return cfg, True
 
 
@@ -334,7 +335,7 @@ def move_product(project, product, to):
     seg_path = os.path.join(src, "segments.json")
     if store.exists(seg_path):
         try:
-            rows = json.load(open(seg_path, encoding="utf-8"))
+            rows = store.read_json(seg_path) or []
         except (ValueError, OSError):
             rows = []
         changed = False
@@ -350,7 +351,7 @@ def move_product(project, product, to):
                 changed = True
                 pinned += 1
         if changed:
-            json.dump(rows, open(seg_path, "w", encoding="utf-8"), indent=2)
+            store.write_json(seg_path, rows)
 
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     os.rename(src, dst)
@@ -390,44 +391,63 @@ def create_project(name, product, market):
     cfg = {"_comment": cfg.pop("_comment"), "name": name,
            "product": product or name, "market": market or "", **cfg}
     paths.scaffold(name)
-    json.dump(cfg, open(os.path.join(dest, "project.json"), "w", encoding="utf-8"),
-              indent=2)
+    # Through the store, both of them. These two files are the project: the
+    # filter regexes and compliance profile every VOC stage is handed, and the
+    # approved claims every ad is checked against. Written with open() they went
+    # to a container disk, which meant a project created on a deployment was
+    # invisible in its own list — `projects()` asks the store — and gone
+    # entirely on the next deploy.
+    store.write_json(os.path.join(dest, "project.json"), cfg)
 
     facts = json.loads(json.dumps(BLANK_FACTS))
     facts["product"] = product or name
-    json.dump(facts, open(os.path.join(dest, "facts.json"), "w", encoding="utf-8"),
-              indent=2)
+    store.write_json(os.path.join(dest, "facts.json"), facts)
 
     return cfg
+
+
+def _when(epoch):
+    """The ISO string the UI prints. A store-held file may have no date at all —
+    the bucket does not carry one — and an empty string is a blank cell rather
+    than 1970."""
+    if not epoch:
+        return ""
+    return datetime.datetime.fromtimestamp(epoch).astimezone().isoformat(
+        timespec="seconds")
 
 
 def project_summary(name):
     """What a project actually contains — so a delete confirmation can state the
     cost of the mistake rather than asking 'are you sure?' about an unknown."""
     root = os.path.join(ROOT, "projects", name)
-    if not os.path.isdir(root):
+    if not store.exists(root):
         return None
     counts = {"evidence": 0, "extractions": 0, "renders": 0, "voc_files": 0,
               "bytes": 0, "segments": []}
-    for base, _dirs, files in os.walk(root):
-        for f in files:
-            fp = os.path.join(base, f)
-            try:
-                counts["bytes"] += os.path.getsize(fp)
-            except OSError:
-                pass
-            rel = os.path.relpath(fp, root)
-            # Only .txt directly in evidence/ is a segment — subfolders hold other
-            # artefacts, and counting them made pain_points files look like segments.
-            if rel == os.path.join("evidence", f) and f.endswith(".txt"):
-                counts["evidence"] += 1
-                counts["segments"].append(f[:-4])
-            elif rel.startswith("extractions" + os.sep) and f.endswith(".md"):
-                counts["extractions"] += 1
-            elif f.lower().endswith(IMG_EXT) and "renders" in rel:
-                counts["renders"] += 1
-            elif rel.startswith("voc" + os.sep):
-                counts["voc_files"] += 1
+    # Walked through the store rather than os.walk. This is what fills the row
+    # in Settings and the delete confirmation — a project held entirely in
+    # Postgres reported nought of everything, which reads as an empty project
+    # and is the worst possible thing for a confirmation to say.
+    for key in store.list_keys(root):
+        rel = os.path.relpath(str(key), root).replace(os.sep, "/")
+        base = rel.rsplit("/", 1)[-1]
+        data = store.read_bytes(key)
+        counts["bytes"] += len(data) if data else 0
+        # Only .txt directly in evidence/ is a segment — subfolders hold other
+        # artefacts, and counting them made pain_points files look like segments.
+        parts = rel.split("/")
+        # Either layout: research/evidence/x.txt (current) or evidence/x.txt.
+        trimmed = parts[1:] if parts[0] == paths.RESEARCH else parts
+        if len(trimmed) == 2 and trimmed[0] == "evidence" and base.endswith(".txt"):
+            counts["evidence"] += 1
+            counts["segments"].append(base[:-4])
+        elif trimmed and trimmed[0] == "extractions" and base.endswith(".md"):
+            counts["extractions"] += 1
+        elif base.lower().endswith(IMG_EXT) and "renders" in rel:
+            counts["renders"] += 1
+        elif trimmed and trimmed[0] == "voc":
+            counts["voc_files"] += 1
+    counts["segments"].sort()
     return counts
 
 
@@ -480,11 +500,25 @@ def delete_project(name):
     if name not in projects():
         raise ValueError(f"no project {name!r}")
     src = os.path.join(ROOT, "projects", name)
-    trash = os.path.join(ROOT, "projects", "_deleted")
-    os.makedirs(trash, exist_ok=True)
     stamp = __import__("datetime").datetime.now().strftime("%Y%m%d-%H%M%S")
-    dest = os.path.join(trash, f"{name}_{stamp}")
-    os.rename(src, dest)
+    dest = os.path.join(ROOT, "projects", "_deleted", f"{name}_{stamp}")
+
+    # A rename moves a directory, and a store has none. On a store-backed
+    # project os.rename moved the empty scaffolding and left every row where it
+    # was, so the project reappeared the moment the list was refreshed — which
+    # is what "I deleted it and it came back" looks like from the outside.
+    keys = store.list_keys(src)
+    if not keys:
+        raise OSError(f"project {name!r} held no files to archive")
+    for key in keys:
+        data = store.read_bytes(key)
+        if data is None:
+            continue
+        store.write_bytes(os.path.join(dest, os.path.relpath(str(key), src)), data)
+    store.delete_prefix(src)
+    # The scaffolding paths.scaffold() made is empty and outlives the keys.
+    if os.path.isdir(src):
+        shutil.rmtree(src, ignore_errors=True)
     return os.path.relpath(dest, ROOT)
 
 
@@ -496,25 +530,22 @@ def project_outputs(project):
         return {}
     prov = {}
     pp = paths.evidence(root, "_provenance.json")
-    if store.exists(pp):
-        try:
-            prov = json.load(open(pp, encoding="utf-8"))
-        except Exception:
-            prov = {}
+    prov = store.read_json(pp, {}) or {}
     out = {"stages": [], "provenance": prov}
 
     def entry(stage, label, path, kind="text", role=None):
-        if store.exists(path):
-            stat = os.stat(path)
+        # Asked of the store, because os.stat raises for a project that only
+        # exists in Postgres — and this loop builds the whole Outputs tab, so
+        # one artefact held there took every artefact down with it.
+        found = store.stat(path)
+        if found:
             rel = os.path.relpath(path, ROOT)
             out["stages"].append({"stage": stage, "label": label, "path": rel,
                                   "kind": kind,
                                   "role": role,
-                                  "size": stat.st_size,
-                                  "mtime": stat.st_mtime,
-                                  "modified_at": datetime.datetime.fromtimestamp(
-                                      stat.st_mtime).astimezone().isoformat(
-                                          timespec="seconds")})
+                                  "size": found["size"],
+                                  "mtime": found["mtime"],
+                                  "modified_at": _when(found["mtime"])})
 
     voc = paths.voc(root)
     entry("ingest", "production_voc.jsonl · segment-ready corpus",
@@ -762,15 +793,14 @@ def segment_voc_files(project):
     files = []
     for name in SEGMENT_VOC_FILES:
         path = os.path.join(voc_dir, name)
-        if store.exists(path):
-            stat = os.stat(path)
+        found = store.stat(path)
+        if found:
             files.append({
                 "name": name,
                 "label": f"Final · {name}",
                 "path": path,
-                "mtime": stat.st_mtime,
-                "modified_at": datetime.datetime.fromtimestamp(
-                    stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+                "mtime": found["mtime"],
+                "modified_at": _when(found["mtime"]),
             })
     return files
 
@@ -800,16 +830,15 @@ def refine_voc_files(project):
                         or first.get("tier") in ("core", "supporting", "context"))
             if not tierable:
                 continue
-            stat = os.stat(path)
+            found = store.stat(path) or {"mtime": 0}
             rel = os.path.relpath(path, voc_dir)
             recommended = rel == "deduplicated_voc.jsonl"
             files.append({
                 "name": rel,
                 "label": ("Recommended" if recommended else "Available") + f" · {rel}",
                 "path": path,
-                "mtime": stat.st_mtime,
-                "modified_at": datetime.datetime.fromtimestamp(
-                    stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+                "mtime": found["mtime"],
+                "modified_at": _when(found["mtime"]),
                 "recommended": recommended,
             })
     return sorted(files, key=lambda row: (not row["recommended"], row["name"]))
@@ -950,7 +979,7 @@ def library():
                     w, h = sips_dims(full)
                     cache[key] = [w, h]
                     dirty = True
-            digest = hashlib.sha256(open(full, "rb").read()).hexdigest()
+            digest = hashlib.sha256(store.read_bytes(full) or b"").hexdigest()
             hashes.setdefault(digest, []).append(rel)
             claimed = os.path.splitext(f)[1].lower().lstrip(".")
             claimed = "jpeg" if claimed == "jpg" else claimed
@@ -1046,8 +1075,8 @@ def compliance_notes(project=""):
     rules as though they were its own.
     """
     try:
-        cfg = json.load(open(os.path.join(ROOT, "projects", project, "project.json"),
-                             encoding="utf-8"))
+        cfg = store.read_json(
+            os.path.join(ROOT, "projects", project, "project.json")) or {}
         return cfg.get("compliance", {}).get("notes", "")
     except Exception:
         return ""
@@ -3979,20 +4008,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(404, b"not found", "text/plain")
             if full.lower().endswith(IMG_EXT):
                 ctype = mimetypes.guess_type(full)[0] or "image/png"
-                return self._send(200, open(full, "rb").read(), ctype)
+                raw = store.read_bytes(full)
+                if raw is None:
+                    return self._send(404, b"not found", "text/plain")
+                return self._send(200, raw, ctype)
             # Text: cap what we ship to the browser — some corpora are ~500KB.
-            data = open(full, encoding="utf-8", errors="replace").read()
+            data = store.read_text(full)
+            if data is None:
+                return self._send(404, b"not found", "text/plain")
+            found = store.stat(full) or {"size": len(data.encode("utf-8"))}
             clipped = len(data) > 200_000
             return self._send(200, json.dumps(
                 {"text": data[:200_000], "clipped": clipped,
-                 "bytes": os.path.getsize(full)}))
+                 "bytes": found["size"]}))
         if u.path == "/settings":
             q = urllib.parse.parse_qs(u.query)
             project = (q.get("project") or [""])[0]
             path = os.path.join(ROOT, "projects", project, "project.json")
             if not SAFE_NAME.match(project or "") or not store.exists(path):
                 return self._send(404, json.dumps({"error": "unknown project"}))
-            cfg = json.load(open(path, encoding="utf-8"))
+            cfg = store.read_json(path) or {}
             return self._send(200, json.dumps({
                 "schema": settings.schema(),
                 "values": settings.current(cfg),
@@ -4032,7 +4067,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 p, ctype = thumbnail(p, rel)
             else:
                 ctype = mimetypes.guess_type(p)[0] or "image/png"
-            return self._send(200, open(p, "rb").read(), ctype)
+            raw = store.read_bytes(p)
+            if raw is None:
+                return self._send(404, b"not found", "text/plain")
+            return self._send(200, raw, ctype)
         self._send(404, b"not found", "text/plain")
 
     # ----------------------------------------------------------------- POST
@@ -4046,7 +4084,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(404, json.dumps({"error": "unknown project"}))
             try:
                 with _lock:
-                    cfg = json.load(open(full, encoding="utf-8"))
+                    cfg = store.read_json(full) or {}
                     # All-or-nothing: one bad value writes none of them, so a run
                     # can never start against a half-applied config.
                     updated = settings.apply(cfg, req.get("values") or {})
@@ -4145,7 +4183,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 while store.exists(dest):
                     b, e = os.path.splitext(os.path.join(dest_dir, name))
                     dest = f"{b}_{n}{e}"; n += 1
-                open(dest, "wb").write(raw)
+                store.write_bytes(dest, raw)
                 saved.append(os.path.relpath(dest, REFS))
             return self._send(200, json.dumps({"saved": saved, "failed": failed}))
         if path == "/presets/levers":
@@ -4309,9 +4347,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # a second, so the plan can be shown before anything is written and
             # a zip of the wrong shape is caught while it is still just a file.
             dest_dir = paths.research(project_dir, "imports")
-            os.makedirs(dest_dir, exist_ok=True)
             dest = os.path.join(dest_dir, name)
-            open(dest, "wb").write(raw)
+            store.write_bytes(dest, raw)
             try:
                 rows = importer.plan(importer.audience_members(raw))
             except zipfile.BadZipFile:
@@ -4323,9 +4360,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "items": r["items"], "segment_id": r["segment_id"]}
                           for r in rows]}))
         dest_dir = paths.voc(project_dir, "raw")
-        os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, name)
-        open(dest, "wb").write(raw)
+        store.write_bytes(dest, raw)
         return self._send(200, json.dumps(
             {"ok": True, "path": dest, "bytes": len(raw),
              "rel": os.path.relpath(dest, ROOT)}))
@@ -4377,18 +4413,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except presets.PresetError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
 
-        cfg = {}
-        try:
-            cfg = json.load(open(os.path.join(ROOT, "projects", project,
-                                              "project.json"), encoding="utf-8"))
-        except Exception:
-            pass
+        cfg = store.read_json(
+            os.path.join(ROOT, "projects", project, "project.json")) or {}
         facts = ""
         if cfg.get("facts"):
-            try:
-                facts = open(os.path.join(ROOT, cfg["facts"]), encoding="utf-8").read()
-            except OSError:
-                facts = ""
+            facts = store.read_text(os.path.join(ROOT, cfg["facts"])) or ""
 
         try:
             n = max(1, min(8, int(req.get("n") or
@@ -4446,7 +4475,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 stage="remix_image", source="studio"):
                 out = remix.remix_images(
                     prompt,
-                    [(os.path.basename(ref), open(ref, "rb").read()), ("product.png", prod)],
+                    [(os.path.basename(ref), store.read_bytes(ref) or b""),
+                     ("product.png", prod)],
                     key, size=req.get("size"))
         except remix.RemixError as e:
             return self._send(200, json.dumps({"error": str(e)}))

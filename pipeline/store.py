@@ -26,6 +26,7 @@ none is added.
 from __future__ import annotations
 
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -206,6 +207,13 @@ class LocalStore:
                 found.append(str(prefix).rstrip("/") + "/" + rest if absolute else rest)
         return sorted(found)
 
+    def stat(self, key):
+        try:
+            found = os.stat(self._path(key))
+        except OSError:
+            return None
+        return {"size": found.st_size, "mtime": found.st_mtime}
+
 
 class SupabaseStore:
     """
@@ -267,7 +275,7 @@ class SupabaseStore:
         the pipeline, and a store has no directories, only keys with a common
         beginning.
         """
-        tidy = normalise(key)
+        given, tidy = key, normalise(key)
         if is_binary_key(tidy):
             status, _ = self._request("GET", self._object_path(tidy))
             if status == 200:
@@ -277,23 +285,28 @@ class SupabaseStore:
                 "GET", "?key=eq.%s&select=key" % urllib.parse.quote(tidy, safe=""))
             if status == 200 and payload.strip() not in (b"[]", b""):
                 return True
-            if self.list_keys(tidy):
+            if self.list_keys(given):
                 return True
-        return self.underlay.exists(key)
+        return self.underlay.exists(given)
 
     def read_text(self, key):
-        key = normalise(key)
+        # The key as asked is kept for the underlay. Normalising strips the data
+        # root, and the image is not always underneath it — hand a relative key
+        # to a LocalStore rooted elsewhere and it resolves the path a second
+        # time, against the wrong base. The skills read as missing, and skill()
+        # exits rather than returning None.
+        given, key = key, normalise(key)
         if is_binary_key(key):
-            raw = self.read_bytes(key)
+            raw = self.read_bytes(given)
             return None if raw is None else raw.decode("utf-8")
         status, payload = self._rest(
             "GET", "?key=eq.%s&select=content" % urllib.parse.quote(key, safe="")
         )
         if status != 200:
-            return self.underlay.read_text(key)
+            return self.underlay.read_text(given)
         rows = json.loads(payload or b"[]")
         if not rows:
-            return self.underlay.read_text(key)
+            return self.underlay.read_text(given)
         content = rows[0]["content"]
         if isinstance(content, str) and content.startswith(OVERFLOW_PREFIX):
             status, payload = self._request("GET", self._object_path(key))
@@ -305,12 +318,12 @@ class SupabaseStore:
         return content
 
     def read_bytes(self, key):
-        key = normalise(key)
+        given, key = key, normalise(key)
         if not is_binary_key(key):
-            text = self.read_text(key)
+            text = self.read_text(given)
             return None if text is None else text.encode("utf-8")
         status, payload = self._request("GET", self._object_path(key))
-        return payload if status == 200 else self.underlay.read_bytes(key)
+        return payload if status == 200 else self.underlay.read_bytes(given)
 
     # -- writes -----------------------------------------------------------
 
@@ -392,23 +405,86 @@ class SupabaseStore:
             self.delete(key)
 
     def list_keys(self, prefix=""):
-        prefix = normalise(prefix)
-        pattern = urllib.parse.quote((prefix + "/%") if prefix else "%", safe="")
+        """
+        Every key under a prefix, in the same shape the prefix was given in, and
+        including what is only in the image.
+
+        Both halves of that were wrong, and the second was fatal. `exists` and
+        every reader fall through to the underlay, but this did not — so on a
+        store-backed deployment the skills, the ad templates and the reference
+        ads all listed as empty while existing. `skill()` exits when it cannot
+        find its markdown, which meant extract, picc, concepts and brief refused
+        to start on the one configuration they were added for.
+
+        Absolute in, absolute out, for the same reason LocalStore does it:
+        callers hold the absolute paths `paths.py` hands them, and some ask
+        about directories outside the data root entirely.
+        """
+        given = str(prefix).replace("\\", "/").rstrip("/")
+        tidy = normalise(given)
+        absolute = bool(given) and os.path.isabs(given)
+        pattern = urllib.parse.quote((tidy + "/%") if tidy else "%", safe="")
         status, payload = self._rest("GET", "?key=like.%s&select=key&order=key" % pattern)
-        keys = [row["key"] for row in json.loads(payload or b"[]")] if status == 200 else []
+        stored = [row["key"] for row in json.loads(payload or b"[]")] if status == 200 else []
 
         # The bucket is listed separately: binary keys are not rows in the table.
         status, payload = self._request(
             "POST",
             "/storage/v1/object/list/%s" % self.bucket,
-            body={"prefix": prefix, "limit": 1000},
+            body={"prefix": tidy, "limit": 1000},
         )
         if status == 200:
             for entry in json.loads(payload or b"[]"):
                 name = entry.get("name")
                 if name:
-                    keys.append("%s/%s" % (prefix, name) if prefix else name)
-        return sorted(set(keys))
+                    stored.append("%s/%s" % (tidy, name) if tidy else name)
+
+        keys = set()
+        for key in stored:
+            if absolute:
+                rest = key[len(tidy) + 1:] if tidy and key.startswith(tidy + "/") else key
+                keys.add(given + "/" + rest)
+            else:
+                keys.add(key)
+        keys.update(self.underlay.list_keys(prefix))
+        return sorted(keys)
+
+    def stat(self, key):
+        """How big, and when — without downloading a corpus to find out.
+
+        The Outputs tab lists a dozen artefacts and shows a size and a date for
+        each. os.stat answered that on a laptop and raised FileNotFoundError on
+        a project held in Postgres, which took the whole tab down with it.
+
+        The row carries `updated_at`, so the date is free. Size is the awkward
+        half — PostgREST cannot compute octet_length in a select — but the files
+        where that would matter are exactly the ones written to the bucket, and
+        their marker records the byte count. So a corpus costs a marker, and
+        anything read in full is under the overflow limit by definition.
+        """
+        given, tidy = key, normalise(key)
+        if is_binary_key(tidy):
+            status, payload = self._request("GET", self._object_path(tidy))
+            if status == 200:
+                return {"size": len(payload), "mtime": 0}
+            return self.underlay.stat(given)
+
+        status, payload = self._rest(
+            "GET",
+            "?key=eq.%s&select=content,updated_at" % urllib.parse.quote(tidy, safe=""))
+        rows = json.loads(payload or b"[]") if status == 200 else []
+        if not rows:
+            return self.underlay.stat(given)
+
+        content = rows[0].get("content") or ""
+        if isinstance(content, str) and content.startswith(OVERFLOW_PREFIX):
+            try:
+                size = int(json.loads(content[len(OVERFLOW_PREFIX):])["bytes"])
+            except (ValueError, KeyError, TypeError):
+                size = 0
+        else:
+            size = len(content.encode("utf-8"))
+        return {"size": size, "mtime": _epoch(rows[0].get("updated_at"))}
 
     def _object_path(self, key):
         return "/storage/v1/object/%s/%s" % (self.bucket, urllib.parse.quote(key))
@@ -490,6 +566,26 @@ def delete_prefix(prefix):
 
 def list_keys(prefix=""):
     return store().list_keys(prefix)
+
+
+def _epoch(stamp):
+    """A Postgres timestamptz as seconds, or 0.
+
+    Listings sort on this, so an unreadable date has to sort as oldest rather
+    than stop the sort.
+    """
+    if not stamp:
+        return 0
+    text = str(stamp).replace("Z", "+00:00")
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return 0
+
+
+def stat(key):
+    """Size and modification time, or None when there is no such key."""
+    return store().stat(key)
 
 
 def read_json(key, default=None):
