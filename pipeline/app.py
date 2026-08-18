@@ -3756,10 +3756,12 @@ async function renderStorage(){
   const good=s.ok && s.kind!=='local';
   el.style.color = good ? 'var(--accent)' : 'var(--signal)';
   if(s.kind==='local'){
-    el.innerHTML=`<b>The container's own disk</b> — ${s.where}<br>`+
-      `Nothing here survives a deploy. Set <code>SUPABASE_URL</code> and `+
-      `<code>SUPABASE_SERVICE_ROLE_KEY</code> on this service, or mount a volume `+
-      `at <code>projects/</code>.`;
+    el.innerHTML=`<b>Not Supabase</b> — ${s.detail}<br><code>${s.where}</code><br>`+
+      (s.durable
+        ? `Work here survives a deploy but lives on one machine. Set `
+        : `Nothing here survives a deploy. Set `)+
+      `<code>SUPABASE_URL</code> and <code>SUPABASE_SERVICE_ROLE_KEY</code> on `+
+      `this service to move it into Postgres.`;
     return;
   }
   el.innerHTML = (s.ok ? `<b>Supabase</b> (${s.where}) — ${s.detail}. `+
@@ -4656,7 +4658,7 @@ STORAGE_MARKER = "projects/.storage.json"
 # Shipped in the repository, therefore present in the image and only visible when
 # nothing is mounted over projects/. Its presence is the one thing that can say
 # "this is the container's own disk" without waiting for a deploy to prove it.
-IMAGE_MARKER = "projects/.in-the-image"
+IMAGE_MARKER = store.IMAGE_MARKER
 
 
 def storage_report(now=None, marker=STORAGE_MARKER, image_marker=IMAGE_MARKER):

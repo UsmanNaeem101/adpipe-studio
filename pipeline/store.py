@@ -62,6 +62,15 @@ TEXT_MAX_BYTES = int(os.environ.get("ADPIPE_TEXT_MAX_BYTES") or 512 * 1024)
 # kept so `exists` and `list_keys` still answer from one place.
 OVERFLOW_PREFIX = "adpipe:overflow:v1:"
 
+# A file that ships inside the container image, under projects/.
+#
+# Seeing it means nothing is mounted over that directory, so the work there is
+# on the container's own disk and a deploy will take it. Not seeing it means a
+# volume is mounted on top — which is the only way to tell the two apart from
+# inside the process, and the difference between "your work is safe" and "your
+# work is about to be deleted".
+IMAGE_MARKER = "projects/.in-the-image"
+
 
 def is_binary_key(key):
     return key.lower().endswith(BINARY_SUFFIXES)
@@ -586,16 +595,29 @@ def health(store_object=None, environ=None):
     # sentence, because it is one variable away from working.
     url, key = supabase_settings(environ)
     root = target.root
+
+    # Is a volume mounted over projects/, or is this the container's own disk?
+    # The marker ships in the image; a volume mounted on top hides it. Without
+    # this the answer is "the filesystem", which is true and useless — it is the
+    # same sentence whether the work is safe or about to be deleted.
+    on_image_disk = os.path.exists(os.path.join(root, IMAGE_MARKER))
+    if on_image_disk:
+        where = "the container's own disk — nothing is mounted over projects/"
+        durable = False
+    else:
+        where = "a mounted volume — work survives a deploy, on this machine only"
+        durable = True
+
     if key and not url:
         detail = ("SUPABASE_SERVICE_ROLE_KEY is set but SUPABASE_URL is not, so "
-                  "this is running on the disk. Both are needed.")
+                  "this is running on %s. Both are needed." % where)
     elif url and not key:
         detail = ("SUPABASE_URL is set but SUPABASE_SERVICE_ROLE_KEY is not, so "
-                  "this is running on the disk. Both are needed.")
+                  "this is running on %s. Both are needed." % where)
     else:
-        detail = "the filesystem — a container discards this on deploy"
-    return {"kind": "local", "ok": os.access(root, os.W_OK), "where": root,
-            "detail": detail}
+        detail = where
+    return {"kind": "local", "ok": os.access(root, os.W_OK) and durable,
+            "durable": durable, "where": root, "detail": detail}
 
 
 def build_store(environ=None):
