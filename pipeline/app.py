@@ -1847,6 +1847,10 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 
 <!-- ================= SETTINGS ================= -->
 <section id=t-settings class=hide>
+  <div class=card style="max-width:760px" id=storagecard>
+    <h2>Where this is saved</h2>
+    <p class=hint id=storageline>Checking…</p>
+  </div>
   <div class=card style="max-width:760px">
     <h2>New project</h2>
     <div class=row>
@@ -1955,7 +1959,9 @@ $$('.tab').forEach(b=>b.onclick=()=>{
   if(b.dataset.t==='library'  && typeof loadLibrary==='function') loadLibrary();
   if(b.dataset.t==='outputs'  && typeof loadOutputs==='function'){
     loadOutputs(); if(typeof loadLogStages==='function') loadLogStages(); }
-  if(b.dataset.t==='settings' && typeof renderProjectList==='function') renderProjectList();
+  if(b.dataset.t==='settings' && typeof renderProjectList==='function'){
+    renderProjectList(); renderStorage();
+  }
   if(b.dataset.t==='product' && typeof loadProducts==='function'){ loadProducts(); renderNewProduct(); loadNewProjectPicker(); }
 });
 
@@ -3739,6 +3745,28 @@ $('#limportfile')&&($('#limportfile').onchange=async e=>{
 });
 
 
+/* ================= where this is saved =================
+   The one question that costs money to get wrong. A project on the container's
+   own disk looks identical to one in Postgres right up until a deploy, and the
+   answer used to be available only in a startup log nobody reads mid-session. */
+async function renderStorage(){
+  const el=$('#storageline'); if(!el)return;
+  let s; try{ s=await (await fetch('/storage')).json(); }
+  catch(e){ el.textContent='Could not check storage: '+e; return; }
+  const good=s.ok && s.kind!=='local';
+  el.style.color = good ? 'var(--accent)' : 'var(--signal)';
+  if(s.kind==='local'){
+    el.innerHTML=`<b>The container's own disk</b> — ${s.where}<br>`+
+      `Nothing here survives a deploy. Set <code>SUPABASE_URL</code> and `+
+      `<code>SUPABASE_SERVICE_ROLE_KEY</code> on this service, or mount a volume `+
+      `at <code>projects/</code>.`;
+    return;
+  }
+  el.innerHTML = (s.ok ? `<b>Supabase</b> (${s.where}) — ${s.detail}. `+
+      `${s.projects} project(s).`
+    : `<b>Supabase is configured but not working</b> (${s.where})<br>${s.detail}`);
+}
+
 /* ================= existing projects ================= */
 async function renderProjectList(){
   const el=$('#plist'); if(!el)return;
@@ -4050,6 +4078,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                for r in extractors],
                 "stage_skills": by_stage,
                 "presets": {k: v for k, v in cli.PRESETS.items()}}))
+        if u.path == "/storage":
+            # Read-only: the startup banner answers this by writing a boot
+            # record, which is right once per process and wrong for a page.
+            report = store.health()
+            report["projects"] = len(projects())
+            return self._send(200, json.dumps(report))
         if u.path == "/keys":
             try:
                 state = credentials.status()
