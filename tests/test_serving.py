@@ -122,6 +122,36 @@ class StartupCredentialLineTests(unittest.TestCase):
         self.assertIn("/app/projects/.credentials.json", line)
         self.assertIn("Settings", line)
 
+    def test_a_variable_read_by_nothing_is_called_out(self):
+        """The trap this deployment actually fell into.
+
+        ADPIPE_CREDENTIALS_PATH sat in the variable list for weeks doing nothing.
+        The store stayed at its user-level default — off the volume, wiped by
+        every deploy — while the list said the question had been dealt with. A
+        setting that is ignored is worse than one that is absent: absent prompts
+        a search, ignored prompts nothing.
+        """
+        with mock.patch.dict(os.environ,
+                             {"ADPIPE_CREDENTIALS_PATH": "/app/projects/x.json"},
+                             clear=True):
+            line = app.credential_line()
+        self.assertIn("ADPIPE_CREDENTIALS_PATH", line)
+        self.assertIn("read by nothing", line)
+        self.assertIn("ADPIPE_CREDENTIALS_FILE", line)
+
+    def test_it_stays_quiet_once_the_real_one_is_set(self):
+        # Both together is a tidy-up, not a fault — the working one is in use.
+        with mock.patch.dict(os.environ,
+                             {"ADPIPE_CREDENTIALS_PATH": "/app/projects/x.json",
+                              "ADPIPE_CREDENTIALS_FILE": "/app/projects/x.json"},
+                             clear=True):
+            line = app.credential_line()
+        self.assertNotIn("read by nothing", line)
+
+    def test_it_says_nothing_when_neither_is_set(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertNotIn("read by nothing", app.credential_line())
+
     def test_an_unreadable_store_is_reported_rather_than_thrown(self):
         # A corrupt store must not stop the studio starting: every other way in
         # still works, and the message is how anyone finds out.

@@ -4766,9 +4766,15 @@ def credential_line():
         return f"  API keys: could not read the store — {error}"
     have = sorted(name for name, present in state.items() if present)
     where = credentials.store_path()
-    if not have:
-        return f"  No API keys yet — add them on the Settings tab (stored at {where})."
-    return f"  API keys: {', '.join(have)} · store {where}"
+    line = (f"  No API keys yet — add them on the Settings tab (stored at {where})."
+            if not have else f"  API keys: {', '.join(have)} · store {where}")
+    # A variable set under a name nothing reads looks, in a list of variables,
+    # exactly like one that works.
+    ignored = credentials.ignored_names()
+    if ignored:
+        line += (f"\n  ! {', '.join(ignored)} is set and read by nothing — "
+                 f"the store path is {credentials.STORE_OVERRIDE_ENV}.")
+    return line
 
 
 def main():
