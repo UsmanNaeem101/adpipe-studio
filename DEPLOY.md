@@ -74,7 +74,9 @@ signed out, you get nothing at all.
 
 ## 4. Supabase instead of a volume (optional)
 
-Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` and every project read and
+Set `SUPABASE_URL` (or `NEXT_PUBLIC_SUPABASE_URL`, which is what Topic Atlas
+already calls it — the two apps can share one project, their tables do not
+collide) and `SUPABASE_SERVICE_ROLE_KEY`, and every project read and
 write goes through Postgres and Supabase Storage instead of the disk — the volume
 becomes optional and the service is no longer pinned to one machine. Leave them
 unset and nothing changes.
@@ -94,6 +96,11 @@ row that size is one PostgREST JSON body — a hosted API gateway refuses it lon
 before Postgres would care. It is also a quota question, since the database is
 metered in hundreds of megabytes and the bucket in gigabytes. Override with
 `ADPIPE_TEXT_MAX_BYTES` if you need to.
+
+Both are needed. With only one set the app runs on the disk, and Settings →
+**Where this is saved** says which of the two is missing. That line is the place
+to check: it names the Supabase project when it is working, and names the remedy
+when it is not — a rejected key, a missing table, an unreachable host.
 
 **API keys do not move with it.** The credential store is a `0600` file written
 straight to disk on purpose — a secret does not belong in a shared table or

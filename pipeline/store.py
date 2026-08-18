@@ -549,7 +549,26 @@ class SupabaseStore:
         return "/storage/v1/object/%s/%s" % (self.bucket, urllib.parse.quote(key))
 
 
-def health(store_object=None):
+def supabase_settings(environ=None):
+    """The two variables, resolved in one place so nothing can disagree.
+
+    `NEXT_PUBLIC_SUPABASE_URL` is accepted because Topic Atlas already sets it
+    under that name — Next.js requires the prefix to expose a value to the
+    browser — and the two apps share one Supabase project. The URL is not a
+    secret; it is in every request a browser makes.
+
+    There is deliberately no such fallback for the key. A service-role key
+    behind a NEXT_PUBLIC_ name would be a key published to every visitor, and
+    accepting one here would make that mistake work, which is the last thing it
+    should do.
+    """
+    environ = os.environ if environ is None else environ
+    url = ((environ.get("SUPABASE_URL") or "").strip()
+           or (environ.get("NEXT_PUBLIC_SUPABASE_URL") or "").strip())
+    return url, (environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+
+
+def health(store_object=None, environ=None):
     """Is this store actually usable, and can it say why not?
 
     Read-only on purpose. The startup banner answers the same question by
@@ -558,12 +577,25 @@ def health(store_object=None):
     question somebody wants to ask without redeploying to read a log.
     """
     target = store_object or store()
-    if target.kind == "local":
-        root = target.root
-        return {"kind": "local", "ok": os.access(root, os.W_OK),
-                "where": root,
-                "detail": "the filesystem — a container discards this on deploy"}
-    return target.health()
+    if target.kind != "local":
+        return target.health()
+
+    # Half a configuration is not Supabase, and it used to be silent about it:
+    # the app ran on the disk exactly as if nothing had been set, so a URL under
+    # the wrong name looked identical to never having tried. That is worth a
+    # sentence, because it is one variable away from working.
+    url, key = supabase_settings(environ)
+    root = target.root
+    if key and not url:
+        detail = ("SUPABASE_SERVICE_ROLE_KEY is set but SUPABASE_URL is not, so "
+                  "this is running on the disk. Both are needed.")
+    elif url and not key:
+        detail = ("SUPABASE_URL is set but SUPABASE_SERVICE_ROLE_KEY is not, so "
+                  "this is running on the disk. Both are needed.")
+    else:
+        detail = "the filesystem — a container discards this on deploy"
+    return {"kind": "local", "ok": os.access(root, os.W_OK), "where": root,
+            "detail": detail}
 
 
 def build_store(environ=None):
@@ -575,8 +607,7 @@ def build_store(environ=None):
     service keeps nothing on a disk that is about to be thrown away.
     """
     environ = os.environ if environ is None else environ
-    url = (environ.get("SUPABASE_URL") or "").strip()
-    key = (environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    url, key = supabase_settings(environ)
     if url and key:
         return SupabaseStore(url, key)
 

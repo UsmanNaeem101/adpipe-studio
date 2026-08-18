@@ -103,6 +103,57 @@ class HealthTests(unittest.TestCase):
         self.assertIn("limit=1", answering.asked[0][1])
 
 
+class VariableNameTests(HealthTests):
+    """The two variables, and the ways they are spelled wrong.
+
+    This cost an afternoon. The deployment had SUPABASE_SERVICE_ROLE_KEY and
+    NEXT_PUBLIC_SUPABASE_URL — the second being what Topic Atlas calls it,
+    because Next.js needs the prefix to expose a value to the browser, and the
+    two apps share one Supabase project. AdPipe read SUPABASE_URL, found
+    nothing, and ran on the container's disk exactly as if nothing had been
+    configured at all. Every write succeeded. Every deploy discarded them.
+    """
+
+    def test_the_next_js_name_is_accepted_for_the_url(self):
+        built = store_module.build_store(
+            {"NEXT_PUBLIC_SUPABASE_URL": "https://x.supabase.co",
+             "SUPABASE_SERVICE_ROLE_KEY": "k"})
+        self.assertEqual(built.kind, "supabase")
+
+    def test_the_plain_name_still_wins(self):
+        url, _ = store_module.supabase_settings(
+            {"SUPABASE_URL": "https://plain.supabase.co",
+             "NEXT_PUBLIC_SUPABASE_URL": "https://prefixed.supabase.co"})
+        self.assertEqual(url, "https://plain.supabase.co")
+
+    def test_there_is_no_such_fallback_for_the_key(self):
+        # A service-role key under a NEXT_PUBLIC_ name is a key published to
+        # every visitor. Accepting one here would make that mistake work.
+        _, key = store_module.supabase_settings(
+            {"NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY": "leaked"})
+        self.assertEqual(key, "")
+
+    def test_a_key_with_no_url_says_which_one_is_missing(self):
+        store_module.use(store_module.LocalStore(self.data))
+        found = store_module.health(environ={"SUPABASE_SERVICE_ROLE_KEY": "k"})
+        self.assertEqual(found["kind"], "local")
+        self.assertIn("SUPABASE_URL is not", found["detail"])
+
+    def test_a_url_with_no_key_says_which_one_is_missing(self):
+        store_module.use(store_module.LocalStore(self.data))
+        found = store_module.health(
+            environ={"SUPABASE_URL": "https://x.supabase.co"})
+        self.assertIn("SUPABASE_SERVICE_ROLE_KEY is not", found["detail"])
+
+    def test_neither_set_is_not_reported_as_a_mistake(self):
+        # A laptop is meant to run on the disk. Only a half-configuration is a
+        # mistake worth naming.
+        store_module.use(store_module.LocalStore(self.data))
+        found = store_module.health(environ={})
+        self.assertNotIn("is not", found["detail"])
+        self.assertIn("discards", found["detail"])
+
+
 class EndpointTests(HealthTests):
     def test_the_route_answers_with_the_report_and_a_count(self):
         store_module.use(Answering((200, b"[]")))
