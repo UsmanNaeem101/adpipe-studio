@@ -136,6 +136,65 @@ def segments(project):
 
 SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
 
+# What a name may be made of, and how a rejection explains itself.
+#
+# The rule alone is not an error message. `shoulders_and_neck` is lowercase,
+# eighteen characters, letters and underscores — and it was rejected, because a
+# copy-paste carried a zero-width space that neither JavaScript's trim() nor
+# Python's strip() removes. Being told the rule you already followed leaves
+# nothing to act on, and the offending character is invisible in the box you
+# would inspect.
+#
+# So a rejection names the character, its position, and its code point.
+NAME_ALLOWED = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+
+# Characters that survive both trims and look like nothing. Named because
+# "U+200B" means little; "zero-width space" tells you what happened.
+INVISIBLES = {
+    "\u200b": "zero-width space", "\u200c": "zero-width non-joiner",
+    "\u200d": "zero-width joiner", "\u2060": "word joiner",
+    "\ufeff": "byte-order mark", "\u00ad": "soft hyphen",
+    "\u00a0": "non-breaking space", "\u2007": "figure space",
+    "\u202f": "narrow no-break space",
+}
+
+
+def name_problem(name):
+    """Why this name is unacceptable, in the terms of this name. None if it is.
+
+    Ordered by what a person can act on: length first, because it is visible;
+    then the first offending character, described precisely enough to find in a
+    string where it may not be visible at all.
+    """
+    value = str(name or "")
+    if len(value) < 2:
+        return (f"name is {len(value)} character{'' if len(value) == 1 else 's'}; "
+                f"it needs at least 2")
+    if len(value) > 41:
+        return f"name is {len(value)} characters; the most is 41"
+
+    for index, char in enumerate(value):
+        if char in NAME_ALLOWED:
+            continue
+        point = f"U+{ord(char):04X}"
+        if char in INVISIBLES:
+            return (f"name has an invisible {INVISIBLES[char]} ({point}) at "
+                    f"position {index + 1} — most likely pasted in. Retype it.")
+        if char.isupper():
+            return (f"name has a capital {char!r} at position {index + 1}; "
+                    f"use {value.lower()!r}")
+        if char == " ":
+            return (f"name has a space at position {index + 1}; "
+                    f"use {value.replace(' ', '_')!r}")
+        return (f"name has {char!r} ({point}) at position {index + 1}; "
+                f"only lowercase letters, digits, - and _ are allowed")
+
+    if value[0] not in NAME_ALLOWED - set("_-"):
+        return f"name starts with {value[0]!r}; it must start with a letter or digit"
+    return None
+
+
+
 
 TEMPLATE_PROJECT = {
     "_comment": "Per-project config. Everything product-specific lives in this "
@@ -202,8 +261,9 @@ def ensure_project(name, product="", market=""):
 
     Returns (cfg, created).
     """
-    if not SAFE_NAME.match(name or ""):
-        raise ValueError("name must be lowercase letters, digits, - or _ (2-41 chars)")
+    problem = name_problem(name)
+    if problem:
+        raise ValueError(problem)
     dest = os.path.join(ROOT, "projects", name)
     existing = os.path.join(dest, "project.json")
     if store.exists(existing):
@@ -318,8 +378,9 @@ def create_project(name, product, market):
     inheritance that puts one product's claims in another product's ads. A new
     project starts blank and says so.
     """
-    if not SAFE_NAME.match(name or ""):
-        raise ValueError("name must be lowercase letters, digits, - or _ (2-41 chars)")
+    problem = name_problem(name)
+    if problem:
+        raise ValueError(problem)
     dest = os.path.join(ROOT, "projects", name)
     if store.exists(dest):
         raise ValueError(f"project {name!r} already exists")
