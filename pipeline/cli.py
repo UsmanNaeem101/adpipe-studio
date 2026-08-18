@@ -44,6 +44,7 @@ import presets  # noqa: E402
 import segmentation  # noqa: E402
 import commercial  # noqa: E402
 import corpus_policy  # noqa: E402
+import archive  # noqa: E402
 import importer  # noqa: E402
 import researchpack  # noqa: E402
 import stagereport  # noqa: E402
@@ -5265,6 +5266,60 @@ def research_pack_path(cfg, segment, required=True):
              f"  Available packs: {', '.join(available) or 'none'}")
 
 
+def _megabytes(n):
+    return "%.1f MB" % (n / 1048576.0) if n >= 1048576 else "%.0f KB" % (n / 1024.0)
+
+
+def cmd_archive(cfg, args):
+    """Write the whole project to a zip, so nothing is only in one place."""
+    name, blob, count = archive.bundle(cfg["_dir"], cfg["name"])
+    dest = getattr(args, "out", None) or name
+    with open(dest, "wb") as fh:
+        fh.write(blob)
+    print(f"\n  {count} file(s), {_megabytes(len(blob))} -> {dest}\n")
+
+
+def cmd_cleanup(cfg, args):
+    """Remove the corpora stages 01-06 have finished with.
+
+    Shows what would go and what it costs to lose before doing it, because the
+    thing being traded away is the ability to re-run segmentation without
+    paying for ingest again.
+    """
+    evidence = archive.stage06_output(cfg["_dir"])
+    spent = archive.spent_files(cfg["_dir"])
+    if not spent:
+        print("\n  Nothing to remove — no spent corpora in this project.\n")
+        return
+
+    total = sum(size for _, size in spent)
+    print(f"\n  {len(spent)} file(s), {_megabytes(total)}")
+    for key, size in sorted(spent, key=lambda row: -row[1]):
+        print(f"    {_megabytes(size):>9}  {os.path.relpath(key, cfg['_dir'])}")
+
+    if not evidence:
+        print("\n  ! Stage 06 has produced no evidence files. These corpora are "
+              "still the only\n    copy of this project's research — nothing "
+              "will be removed.\n")
+        return
+
+    print(f"\n  Stage 06 has written {len(evidence)} evidence file(s), which is "
+          f"what everything\n  downstream reads. These corpora are no longer "
+          f"read by anything.")
+    print("\n  After this, segmentation cannot be re-run (--reassign, "
+          "--rediscover, --from)\n  without ingesting the source again. "
+          f"Take a copy first: adpipe -p {cfg['name']} archive")
+
+    if not args.yes:
+        answer = input("\n  Remove them? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("  nothing removed")
+            return
+
+    removed, freed = archive.remove(cfg["_dir"])
+    print(f"\n  removed {len(removed)} file(s), freed {_megabytes(freed)}\n")
+
+
 def cmd_import(cfg, args):
     """Adopt a segmentation that stages 01-06 produced somewhere else.
 
@@ -5965,6 +6020,13 @@ def main():
     s.add_argument("--source", help="VOC file to segment (default: voc/production_voc.jsonl)")
     s.set_defaults(fn=cmd_segment)
     s = sub.add_parser("studio", help="open the browser UI"); s.set_defaults(fn=cmd_studio)
+    s = sub.add_parser("archive", help="write the whole project to a zip")
+    s.add_argument("--out", help="file to write (default: <project>.zip)")
+    s.set_defaults(fn=cmd_archive)
+    s = sub.add_parser("cleanup",
+                       help="remove the corpora stages 01-06 have finished with")
+    s.add_argument("--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_cleanup)
     s = common(sub.add_parser(
         "import",
         help="adopt stage 01-06 audience files produced outside this project"))

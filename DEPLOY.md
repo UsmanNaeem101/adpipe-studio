@@ -72,13 +72,49 @@ On the Topic Atlas service:
 Redeploy, then open **topicatlas.digital/adpipe**. Signed in, you get the studio;
 signed out, you get nothing at all.
 
+## 4. Supabase instead of a volume (optional)
+
+Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` and every project read and
+write goes through Postgres and Supabase Storage instead of the disk — the volume
+becomes optional and the service is no longer pinned to one machine. Leave them
+unset and nothing changes.
+
+Text goes in a table, so a brief or a product sheet stays readable in the table
+editor. Anything over **512KB** goes to the `adpipe-media` bucket instead, with a
+marker row left behind so listings still answer from one place. That threshold
+matters: a raw VOC dump is 16MB and its deduplicated twin nearly as big, and a
+row that size is one PostgREST JSON body — a hosted API gateway refuses it long
+before Postgres would care. It is also a quota question, since the database is
+metered in hundreds of megabytes and the bucket in gigabytes. Override with
+`ADPIPE_TEXT_MAX_BYTES` if you need to.
+
+### Reclaiming the corpora
+
+Stages 01–06 build several copies of the corpus, and stage 06 is the end of that
+chain: everything after it — extract, picc, concepts, brief — reads the evidence
+files and nothing earlier. Once those exist, the corpora are the largest thing in
+a project and the least read.
+
+Settings → Existing projects has **Download** (the whole project as a zip) and
+**Free space** (removes only the spent corpora). The same pair on the command
+line:
+
+```bash
+adpipe -p <project> archive          # whole project -> <project>.zip
+adpipe -p <project> cleanup          # remove the spent corpora
+```
+
+`cleanup` refuses while stage 06 has produced no evidence files, because at that
+point the corpora are still the only copy of the research. It leaves the
+segmentation state (`candidate_segments`, `validated_segments`,
+`segment_assignments`) alone, but removing the corpora does mean segmentation
+cannot be re-run — `--reassign`, `--rediscover` and `--from` all read them — so
+take the zip first.
+
 ## Known limits
 
-- **Storage is a volume, not a database.** Work survives deploys but lives on one
-  machine, so the service cannot be scaled to more than one instance. Moving
-  project state into Postgres is in progress (`pipeline/store.py`); once every
-  module reads and writes through it, set `SUPABASE_URL` and
-  `SUPABASE_SERVICE_ROLE_KEY` and the volume becomes optional.
+- **Without Supabase, storage is a volume.** Work survives deploys but lives on
+  one machine, so the service cannot be scaled to more than one instance.
 - **Long stages hold a request open.** The pipeline tab streams output as it
   goes, but a stage that runs for many minutes depends on the connection staying
   up through Topic Atlas's proxy.

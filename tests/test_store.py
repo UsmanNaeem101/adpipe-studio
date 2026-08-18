@@ -171,6 +171,120 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertEqual(self.store.calls[-1]["body"]["key"], "projects/p/a.md")
 
 
+class LargeTextTests(unittest.TestCase):
+    """Where a 16MB corpus goes.
+
+    Routing was decided by file extension alone, and .jsonl is not a binary
+    suffix — so a raw VOC dump took the table path, as one PostgREST JSON body,
+    which a hosted API gateway refuses long before Postgres would care. The
+    biggest files in the system were the ones taking the least-exercised path.
+
+    The row is still written, holding a marker instead of the text, so `exists`
+    and `list_keys` keep answering from one place.
+    """
+
+    def setUp(self):
+        self.store = StubSupabase()
+        self.small = "x" * 128
+        self.large = "y" * (store_module.TEXT_MAX_BYTES + 1)
+
+    def sent(self, method, fragment):
+        return [c for c in self.store.calls
+                if c["method"] == method and fragment in c["path"]]
+
+    def test_small_text_still_goes_to_the_table(self):
+        self.store.write_text("projects/p/research/voc/notes.jsonl", self.small)
+        self.assertTrue(self.sent("POST", "/rest/v1/adpipe_files"))
+        self.assertEqual(self.sent("POST", "/rest/v1/adpipe_files")[0]["body"]["content"],
+                         self.small)
+        self.assertFalse(self.sent("POST", "/storage/v1/object/"))
+
+    def test_a_small_write_costs_exactly_one_request(self):
+        # urllib opens a fresh connection per call, and the audit log writes a
+        # file per model request. A tidy-up round trip on each of those would be
+        # paid thousands of times to catch a case that arises when a corpus
+        # shrinks below half a megabyte.
+        self.store.write_text("projects/p/research/voc/notes.jsonl", self.small)
+        self.assertEqual(len(self.store.calls), 1)
+
+    def test_a_corpus_goes_to_the_bucket(self):
+        self.store.write_text("projects/p/research/voc/deduplicated_voc.jsonl", self.large)
+        upload = self.sent("POST", "/storage/v1/object/")
+        self.assertEqual(len(upload), 1)
+        self.assertTrue(upload[0]["binary"])
+        self.assertEqual(upload[0]["body"], self.large.encode("utf-8"))
+
+    def test_the_row_is_still_written_and_says_what_it_stands_for(self):
+        self.store.write_text("projects/p/research/voc/big.jsonl", self.large)
+        row = self.sent("POST", "/rest/v1/adpipe_files")[0]["body"]["content"]
+        self.assertTrue(row.startswith(store_module.OVERFLOW_PREFIX))
+        self.assertEqual(json.loads(row[len(store_module.OVERFLOW_PREFIX):])["bytes"],
+                         len(self.large.encode("utf-8")))
+
+    def test_a_corpus_reads_back_as_itself(self):
+        # The marker is an implementation detail of storage. Nothing above this
+        # class knows the file went anywhere unusual.
+        self.store.reply = (200, json.dumps(
+            [{"content": store_module.OVERFLOW_PREFIX + '{"bytes":9}'}]).encode())
+        original = self.store._request
+
+        def routed(method, path, **kwargs):
+            if "/storage/v1/object/" in path:
+                return 200, b"recovered"
+            return original(method, path, **kwargs)
+
+        self.store._request = routed
+        self.assertEqual(self.store.read_text("projects/p/research/voc/big.jsonl"),
+                         "recovered")
+
+    def test_a_row_whose_object_is_gone_raises_rather_than_returns_the_marker(self):
+        # Handing the marker back as file content would put "adpipe:overflow:v1:"
+        # through a JSONL parser, and the traceback would name the parser.
+        self.store.reply = (200, json.dumps(
+            [{"content": store_module.OVERFLOW_PREFIX + '{"bytes":9}'}]).encode())
+        original = self.store._request
+
+        def missing(method, path, **kwargs):
+            if "/storage/v1/object/" in path:
+                return 404, b""
+            return original(method, path, **kwargs)
+
+        self.store._request = missing
+        with self.assertRaises(IOError):
+            self.store.read_text("projects/p/research/voc/big.jsonl")
+
+    def test_text_that_begins_like_a_marker_is_stored_as_one_too(self):
+        # Otherwise a file could impersonate the marker and be read as a
+        # pointer to a bucket object that was never uploaded. Size is not what
+        # is being tested here — the ambiguity is.
+        self.store.write_text("projects/p/a.md", store_module.OVERFLOW_PREFIX + "hello")
+        self.assertTrue(self.sent("POST", "/storage/v1/object/"))
+
+    def test_shrinking_back_under_the_limit_removes_the_old_object(self):
+        # Otherwise the row says "small text" while the bucket still holds the
+        # previous, larger version, and a later read could find either.
+        self.store.write_text("projects/p/research/voc/x.jsonl", self.large)
+        self.store.calls.clear()
+        self.store.write_text("projects/p/research/voc/x.jsonl", self.small)
+        self.assertEqual(self.sent("POST", "/rest/v1/adpipe_files")[0]["body"]["content"],
+                         self.small)
+        self.assertTrue(self.sent("DELETE", "/storage/v1/object/"))
+
+    def test_deleting_takes_both_halves(self):
+        # The row that would say whether this key overflowed is the one being
+        # deleted, so the object has to go unconditionally.
+        self.store.write_text("projects/p/research/voc/x.jsonl", self.large)
+        self.store.calls.clear()
+        self.store.delete("projects/p/research/voc/x.jsonl")
+        self.assertTrue(self.sent("DELETE", "/rest/v1/adpipe_files"))
+        self.assertTrue(self.sent("DELETE", "/storage/v1/object/"))
+
+    def test_a_failed_upload_is_not_silent(self):
+        self.store.reply = (413, b'{"message":"too large"}')
+        with self.assertRaises(IOError):
+            self.store.write_text("projects/p/research/voc/big.jsonl", self.large)
+
+
 class BuildStoreTests(unittest.TestCase):
     def test_supabase_when_configured(self):
         built = store_module.build_store(
