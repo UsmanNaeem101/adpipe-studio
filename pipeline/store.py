@@ -62,6 +62,10 @@ TEXT_MAX_BYTES = int(os.environ.get("ADPIPE_TEXT_MAX_BYTES") or 512 * 1024)
 # kept so `exists` and `list_keys` still answer from one place.
 OVERFLOW_PREFIX = "adpipe:overflow:v1:"
 
+# How many keys a listing asks for at a time. Under PostgREST's own ceiling so
+# a short page always means the end, rather than meaning the server capped it.
+PAGE = 500
+
 # A file that ships inside the container image, under projects/.
 #
 # Seeing it means nothing is mounted over that directory, so the work there is
@@ -457,20 +461,48 @@ class SupabaseStore:
         tidy = normalise(given)
         absolute = bool(given) and os.path.isabs(given)
         pattern = urllib.parse.quote((tidy + "/%") if tidy else "%", safe="")
-        status, payload = self._rest("GET", "?key=like.%s&select=key&order=key" % pattern)
-        stored = [row["key"] for row in json.loads(payload or b"[]")] if status == 200 else []
+        stored = []
+
+        # Paged, because both halves of this silently stop at a limit rather
+        # than saying they did. PostgREST caps an unbounded select, and the
+        # bucket listing took a literal limit of 1000 — and a listing that
+        # quietly returns the first N is the worst possible failure here: the
+        # caller reads it as "that is everything", and a stage runs against part
+        # of the evidence without anybody being told.
+        #
+        # One 37-segment project passes both caps on its own: 37 evidence files,
+        # twenty extractions each, and three audit files per model request.
+        offset = 0
+        while True:
+            status, payload = self._rest(
+                "GET", "?key=like.%s&select=key&order=key&limit=%d&offset=%d"
+                % (pattern, PAGE, offset))
+            if status != 200:
+                break
+            page = [row["key"] for row in json.loads(payload or b"[]")]
+            stored.extend(page)
+            if len(page) < PAGE:
+                break
+            offset += PAGE
 
         # The bucket is listed separately: binary keys are not rows in the table.
-        status, payload = self._request(
-            "POST",
-            "/storage/v1/object/list/%s" % self.bucket,
-            body={"prefix": tidy, "limit": 1000},
-        )
-        if status == 200:
-            for entry in json.loads(payload or b"[]"):
+        offset = 0
+        while True:
+            status, payload = self._request(
+                "POST",
+                "/storage/v1/object/list/%s" % self.bucket,
+                body={"prefix": tidy, "limit": PAGE, "offset": offset},
+            )
+            if status != 200:
+                break
+            entries = json.loads(payload or b"[]")
+            for entry in entries:
                 name = entry.get("name")
                 if name:
                     stored.append("%s/%s" % (tidy, name) if tidy else name)
+            if len(entries) < PAGE:
+                break
+            offset += PAGE
 
         keys = set()
         for key in stored:

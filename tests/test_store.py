@@ -17,6 +17,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pipeline"))
@@ -283,6 +284,75 @@ class LargeTextTests(unittest.TestCase):
         self.store.reply = (413, b'{"message":"too large"}')
         with self.assertRaises(IOError):
             self.store.write_text("projects/p/research/voc/big.jsonl", self.large)
+
+
+class PagedListingTests(unittest.TestCase):
+    """A listing that stops at a limit without saying so.
+
+    PostgREST caps an unbounded select and the bucket listing took a literal
+    1000, and neither says it truncated — the caller reads the answer as "that
+    is everything". A stage then runs against part of the evidence and reports
+    success, which is the failure mode with no symptom.
+
+    One real project passes both caps on its own: 37 evidence files, twenty
+    extractions each, three audit files per model request.
+    """
+
+    class Pager(store_module.SupabaseStore):
+        def __init__(self, total):
+            super().__init__("https://p.supabase.co", "k")
+            self.keys = ["projects/p/research/extractions/s/%04d.md" % i
+                         for i in range(total)]
+            self.objects = ["projects/p/assets/renders/%04d.png" % i
+                            for i in range(total)]
+            self.requests = 0
+
+        def _request(self, method, path, *, body=None, headers=None, binary=False):
+            self.requests += 1
+            if path.startswith("/storage/v1/object/list/"):
+                start = (body or {}).get("offset", 0)
+                window = self.objects[start:start + (body or {}).get("limit", 0)]
+                return 200, json.dumps(
+                    [{"name": k.split("/")[-1]} for k in window]).encode()
+            params = urllib.parse.parse_qs(path.split("?", 1)[1])
+            start = int(params.get("offset", ["0"])[0])
+            size = int(params.get("limit", ["0"])[0])
+            return 200, json.dumps(
+                [{"key": k} for k in self.keys[start:start + size]]).encode()
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def listing(self, total, prefix="projects/p"):
+        pager = self.Pager(total)
+        pager.underlay = store_module.LocalStore(self.dir)
+        return pager, pager.list_keys(prefix)
+
+    def test_everything_comes_back_past_the_first_page(self):
+        _, keys = self.listing(store_module.PAGE + 1)
+        self.assertEqual(len([k for k in keys if k.endswith(".md")]),
+                         store_module.PAGE + 1)
+
+    def test_and_past_several_pages(self):
+        _, keys = self.listing(store_module.PAGE * 3 + 7)
+        self.assertEqual(len([k for k in keys if k.endswith(".md")]),
+                         store_module.PAGE * 3 + 7)
+
+    def test_the_bucket_is_paged_too(self):
+        # Binary keys are not rows, so they are listed separately — and had a
+        # limit written into the request rather than inherited from a server.
+        _, keys = self.listing(store_module.PAGE + 5)
+        self.assertEqual(len([k for k in keys if k.endswith(".png")]),
+                         store_module.PAGE + 5)
+
+    def test_a_short_page_ends_it_rather_than_looping(self):
+        pager, keys = self.listing(3)
+        # One table page, one bucket page, and no speculative extra round trips.
+        self.assertEqual(pager.requests, 2)
+
+    def test_an_empty_prefix_is_not_an_infinite_loop(self):
+        pager, keys = self.listing(0)
+        self.assertEqual(pager.requests, 2)
 
 
 class BuildStoreTests(unittest.TestCase):
