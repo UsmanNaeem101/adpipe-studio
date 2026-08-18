@@ -170,6 +170,27 @@ def chosen_extractors(args):
 
 # ------------------------------------------------------------------ project
 
+def sole_project():
+    """The project to use when -p was not given.
+
+    This used to default to the bundled example, which meant a command typed
+    without -p ran against somebody else's research rather than saying it did not
+    know which project was meant. With one project the answer is unambiguous;
+    with several, guessing is worse than asking.
+    """
+    available = sorted(
+        name for name in store.dirs_in(os.path.join(ROOT, "projects"))
+        if not name.startswith(("_", "."))
+    ) if store.exists(os.path.join(ROOT, "projects")) else []
+    if len(available) == 1:
+        return available[0]
+    if not available:
+        sys.exit("  No projects yet. Create one in the studio, or import a "
+                 "segmentation with `adpipe import`.")
+    sys.exit("  Several projects here — say which with -p:\n    "
+             + "\n    ".join(available))
+
+
 def load_project(name):
     p = os.path.join(ROOT, "projects", name, "project.json")
     if not store.exists(p):
@@ -5884,7 +5905,9 @@ def cmd_run(cfg, args):
 def main():
     ap = argparse.ArgumentParser(prog="adpipe", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-p", "--project", default="montisella")
+    ap.add_argument("-p", "--project", default=None,
+                    help="which project to work on (default: the only one, if "
+                         "there is exactly one)")
     ap.add_argument("--yes", action="store_true", help="skip cost confirmations")
     ap.add_argument("--force", action="store_true", help="redo work that already exists")
     ap.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
@@ -5973,7 +5996,7 @@ def main():
     args, extra = ap.parse_known_args()
     if extra:
         ap.error(f"unrecognized arguments: {' '.join(extra)}")
-    cfg = load_project(args.project)
+    cfg = load_project(args.project or sole_project())
     os.environ["ADPIPE_PROJECT"] = cfg["name"]
     os.environ["ADPIPE_STAGE"] = args.cmd
     import auditlog
