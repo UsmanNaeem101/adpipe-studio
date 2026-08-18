@@ -22,6 +22,24 @@ PROVIDER_ENV = {
 }
 STORE_OVERRIDE_ENV = "ADPIPE_CREDENTIALS_FILE"
 
+# Names that sound like the one above and are read by nothing.
+#
+# A deployment carried ADPIPE_CREDENTIALS_PATH for weeks. It did exactly nothing,
+# so the store stayed at its user-level default — off the volume, wiped by every
+# deploy — while the variable list said the question had been dealt with. A
+# setting that is ignored is worse than one that is absent: absent prompts a
+# search, ignored prompts nothing.
+NEARLY_ENV = ("ADPIPE_CREDENTIALS_PATH", "ADPIPE_CREDENTIAL_FILE",
+              "ADPIPE_CREDENTIALS", "CREDENTIALS_FILE")
+
+
+def ignored_names(environ=None):
+    """Set-but-unread variables someone probably meant as the store path."""
+    env = os.environ if environ is None else environ
+    if str(env.get(STORE_OVERRIDE_ENV) or "").strip():
+        return []
+    return [name for name in NEARLY_ENV if str(env.get(name) or "").strip()]
+
 
 class CredentialStoreError(RuntimeError):
     pass
