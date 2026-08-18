@@ -5333,13 +5333,18 @@ def cmd_import(cfg, args):
     Nothing is written until the whole plan is known, so a half-recognised export
     cannot leave a project holding four of its thirty-seven audiences.
     """
-    # A path someone typed or a file the browser just landed on this machine --
-    # filesystem either way, and asked as the filesystem throughout. store.exists
-    # would answer a broader question than the os.listdir below can survive.
+    # A zip is asked of the store, because the browser's upload no longer lands
+    # on this machine — it goes wherever the project lives, which on a deployment
+    # is a bucket. On a laptop the store is the filesystem and a path someone
+    # typed still resolves, absolute or not.
+    #
+    # A directory stays a filesystem question. It only ever means "the folder I
+    # exported into", the store has no directories, and the os.listdir below
+    # could not survive being asked the broader question store.exists answers.
     source = args.source
-    if os.path.isfile(source) and source.lower().endswith(".zip"):
-        with open(source, "rb") as fh:
-            members = importer.audience_members(fh.read())
+    blob = store.read_bytes(source) if source.lower().endswith(".zip") else None
+    if blob is not None:
+        members = importer.audience_members(blob)
     elif os.path.isdir(source):
         members = []
         for name in sorted(os.listdir(source)):
