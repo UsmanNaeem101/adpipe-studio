@@ -80,11 +80,29 @@ class HealthTests(unittest.TestCase):
         self.assertFalse(found["ok"])
         self.assertIn("upstream boom", found["detail"])
 
-    def test_no_supabase_at_all_says_the_disk_will_be_discarded(self):
+    def ships_marker(self):
+        """As the image does: a file under projects/ that a volume would hide."""
+        os.makedirs(os.path.join(self.data, "projects"), exist_ok=True)
+        with open(os.path.join(self.data, store_module.IMAGE_MARKER), "w") as fh:
+            fh.write("shipped")
+
+    def test_the_containers_own_disk_is_named_as_such(self):
+        # "the filesystem" is true and useless — the same sentence whether the
+        # work is safe or about to be deleted. The marker is what separates them.
+        self.ships_marker()
         store_module.use(store_module.LocalStore(self.data))
-        found = store_module.health()
+        found = store_module.health(environ={})
         self.assertEqual(found["kind"], "local")
-        self.assertIn("discards", found["detail"])
+        self.assertFalse(found["durable"])
+        self.assertIn("container's own disk", found["detail"])
+
+    def test_a_mounted_volume_is_told_apart_from_it(self):
+        # A volume mounted over projects/ hides the marker. That is the only way
+        # to tell the two apart from inside the process.
+        store_module.use(store_module.LocalStore(self.data))
+        found = store_module.health(environ={})
+        self.assertTrue(found["durable"])
+        self.assertIn("volume", found["detail"])
 
     def test_asking_writes_nothing(self):
         # The banner's boot record is a write. This is asked on every visit to
@@ -150,8 +168,16 @@ class VariableNameTests(HealthTests):
         # mistake worth naming.
         store_module.use(store_module.LocalStore(self.data))
         found = store_module.health(environ={})
-        self.assertNotIn("is not", found["detail"])
-        self.assertIn("discards", found["detail"])
+        self.assertNotIn("Both are needed", found["detail"])
+
+    def test_a_half_configuration_still_says_where_the_work_is(self):
+        # Both halves of the answer matter at once: which variable is missing,
+        # and whether what is already written is going to survive.
+        self.ships_marker()
+        store_module.use(store_module.LocalStore(self.data))
+        found = store_module.health(environ={"SUPABASE_SERVICE_ROLE_KEY": "k"})
+        self.assertIn("SUPABASE_URL is not", found["detail"])
+        self.assertIn("container's own disk", found["detail"])
 
 
 class EndpointTests(HealthTests):
