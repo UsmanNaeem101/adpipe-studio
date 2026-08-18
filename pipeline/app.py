@@ -1505,12 +1505,23 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 
       <div style="border:1.5px solid var(--line);border-radius:11px;padding:13px 15px;
         margin-bottom:14px">
-        <b style=font-size:13.5px>Enrich from research</b>
-        <p class=hint style="margin:5px 0 10px">Reads this segment's extraction
-          outputs and proposes values for its research fields. Evidence only — it
-          records what customers said, never what to do about it. Every suggestion
-          arrives as <i>ai&nbsp;suggested</i> for you to accept, edit or reject, and
-          fields you have already approved are left alone.</p>
+        <b style=font-size:13.5px>Enrich this segment from its research</b>
+        <p class=hint style="margin:5px 0 10px">Reads this segment's twenty
+          extraction outputs and fills its research fields: <b>pain points, pain
+          moments, desired outcomes, failed solutions, beliefs and limiting
+          beliefs, buying triggers, purchase criteria, competitor complaints,
+          proof expectations</b> and the words customers actually use — plus who
+          the segment is, why they care, and who is a poor fit.</p>
+        <p class=hint style="margin:0 0 10px"><b>It never fills product fields.</b>
+          What your product is, what it is made of and what you can prove are
+          yours to state: a customer's desire is not evidence of a capability.
+          This fills the segment only — one segment at a time, each from its own
+          research, all inside the same product.</p>
+        <p class=hint style="margin:0 0 10px">Evidence only: it records what
+          customers said, never what to do about it. That is <i>Product ×
+          segment strategy</i>, below. Every suggestion arrives as
+          <i>ai&nbsp;suggested</i> for you to accept, edit or reject, and fields
+          you have already approved are left alone.</p>
         <div class=row style="margin-bottom:9px">
           <div><label>Segment</label><select id=en_seg></select></div>
           <div><label>&nbsp;</label>
