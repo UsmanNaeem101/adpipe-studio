@@ -38,3 +38,11 @@ projects/*/evidence/
 
 # macOS
 .DS_Store
+
+# Projects are the user's work and live on disk (or a mounted volume), never in
+# the repository. Shipping one meant every deploy restored it: deleting it in the
+# app never stuck, and — worse — the studio always reported "1 project(s)", so an
+# empty data directory looked identical to a healthy one. That is what hid a real
+# data loss. Only the marker below is shipped.
+/projects/*
+!/projects/.in-the-image

@@ -56,8 +56,8 @@ class ThePanelNamesRealFieldsTests(unittest.TestCase):
         # Pins the copy to this list, so removing a field from the schema
         # without removing it from the panel fails here rather than in front
         # of somebody wondering what enrich does.
-        panel = re.search(r"Enrich this segment from its research.*?</p>\s*<p[^>]*>.*?</p>",
-                          app.PAGE, re.S)
+        panel = re.search(r"Fill this product's segment from the research"
+                          r"(?:.*?</p>){3}", app.PAGE, re.S)
         self.assertIsNotNone(panel, "the enrich panel's copy has moved")
         # Collapse the source's line wrapping: "pain\n          moments" is one
         # phrase to a reader and must be one phrase to this test.
@@ -67,7 +67,19 @@ class ThePanelNamesRealFieldsTests(unittest.TestCase):
                 self.assertIn(label, text)
 
     def test_the_panel_states_that_products_are_untouched(self):
-        self.assertIn("never fills product fields", app.PAGE)
+        # Whitespace-collapsed, because the source wraps the sentence and a test
+        # pinned to that wrapping breaks on reflow rather than on meaning.
+        flat = " ".join(app.PAGE.split())
+        self.assertIn("never fills product-wide fields", flat)
+
+    def test_the_panel_distinguishes_the_two_meanings_of_segment(self):
+        # The confusion this rewrite exists to end: "segment" is both the audience
+        # the research found and the product's record of it, and enrich reads one
+        # to fill the other.
+        flat = " ".join(app.PAGE.split())
+        self.assertIn("\"Segment\" means two things", flat)
+        self.assertIn("research segment", flat)
+        self.assertIn("product segment", flat)
 
 
 if __name__ == "__main__":
