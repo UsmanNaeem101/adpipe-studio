@@ -44,6 +44,7 @@ import presets  # noqa: E402
 import segmentation  # noqa: E402
 import commercial  # noqa: E402
 import corpus_policy  # noqa: E402
+import importer  # noqa: E402
 import researchpack  # noqa: E402
 import stagereport  # noqa: E402
 from llm import BatchResult, NO_RETRY_STOP_REASONS  # noqa: E402
@@ -191,23 +192,26 @@ def pdir(cfg, *parts):
 
 
 def provenance_path(cfg):
-    return paths.evidence(cfg["_dir"], "_provenance.json")
+    return importer.provenance_path(cfg["_dir"])
 
 
 def read_provenance(cfg):
-    p = provenance_path(cfg)
-    return store.read_json(p) if store.exists(p) else {}
+    return importer.read_provenance(cfg["_dir"])
 
 
 def record_provenance(cfg, segment, origin, detail):
     """Every evidence file records where it came from. Without this an imported
     file is indistinguishable from one the pipeline produced, and downstream
-    output silently inherits an unknown lineage."""
-    prov = read_provenance(cfg)
-    prov[segment] = {"origin": origin, "detail": detail,
-                     "recorded_at": datetime.datetime.now().isoformat(timespec="seconds")}
-    os.makedirs(os.path.dirname(provenance_path(cfg)), exist_ok=True)
-    json.dump(prov, open(provenance_path(cfg), "w", encoding="utf-8"), indent=2)
+    output silently inherits an unknown lineage.
+
+    The implementation lives in `importer` because the import path is the only
+    thing that ever writes an `imported` origin, and two writers of one file
+    drift. It also goes through the store: this used to write with a plain
+    open(), which on a Supabase-backed project put the record on the container's
+    disk while every reader looked in the store, so the lineage of an entire run
+    disappeared on the next deploy.
+    """
+    importer.record_provenance(cfg["_dir"], segment, origin, detail)
 
 
 def warn_if_imported(cfg, segment):
@@ -5240,6 +5244,61 @@ def research_pack_path(cfg, segment, required=True):
              f"  Available packs: {', '.join(available) or 'none'}")
 
 
+def cmd_import(cfg, args):
+    """Adopt a segmentation that stages 01-06 produced somewhere else.
+
+    The skills run perfectly well pasted into a chat window, and someone who has
+    already spent a week doing that should not spend it again to reach stage 07.
+    What comes back is one markdown file per audience; what this writes is the
+    evidence file stage 06 would have written, which is all anything downstream
+    reads.
+
+    Nothing is written until the whole plan is known, so a half-recognised export
+    cannot leave a project holding four of its thirty-seven audiences.
+    """
+    # A path someone typed or a file the browser just landed on this machine --
+    # filesystem either way, and asked as the filesystem throughout. store.exists
+    # would answer a broader question than the os.listdir below can survive.
+    source = args.source
+    if os.path.isfile(source) and source.lower().endswith(".zip"):
+        with open(source, "rb") as fh:
+            members = importer.audience_members(fh.read())
+    elif os.path.isdir(source):
+        members = []
+        for name in sorted(os.listdir(source)):
+            path = os.path.join(source, name)
+            if not os.path.isfile(path) or not name.lower().endswith((".md", ".txt")):
+                continue
+            text = open(path, encoding="utf-8", errors="replace").read()
+            if importer.looks_like_audience_file(text):
+                members.append((name, text))
+    else:
+        sys.exit(f"  Not a zip or a directory: {source}")
+
+    rows = importer.plan(members)
+    if not rows:
+        sys.exit(f"  No audience files recognised in {source}.\n"
+                 f"  Expected markdown with a '# Name' heading and "
+                 f"'### Comment N' blocks.")
+
+    print(f"\n  {len(rows)} audience(s), {sum(r['items'] for r in rows):,} items")
+    existing = set(importer.read_provenance(cfg["_dir"]))
+    for row in rows:
+        mark = " (replaces existing)" if row["slug"] in existing else ""
+        print(f"    {row['segment_id']}  {row['slug']:<40} {row['items']:>6,}{mark}")
+    if not args.yes:
+        answer = input("\n  Write these evidence files? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("  nothing written")
+            return
+
+    written = importer.write(cfg["_dir"], rows, f"imported from {os.path.basename(source)}")
+    print(f"\n  wrote {len(written)} evidence file(s) to "
+          f"{paths.evidence(cfg['_dir'])}")
+    print(f"  every one is marked IMPORTED — extract will say so before it runs.")
+    print(f"\n  next: adpipe -p {cfg['name']} extract {written[0]['slug']}\n")
+
+
 def extraction_source(cfg, segment, args):
     """Which layer skills 07-26 read, and why.
 
@@ -5883,6 +5942,11 @@ def main():
     s.add_argument("--source", help="VOC file to segment (default: voc/production_voc.jsonl)")
     s.set_defaults(fn=cmd_segment)
     s = sub.add_parser("studio", help="open the browser UI"); s.set_defaults(fn=cmd_studio)
+    s = common(sub.add_parser(
+        "import",
+        help="adopt stage 01-06 audience files produced outside this project"))
+    s.add_argument("source", help="a zip of audience markdown files, or a directory of them")
+    s.set_defaults(fn=cmd_import)
     for name, fn in (("extract", cmd_extract), ("picc", cmd_picc), ("concepts", cmd_concepts),
                      ("brief", cmd_brief), ("qa", cmd_qa), ("render", cmd_render),
                      ("run", cmd_run)):

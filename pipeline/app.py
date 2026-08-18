@@ -37,6 +37,7 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pipeline"))
+import importer  # noqa: E402
 import remix  # noqa: E402
 import exifstrip  # noqa: E402
 import presets  # noqa: E402
@@ -84,6 +85,7 @@ def _credential_snapshot():
 
 
 STAGES = [
+    ("import",   "Adopt audience files run outside this project", False, False),
     ("ingest",   "Skills 01-02: filter + deduplicate",         True,  True),
     ("refine-voc", "Deterministic VOC refinement + export",    False, False),
     ("segment",  "Stages 03-09: research segments to commercial pack", True, False),
@@ -1091,6 +1093,12 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
  .drop{border:2px dashed var(--line);border-radius:11px;padding:26px;text-align:center;
    cursor:pointer;color:var(--soft)}
  .drop:hover,.drop.over{border-color:var(--accent);background:var(--accent-soft)}
+ /* The import plan: long enough to scroll, short enough not to push Run off
+    the page — the point is to read it before pressing that button. */
+ .planlist{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px;
+   max-height:260px;display:block;overflow-y:auto}
+ .planlist td{padding:3px 8px;border-bottom:1px solid var(--line)}
+ .planlist code{opacity:.6}
  .drop img{max-width:100%;max-height:210px;border-radius:8px}
  .cats{max-height:520px;overflow:auto;border:1px solid var(--line);border-radius:11px;
    padding:6px;background:var(--surface)}
@@ -1531,6 +1539,19 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
         <input type=checkbox id=rulesonly style="width:auto"> Rules only — skip skills 01/02 (free, no judgement)
       </label>
       <p class=hint>Full path to the exported Reddit dump.</p>
+    </div>
+    <div id=importbox class="hide" style="margin-top:16px">
+      <label>Audience files from a run done elsewhere</label>
+      <div class=drop id=impdrop>
+        <input type=file id=impfile accept=".zip,.md" hidden>
+        <div id=impmsg>Drop the stage&nbsp;06 audience-file zip here, or click to choose</div>
+      </div>
+      <p class=hint id=impstate></p>
+      <div id=impplan class=hide></div>
+      <p class=hint>Stages 01&ndash;06 run perfectly well pasted into a chat. This adopts
+        what came back &mdash; one markdown file per audience &mdash; as the evidence files
+        stage&nbsp;06 would have written, so <code>extract</code> onwards can read them.
+        Every one is recorded as <b>imported</b>, and every later stage says so before it runs.</p>
     </div>
     <div id=segvocbox class="hide" style="margin-top:16px">
       <label>VOC source for segmentation</label>
@@ -2850,6 +2871,7 @@ const STAGES=__STAGES__;
       const showRefine = s.name==='refine-voc';
       $('#refinevocbox').classList.toggle('hide',!showRefine);
       if(showRefine) loadRefineVocFiles();
+      $('#importbox').classList.toggle('hide',s.name!=='import');
       const wantsProduct = ['picc','concepts','brief','run'].includes(s.name);
       $('#prodwrap').classList.toggle('hide',!wantsProduct);
       showOpts(s.name);
@@ -2959,7 +2981,8 @@ $('#runbtn').onclick=async()=>{
     $('#runhint').textContent='Tick the approval box first — this stage spends credit.'; return; }
   const log=$('#log'); log.textContent=''; $('#runbtn').disabled=true;
   const body={stage:stage.name,project:$('#proj').value,segment:$('#seg').value,
-              source:$('#ingestpath').value.trim(),voc_source:$('#segvoc')?$('#segvoc').value:'',
+              source:(stage&&stage.name==='import')?(importSource||''):$('#ingestpath').value.trim(),
+              voc_source:$('#segvoc')?$('#segvoc').value:'',
               refine_source:$('#refinevoc')?$('#refinevoc').value:'',
               approve:$('#approve').checked,
               force:$('#force').checked,
@@ -3040,6 +3063,34 @@ bindDrop($('#vocdrop'),$('#vocfile'),async fs=>{
   $('#ingestpath').value=r.path; $('#vocmsg').textContent=f.name;
   st.innerHTML='✓ saved into the project — <code>'+r.rel+'</code> ('+(r.bytes/1024).toFixed(0)+' KB)';
   st.style.color='var(--accent)';
+});
+
+/* ================= import: adopt a run done elsewhere ================= */
+let importSource=null;
+bindDrop($('#impdrop'),$('#impfile'),async fs=>{
+  const f=fs[0], st=$('#impstate'), plan=$('#impplan');
+  importSource=null; plan.classList.add('hide'); plan.innerHTML='';
+  st.textContent='Reading '+f.name+' \u2026'; st.style.color='';
+  const r=await (await fetch('/upload',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({project:$('#proj').value,filename:f.name,kind:'import',
+                         data:await toB64(f)})})).json();
+  if(r.error){st.textContent='\u26a0 '+r.error;st.style.color='var(--signal)';return;}
+  if(!r.plan||!r.plan.length){
+    st.textContent='\u26a0 No audience files in there. Expected markdown with a '+
+      '"# Name" heading and "### Comment N" blocks.';
+    st.style.color='var(--signal)'; return;
+  }
+  importSource=r.path;
+  $('#impmsg').textContent=f.name;
+  const items=r.plan.reduce((a,x)=>a+x.items,0);
+  st.innerHTML='\u2713 <b>'+r.plan.length+'</b> audience(s), <b>'+items.toLocaleString()+
+    '</b> assigned items \u2014 nothing written yet. Press Run to write them.';
+  st.style.color='var(--accent)';
+  plan.innerHTML='<table class=planlist><tbody>'+r.plan.map(x=>
+    '<tr><td><code>'+x.segment_id+'</code></td><td>'+x.name+'</td>'+
+    '<td style="text-align:right">'+x.items.toLocaleString()+'</td></tr>').join('')+
+    '</tbody></table>';
+  plan.classList.remove('hide');
 });
 
 /* ================= stage options ================= */
@@ -4028,7 +4079,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if proj not in projects():
             return self._send(200, json.dumps({"error": "unknown project"}))
         name = os.path.basename(req.get("filename", "voc.txt")) or "voc.txt"
-        if not name.lower().endswith((".txt", ".jsonl", ".json", ".csv", ".md")):
+        if not name.lower().endswith((".txt", ".jsonl", ".json", ".csv", ".md", ".zip")):
             name += ".txt"
         blob = req.get("data", "")
         if blob.startswith("data:") and "," in blob:
@@ -4039,7 +4090,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"error": "could not decode upload"}))
         if not raw:
             return self._send(200, json.dumps({"error": "empty file"}))
-        dest_dir = paths.voc(os.path.join(ROOT, "projects", proj), "raw")
+        project_dir = os.path.join(ROOT, "projects", proj)
+        if req.get("kind") == "import":
+            # An export of someone else's stage 01-06 run. Read it here rather
+            # than only at run time: parsing the whole thing costs a fraction of
+            # a second, so the plan can be shown before anything is written and
+            # a zip of the wrong shape is caught while it is still just a file.
+            dest_dir = paths.research(project_dir, "imports")
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, name)
+            open(dest, "wb").write(raw)
+            try:
+                rows = importer.plan(importer.audience_members(raw))
+            except zipfile.BadZipFile:
+                return self._send(200, json.dumps({"error": "not a readable zip"}))
+            return self._send(200, json.dumps(
+                {"ok": True, "path": dest, "bytes": len(raw),
+                 "rel": os.path.relpath(dest, ROOT),
+                 "plan": [{"slug": r["slug"], "name": r["name"],
+                           "items": r["items"], "segment_id": r["segment_id"]}
+                          for r in rows]}))
+        dest_dir = paths.voc(project_dir, "raw")
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, name)
         open(dest, "wb").write(raw)
@@ -4220,7 +4291,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if stage in ("picc", "concepts", "brief", "run"):
             if req.get("product"):
                 cmd += ["--product", str(req["product"])]
-        if stage == "ingest":
+        if stage == "import":
+            source = req.get("source") or ""
+            # Filesystem, matching where _upload put it and how the CLI reads it.
+            if not (os.path.isfile(source) or os.path.isdir(source)):
+                return self._send(200, "Nothing uploaded to import yet.\n",
+                                  "text/plain; charset=utf-8")
+            # The browser has already been shown the plan and pressed Run, so
+            # the CLI's own confirmation would be a second prompt with no
+            # terminal to answer it.
+            if "--yes" not in cmd:
+                cmd.append("--yes")
+            cmd.append(source)
+        elif stage == "ingest":
             if req.get("rules_only"):
                 cmd.append("--rules-only")
             src = req.get("source") or ""
