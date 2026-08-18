@@ -45,6 +45,7 @@ import levers  # noqa: E402
 import briefs  # noqa: E402
 import products  # noqa: E402
 import paths
+import plates
 import settings  # noqa: E402
 import enrich  # noqa: E402
 import synth  # noqa: E402
@@ -3711,6 +3712,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for s, fs in enrich.enrichable()]
             sch["synth_sections"] = synth.sections()
             return self._send(200, json.dumps(sch))
+        if u.path == "/plates":
+            # The plate prompts a project has ready to generate, for anything
+            # that wants to make the images somewhere other than plates.py --
+            # Topic Atlas's node canvas is the reason this exists. Read-only and
+            # cheap; it spends nothing and starts nothing.
+            pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
+            if pr not in projects():
+                return self._send(200, json.dumps({"error": "unknown project"}))
+            return self._send(200, json.dumps(
+                {"project": pr, "segments": plates.catalogue(pr)}))
         if u.path == "/piccs":
             pr = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             return self._send(200, json.dumps(

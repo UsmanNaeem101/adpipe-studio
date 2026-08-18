@@ -27,10 +27,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import re
 
 import credentials
 
 import auditlog
+import paths
 import store
 
 API_URL = os.environ.get("IMAGE_API_URL", "https://api.openai.com/v1/images/generations")
@@ -43,6 +45,68 @@ SIZE = os.environ.get("IMAGE_SIZE", "1024x1536")
 USD_PER_IMAGE = float(os.environ.get("IMAGE_USD", "0.17"))
 
 BANNED_IN_PROMPT = ("text", "word", "caption", "label", "logo", "typography")
+
+
+# ------------------------------------------------------------------ catalogue
+
+# The Plates table a production brief ends with: | Concept | Slot | Prompt |.
+# plates.json is the same content already extracted, so it wins when present;
+# this is for the segment whose brief has been written but not yet extracted.
+PLATE_ROW = re.compile(r"^\|\s*(?P<concept>C?\d+[A-Za-z]?)\s*\|\s*`?(?P<slot>[a-z_]+)`?"
+                       r"\s*\|\s*(?P<prompt>.+?)\s*\|\s*$", re.M)
+
+
+def plates_from_brief(text):
+    """Plate prompts read out of a production brief's own table.
+
+    Deliberately strict about the row shape rather than clever: a brief holds
+    several markdown tables, and a loose match turns the QA checklist into
+    image prompts nobody asked to pay for.
+    """
+    return [{"concept": m.group("concept"), "slot": m.group("slot"),
+             "prompt": m.group("prompt").strip()}
+            for m in PLATE_ROW.finditer(str(text or ""))
+            if len(m.group("prompt").strip()) > 40]
+
+
+def catalogue(project_dir):
+    """Every segment in a project that has plate prompts ready to generate.
+
+    Two sources, in order of trust: plates.json, which is the prompts already
+    extracted and is what plates.py itself reads, then the brief's own table for
+    a segment whose brief exists but has not been extracted yet. Reporting which
+    one answered matters — one is a file somebody checked, the other is a regex
+    over prose.
+    """
+    out = []
+    assets = paths.assets(project_dir)
+    if not store.exists(assets):
+        return out
+    for segment in sorted(store.dirs_in(assets)):
+        seg_dir = os.path.join(assets, segment)
+        rows, source = [], None
+        pj = os.path.join(seg_dir, "plates.json")
+        if store.exists(pj):
+            data = store.read_json(pj, {}) or {}
+            rows = [r for r in (data.get("plates") or [])
+                    if isinstance(r, dict) and str(r.get("prompt") or "").strip()]
+            source = "plates.json"
+        if not rows:
+            bp = os.path.join(seg_dir, "03_production_brief.md")
+            if store.exists(bp):
+                rows = plates_from_brief(store.read_text(bp) or "")
+                source = "brief" if rows else None
+        if not rows:
+            continue
+        out.append({
+            "segment": segment,
+            "source": source,
+            "plates": [{"concept": str(r.get("concept") or ""),
+                        "slot": str(r.get("slot") or "image"),
+                        "prompt": str(r.get("prompt") or "").strip()}
+                       for r in rows],
+        })
+    return out
 
 
 def generate(prompt: str, key: str, retries: int = 3) -> bytes:
