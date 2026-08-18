@@ -4666,6 +4666,20 @@ def storage_report(now=None, marker=STORAGE_MARKER, image_marker=IMAGE_MARKER):
         return (f"  Storage: NOT WRITABLE ({error}) — nothing done here can be "
                 f"saved."), False
 
+    # A store answers this outright. The boot record above went through it, so
+    # reaching this line at all proves the table is configured, reachable and
+    # writable — which is most of what "am I ready?" is asking. The disk stops
+    # mattering here, and saying otherwise would be worse than saying nothing:
+    # the image marker is visible through the underlay whether or not a volume
+    # is mounted, so the volume wording below would report a project safely in
+    # Postgres as about to be destroyed.
+    if store.store().kind != "local":
+        where = os.environ.get("SUPABASE_URL", "").split("//")[-1].split(".")[0]
+        return (f"  Storage: DURABLE — projects are held in Supabase"
+                + (f" ({where})" if where else "")
+                + f", boot {record['boots']}, {len(here)} project(s). "
+                f"No volume needed; the container's disk is scratch."), True
+
     # The definite answer first: it does not depend on history.
     if on_image_disk:
         return (f"  Storage: EPHEMERAL — {os.path.join(ROOT, 'projects')} is the "

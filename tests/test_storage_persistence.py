@@ -114,6 +114,48 @@ class StorageReportTests(unittest.TestCase):
         self.assertIn("NOT WRITABLE", line)
         self.assertIn("read-only file system", line)
 
+    def test_a_store_backed_deployment_is_durable_whatever_the_disk_says(self):
+        """The volume wording is wrong once a store answers instead.
+
+        The image marker is visible through the underlay whether or not a volume
+        is mounted, so the ephemeral branch fires for a project sitting safely in
+        Postgres — telling somebody their work is about to be destroyed at the
+        exact moment they are checking whether it is safe.
+        """
+        class Elsewhere(app.store.LocalStore):
+            kind = "supabase"
+
+        self.state(["montisella"], in_image=True)
+        app.store.use(Elsewhere(self.tmp))
+        try:
+            line, ok = self.boot()
+        finally:
+            app.store.use(None)
+        self.assertTrue(ok)
+        self.assertIn("DURABLE", line)
+        self.assertNotIn("EPHEMERAL", line)
+        self.assertNotIn("Mount a volume", line)
+
+    def test_a_store_that_cannot_be_written_is_still_reported(self):
+        # The boot record goes through the store, so reaching the durable line at
+        # all proves the table is configured and writable. When it is not, that
+        # has to be the message rather than a reassuring one.
+        class Broken(app.store.LocalStore):
+            kind = "supabase"
+
+            def write_text(self, key, text):
+                raise IOError('relation "adpipe_files" does not exist')
+
+        self.state(["montisella"], in_image=True)
+        app.store.use(Broken(self.tmp))
+        try:
+            line, ok = self.boot()
+        finally:
+            app.store.use(None)
+        self.assertFalse(ok)
+        self.assertIn("NOT WRITABLE", line)
+        self.assertIn("adpipe_files", line)
+
 
 class ImageMarkerShipsTests(unittest.TestCase):
     def test_the_marker_is_in_the_repository(self):
