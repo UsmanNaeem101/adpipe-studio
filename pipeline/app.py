@@ -37,6 +37,7 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pipeline"))
+import archive  # noqa: E402
 import importer  # noqa: E402
 import remix  # noqa: E402
 import exifstrip  # noqa: E402
@@ -428,6 +429,49 @@ def project_summary(name):
             elif rel.startswith("voc" + os.sep):
                 counts["voc_files"] += 1
     return counts
+
+
+def project_storage(name):
+    """What a project is holding, and how much of it stage 06 has made spare.
+
+    Answered before anything is offered, because the two operations underneath
+    read as the same thing from the outside — one downloads a project, the other
+    deletes most of it — and the difference between them is entirely in whether
+    stage 06 has written its evidence yet.
+    """
+    if name not in projects():
+        raise ValueError(f"no project {name!r}")
+    directory = os.path.join(ROOT, "projects", name)
+    spent = archive.spent_files(directory)
+    evidence = archive.stage06_output(directory)
+    return {
+        "project": name,
+        "evidence": evidence,
+        "ready": bool(evidence),
+        "files": [{"path": os.path.relpath(key, directory).replace(os.sep, "/"),
+                   "bytes": size} for key, size in sorted(spent, key=lambda r: -r[1])],
+        "bytes": sum(size for _, size in spent),
+    }
+
+
+def project_archive(name):
+    """The whole project as a zip, for keeping somewhere this app is not."""
+    if name not in projects():
+        raise ValueError(f"no project {name!r}")
+    filename, blob, count = archive.bundle(os.path.join(ROOT, "projects", name), name)
+    return filename, blob, count
+
+
+def project_cleanup(name):
+    """Remove the corpora stages 01-06 have finished with.
+
+    The guard lives in archive.remove, not here, so the CLI and the browser
+    cannot disagree about when this is safe.
+    """
+    if name not in projects():
+        raise ValueError(f"no project {name!r}")
+    removed, freed = archive.remove(os.path.join(ROOT, "projects", name))
+    return {"ok": True, "removed": len(removed), "freed": freed}
 
 
 def delete_project(name):
@@ -3685,11 +3729,60 @@ async function renderProjectList(){
           ${s.segments&&s.segments.length?'<br>'+s.segments.join(', '):''}
         </div>
       </div>
-      <button class="btn ghost pdel" data-n="${n}"
-        style="border-color:var(--signal);color:var(--signal);padding:8px 15px">Delete</button>
-    </div>`).join('')||'<p class=hint>No projects yet.</p>';
+      <div style="display:flex;gap:8px;flex-shrink:0">
+        <a class="btn ghost" href="/project/archive?project=${encodeURIComponent(n)}"
+          style="padding:8px 15px;text-decoration:none">Download</a>
+        <button class="btn ghost pclean" data-n="${n}"
+          style="padding:8px 15px">Free space</button>
+        <button class="btn ghost pdel" data-n="${n}"
+          style="border-color:var(--signal);color:var(--signal);padding:8px 15px">Delete</button>
+      </div>
+    </div>
+    <p class=hint id="pmsg-${n}" style="margin:-4px 0 10px"></p>`).join('')||
+    '<p class=hint>No projects yet.</p>';
   document.querySelectorAll('.pdel').forEach(b=>b.onclick=()=>deleteProject(b.dataset.n,
     rows.find(r=>r.n===b.dataset.n).s));
+  document.querySelectorAll('.pclean').forEach(b=>b.onclick=()=>cleanupProject(b.dataset.n));
+}
+
+/* Removing the corpora stages 01-06 built. Everything after stage 06 reads the
+   evidence files and nothing earlier, so once those exist the corpora are the
+   largest thing in the project and the least read — but they are also the only
+   thing a re-segmentation can be run from, so this asks rather than tidying up
+   on its own. */
+function mb(n){return n>=1048576?(n/1048576).toFixed(1)+' MB':Math.round(n/1024)+' KB'}
+async function cleanupProject(name){
+  const m=$('#pmsg-'+name); if(m){m.style.color='';m.textContent='Checking…'}
+  const s=await (await fetch('/project/storage?project='+encodeURIComponent(name))).json();
+  if(s.error){if(m){m.style.color='var(--signal)';m.textContent='⚠ '+s.error}return}
+  if(!s.files.length){if(m)m.textContent='Nothing to free — no working corpora left.';return}
+
+  const list=s.files.slice(0,8).map(f=>`  ${mb(f.bytes).padStart(9)}  ${f.path}`).join('\n')+
+    (s.files.length>8?`\n  …and ${s.files.length-8} more`:'');
+  if(!s.ready){
+    if(m){m.style.color='var(--signal)';
+      m.innerHTML=`⚠ Stage 06 has written no evidence files yet, so these `+
+        `${s.files.length} file(s) (${mb(s.bytes)}) are still the only copy of this `+
+        `project's research. Run segmentation through stage 06, or import audience `+
+        `files, first.`}
+    return;
+  }
+  if(!confirm(`Free ${mb(s.bytes)} from "${name}"?\n\n${s.files.length} file(s):\n`+
+    `${list}\n\nStage 06 has written ${s.evidence.length} evidence file(s), which is `+
+    `what every stage after it reads — these corpora are no longer read by anything.\n\n`+
+    `After this, segmentation cannot be re-run without ingesting the source again. `+
+    `Use Download first if you want a copy.`))return;
+
+  if(m)m.textContent='Removing…';
+  const r=await (await fetch('/project/cleanup',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})).json();
+  if(r.error){if(m){m.style.color='var(--signal)';m.textContent='⚠ '+r.error}return}
+  // Re-render first: it replaces this paragraph, so a message set before it
+  // would be written onto an element that is about to be discarded.
+  await renderProjectList();
+  const after=$('#pmsg-'+name);
+  if(after){after.style.color='var(--accent)';
+    after.textContent=`Removed ${r.removed} file(s), freed ${mb(r.freed)}.`}
 }
 async function deleteProject(name,s){
   const has=(s.extractions||0)+(s.renders||0)+(s.evidence||0);
@@ -3757,6 +3850,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/project/summary":
             n = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             return self._send(200, json.dumps(project_summary(n) or {}))
+        if u.path == "/project/storage":
+            n = urllib.parse.parse_qs(u.query).get("project", [""])[0]
+            try:
+                return self._send(200, json.dumps(project_storage(n)))
+            except ValueError as e:
+                return self._send(200, json.dumps({"error": str(e)}))
+        if u.path == "/project/archive":
+            # A GET so the browser saves it: a fetch() would pull the whole zip
+            # into a tab's memory first, and these run to hundreds of megabytes.
+            n = urllib.parse.parse_qs(u.query).get("project", [""])[0]
+            try:
+                filename, blob, _ = project_archive(n)
+            except ValueError as e:
+                return self._send(404, json.dumps({"error": str(e)}))
+            return self._send(200, blob, "application/zip", download=filename)
         if u.path == "/library":
             return self._send(200, json.dumps(library()))
         if u.path == "/products":
@@ -3968,6 +4076,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._send(200, json.dumps({"error": str(e)}))
             return self._send(200, json.dumps({"ok": True, "project": cfg["name"]}))
+        if path == "/project/cleanup":
+            req = self._json()
+            try:
+                return self._send(200, json.dumps(project_cleanup(req.get("name", ""))))
+            except (ValueError, OSError) as e:
+                # ValueError is also how archive.remove says "too early", which
+                # is the answer this endpoint exists to give.
+                return self._send(200, json.dumps({"error": str(e)}))
         if path == "/project/delete":
             req = self._json()
             try:

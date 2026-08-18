@@ -43,6 +43,24 @@ BUCKET = "adpipe-media"
 # file readable in the Supabase table editor instead of being an opaque blob.
 BINARY_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mp3", ".zip", ".pdf")
 
+# The largest text this will put in a table row.
+#
+# Postgres would hold far more, but the row goes through PostgREST as one JSON
+# request body, and a hosted API gateway refuses a large one long before
+# Postgres would care. The pipeline routinely writes past this: a raw VOC dump
+# is 16MB, its deduplicated twin nearly as big. Those went to the table because
+# routing was decided by file extension alone, and .jsonl is not a binary
+# suffix — so the one path never exercised beyond a one-line fixture was the one
+# the biggest files in the system took.
+#
+# It is also a quota question. The database is metered in hundreds of megabytes
+# and the object store in gigabytes; a corpus belongs in the second.
+TEXT_MAX_BYTES = int(os.environ.get("ADPIPE_TEXT_MAX_BYTES") or 512 * 1024)
+
+# What stands in the table when the text itself went to the bucket. The row is
+# kept so `exists` and `list_keys` still answer from one place.
+OVERFLOW_PREFIX = "adpipe:overflow:v1:"
+
 
 def is_binary_key(key):
     return key.lower().endswith(BINARY_SUFFIXES)
@@ -214,6 +232,9 @@ class SupabaseStore:
         # never does — which is what stops "is this file there?" having a
         # different answer depending on which layer somebody was thinking of.
         self.underlay = LocalStore()
+        # Keys this process has sent to the bucket as overflow text. See
+        # write_text: it is what lets the common small write stay one request.
+        self._overflowed = set()
 
     # -- plumbing ---------------------------------------------------------
 
@@ -271,7 +292,17 @@ class SupabaseStore:
         if status != 200:
             return self.underlay.read_text(key)
         rows = json.loads(payload or b"[]")
-        return rows[0]["content"] if rows else self.underlay.read_text(key)
+        if not rows:
+            return self.underlay.read_text(key)
+        content = rows[0]["content"]
+        if isinstance(content, str) and content.startswith(OVERFLOW_PREFIX):
+            status, payload = self._request("GET", self._object_path(key))
+            if status == 200:
+                return payload.decode("utf-8")
+            # The row says the bytes exist and the bucket disagrees. Say so
+            # rather than returning the marker as if it were the file.
+            raise IOError("%s is recorded as stored but its object is missing" % key)
+        return content
 
     def read_bytes(self, key):
         key = normalise(key)
@@ -283,35 +314,64 @@ class SupabaseStore:
 
     # -- writes -----------------------------------------------------------
 
-    def write_text(self, key, text):
-        key = normalise(key)
-        if is_binary_key(key):
-            return self.write_bytes(key, text.encode("utf-8"))
+    def _put_row(self, key, content):
         status, payload = self._rest(
             "POST",
             "?on_conflict=key",
             body={"key": key, "project": key.split("/")[1] if key.startswith("projects/") else None,
-                  "content": text},
+                  "content": content},
             headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
         )
         if status >= 300:
             raise IOError("could not write %s: %s %s" % (key, status, payload[:200]))
 
-    def write_bytes(self, key, data):
-        key = normalise(key)
-        if not is_binary_key(key):
-            return self.write_text(key, data.decode("utf-8"))
+    def _put_object(self, key, data):
         status, payload = self._request(
             "POST",
             self._object_path(key),
             body=data,
             binary=True,
-            # Overwrite rather than fail: a re-render of the same ad is a
-            # replacement, not a second file.
             headers={"Content-Type": "application/octet-stream", "x-upsert": "true"},
         )
         if status >= 300:
             raise IOError("could not upload %s: %s %s" % (key, status, payload[:200]))
+
+    def write_text(self, key, text):
+        key = normalise(key)
+        if is_binary_key(key):
+            return self.write_bytes(key, text.encode("utf-8"))
+
+        raw = text.encode("utf-8")
+        # The prefix test is not paranoia about size: it removes the only way a
+        # real file could be mistaken for a marker, by sending any text that
+        # begins like one to the bucket as well.
+        if len(raw) > TEXT_MAX_BYTES or text.startswith(OVERFLOW_PREFIX):
+            self._put_object(key, raw)
+            self._put_row(key, OVERFLOW_PREFIX + json.dumps({"bytes": len(raw)}))
+            self._overflowed.add(key)
+            return
+
+        self._put_row(key, text)
+        # A file that shrank back under the limit leaves its old, larger self in
+        # the bucket. No read will ever return it — the row decides, and the row
+        # now holds the text — so this is space, not correctness, and it is
+        # reclaimed either here or by delete(), which takes both halves.
+        #
+        # Conditional because urllib opens a fresh connection per call and the
+        # small write is the hot path: the audit log writes one file per model
+        # request, and paying a second round trip on each of those to tidy up
+        # after a case that only arises when a corpus shrinks is the wrong trade.
+        if key in self._overflowed:
+            self._request("DELETE", self._object_path(key))
+            self._overflowed.discard(key)
+
+    def write_bytes(self, key, data):
+        key = normalise(key)
+        if not is_binary_key(key):
+            return self.write_text(key, data.decode("utf-8"))
+        # Overwrite rather than fail: a re-render of the same ad is a
+        # replacement, not a second file.
+        self._put_object(key, data)
 
     # -- removal and listing ----------------------------------------------
 
@@ -321,6 +381,10 @@ class SupabaseStore:
             self._request("DELETE", self._object_path(key))
             return
         self._rest("DELETE", "?key=eq.%s" % urllib.parse.quote(key, safe=""))
+        # Unconditional, because the row that would have said whether this key
+        # overflowed is the one just deleted.
+        self._request("DELETE", self._object_path(key))
+        self._overflowed.discard(key)
 
     def delete_prefix(self, prefix):
         prefix = normalise(prefix)
