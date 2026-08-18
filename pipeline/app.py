@@ -4,7 +4,7 @@ adpipe studio — the whole pipeline in a browser. No terminal needed.
 
 Three tabs:
   Remix    upload a product photo, write a brief, pick reference layouts, generate
-  Pipeline run any stage (ingest -> ... -> render) and watch the output live
+  Pipeline run any stage (ingest -> ... -> brief) and watch the output live
   Settings paste your API keys
 
 Keys saved in Settings go to AdPipe's private user-level credential store, outside
@@ -97,8 +97,7 @@ STAGES = [
     ("concepts", "10 concepts + hooks + layouts",             True,  False),
     ("brief",    "Production briefs",                         True,  False),
     ("qa",       "Compliance gate",                           False, False),
-    ("render",   "Composite copy into layouts -> PNG",        False, False),
-    ("run",      "Everything: extract -> ... -> render",      True,  False),
+    ("run",      "Everything: extract -> ... -> brief",       True,  False),
 ]
 
 
@@ -443,7 +442,11 @@ def project_summary(name):
             counts["segments"].append(base[:-4])
         elif trimmed and trimmed[0] == "extractions" and base.endswith(".md"):
             counts["extractions"] += 1
-        elif base.lower().endswith(IMG_EXT) and "renders" in rel:
+        elif base.lower().endswith(IMG_EXT) and (
+                "remixes" in rel or "plates" in rel or "renders" in rel):
+            # "renders" stays in the test because a project made before the
+            # compositor was removed still has that folder, and a delete
+            # confirmation that under-counts is the one that gets clicked.
             counts["renders"] += 1
         elif trimmed and trimmed[0] == "voc":
             counts["voc_files"] += 1
@@ -613,11 +616,15 @@ def project_outputs(project):
                           ("03_production_brief.md", "brief"),
                           ("plates.json", "brief"), ("remix.json", "brief")):
                 entry(st, f"{seg} · {f}", os.path.join(d, f))
-            rd = os.path.join(d, "renders")
-            if store.exists(rd):
-                for f in store.names_in(rd):
+            # Images come from Remix and the plate generator now, which write
+            # here. `renders/` was the compositor's output and nothing fills it.
+            for folder in ("remixes", "plates"):
+                id = os.path.join(d, folder)
+                if not store.exists(id):
+                    continue
+                for f in store.names_in(id):
                     if f.lower().endswith(IMG_EXT):
-                        entry("render", f"{seg} · {f}", os.path.join(rd, f), "image")
+                        entry("brief", f"{seg} · {f}", os.path.join(id, f), "image")
 
     ld = os.path.join(root, "logs", "model")
     if os.path.isdir(ld):
@@ -3395,7 +3402,7 @@ async function loadOutputs(){
   const pr=$('#oproj')&&$('#oproj').value; if(!pr)return;
   const d=await (await fetch('/outputs?project='+encodeURIComponent(pr))).json();
   const by={}; (d.stages||[]).forEach(x=>{(by[x.stage]=by[x.stage]||[]).push(x)});
-  const order=['ingest','segment','extract','picc','concepts','brief','render','logs'];
+  const order=['ingest','segment','extract','picc','concepts','brief','logs'];
   const old=[...document.querySelectorAll('#olist details.outstage')];
   const hadAccordion=old.length>0;
   const openStages=new Set(old.filter(x=>x.open).map(x=>x.dataset.stage));

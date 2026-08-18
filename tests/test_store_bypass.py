@@ -45,8 +45,6 @@ ALLOWED = {
     ("app.py", "thumbnail"),         # writes a derived thumbnail beside the cache
     ("cli.py", "cmd_archive"),       # writes the zip to the machine you asked from
     ("cli.py", "cmd_import"),        # reads a zip or folder someone named
-    ("render.py", "main"),           # the page Chromium screenshots must be a file
-    ("render.py", "resolve_asset"),  # ditto: a plate written out for Chrome to read
 }
 
 TAINTED_NAMES = {"ROOT"}
@@ -141,8 +139,9 @@ class StoreBypassTests(unittest.TestCase):
         self.assertEqual(hits, 1)
 
     def test_it_leaves_a_scratch_file_alone(self):
-        # render.py writes the page it is about to screenshot to a temp dir and
-        # hands Chromium a real path, because Chromium cannot read a table.
+        # Some callers genuinely need a real file in a scratch directory — an
+        # export written out for someone to download, a temp file handed to a
+        # subprocess. Those are not project state and must not be flagged.
         module = ast.parse(
             "def shoot(scratch_dir):\n"
             "    tmp = os.path.join(scratch_dir, 'page.html')\n"

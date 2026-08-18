@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-QA gate for Montisella static ad copy. Run BEFORE render.py; nothing ships without it.
+QA gate for static ad copy. Run before the copy goes to an image model;
+nothing ships without it.
 
 Enforces the four things that actually kill this account or this ad:
   1. NO unsupported medical claim  (Meta health-adjacent policy - hard fail)

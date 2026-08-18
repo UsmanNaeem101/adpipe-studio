@@ -3,8 +3,8 @@
 Generate the background/product plates for a segment's ads.
 
 Plates are images ONLY — no text ever. Image models cannot spell reliably, so
-every word in the finished ad is composited by render.py on top of the plate.
-A plate that comes back with lettering in it is a defect; regenerate it.
+the words go on afterwards, wherever the ad is finally assembled. A plate that
+comes back with lettering in it is a defect; regenerate it.
 
     export OPENAI_API_KEY=sk-...
     python3 pipeline/plates.py projects/montisella/output/side_sleepers_night_pain/plates.json
@@ -37,8 +37,8 @@ import store
 
 API_URL = os.environ.get("IMAGE_API_URL", "https://api.openai.com/v1/images/generations")
 MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-1")
-# Portrait. render.py crops with object-fit: cover, so this only needs the right
-# shape for a 4:5 ad, not the exact pixel dimensions.
+# Portrait: the right shape for a 4:5 ad. Whatever assembles the ad crops to
+# fit, so this does not need to be the exact pixel dimensions.
 SIZE = os.environ.get("IMAGE_SIZE", "1024x1536")
 # Rough list price for gpt-image-1 at 1024x1536, quality=high. Verify against
 # current OpenAI pricing — this is only here so --dry-run gives you a ballpark.

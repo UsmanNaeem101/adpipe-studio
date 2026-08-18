@@ -102,7 +102,10 @@ class AppOutputTests(unittest.TestCase):
         self.assertCountEqual(
             [os.path.basename(x["path"]) for x in logs],
             ["request.json", "response.json"])
-        self.assertIn("'render','logs'", app.PAGE)
+        # Model logs are grouped last in the Outputs tab, after every stage
+        # that produces an artefact. The stage before them changed when the
+        # compositor went; what matters is that logs still come after it.
+        self.assertIn("'brief','logs'", app.PAGE)
 
     def test_commercial_and_human_pack_outputs_appear_in_studio(self):
         with tempfile.TemporaryDirectory() as tmp:

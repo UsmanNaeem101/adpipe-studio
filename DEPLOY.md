@@ -12,17 +12,20 @@ you → topicatlas.digital/adpipe → /api/adpipe/* (session checked) → adpipe
 
 Railway → **New service** → deploy from this repository. Railway's own builder
 handles it — there is no Dockerfile and no image to maintain, because the app has
-no dependencies to install. Two settings do all the work:
+no dependencies to install. One setting does all the work:
 
 | Setting | Value |
 |---|---|
 | Start command | `python3 pipeline/app.py` |
-| `RAILPACK_DEPLOY_APT_PACKAGES` | `chromium fonts-liberation fonts-dejavu-core` |
 
-Chromium is the only thing this app needs that Python does not bring: rendering
-an ad *is* screenshotting an HTML template. The fonts matter as much — a headless
-browser with no fonts renders every ad in tofu, and that looks like a broken
-template rather than a missing font.
+Nothing is fetched at build time. `requirements.txt` is empty on purpose — the
+app is the Python standard library and nothing else — so there is no pip step and
+no apt step, and a build has no network dependency that can time out.
+
+It used to install Chromium, because an ad was made by screenshotting an HTML
+template. Images come from image models now, so there is no browser to install:
+a few hundred megabytes of apt, and every "failed to connect before the deadline"
+that came with it, are gone.
 
 **Add a volume**, mounted at **`/app/projects`**. This is not optional. Without
 it every project, every brief and every rendered ad is deleted on the next
@@ -34,7 +37,6 @@ deploy — the container filesystem does not survive one.
 |---|---|---|
 | `STUDIO_HOST` | `0.0.0.0` | a container bound to loopback is unreachable, with no error to read |
 | `STUDIO_NO_BROWSER` | `1` | there is no browser to open and nobody to look at it |
-| `CHROME` | `/usr/bin/chromium` | names the browser installed above; `find_chrome()` looks in /Applications and on PATH otherwise |
 | `ADPIPE_CREDENTIALS_FILE` | `/app/projects/.credentials.json` | puts the credential store **on the volume**; see below |
 | `ADPIPE_SHARED_SECRET` | a long random string | must match Topic Atlas's; see below |
 | `OPENROUTER_API_KEY` | your key | `credentials.resolve()` prefers the environment over its stored file |
