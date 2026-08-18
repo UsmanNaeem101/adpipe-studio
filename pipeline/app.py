@@ -1505,25 +1505,32 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 
       <div style="border:1.5px solid var(--line);border-radius:11px;padding:13px 15px;
         margin-bottom:14px">
-        <b style=font-size:13.5px>Enrich this segment from its research</b>
-        <p class=hint style="margin:5px 0 10px">Reads this segment's twenty
-          extraction outputs and fills its research fields: <b>pain points, pain
+        <b style=font-size:13.5px>Fill this product's segment from the research</b>
+        <p class=hint style="margin:5px 0 10px"><b>"Segment" means two things, and
+          this connects them.</b> The <i>research segment</i> is what the pipeline
+          found — an audience, its comments and its twenty extraction outputs, in
+          <code>research/</code>. The <i>product segment</i> is this product's own
+          record of those people, in <code>products/&lt;product&gt;/segments.json</code>.
+          This reads the first and fills in the second.</p>
+        <p class=hint style="margin:0 0 10px">What gets filled: <b>pain points, pain
           moments, desired outcomes, failed solutions, beliefs and limiting
           beliefs, buying triggers, purchase criteria, competitor complaints,
           proof expectations</b> and the words customers actually use — plus who
-          the segment is, why they care, and who is a poor fit.</p>
-        <p class=hint style="margin:0 0 10px"><b>It never fills product fields.</b>
-          What your product is, what it is made of and what you can prove are
-          yours to state: a customer's desire is not evidence of a capability.
-          This fills the segment only — one segment at a time, each from its own
-          research, all inside the same product.</p>
+          these people are, why they care, and who is a poor fit. Which research
+          it reads is set by <i>Pipeline segment slug</i> on the segment below.</p>
+        <p class=hint style="margin:0 0 10px"><b>It never fills product-wide
+          fields.</b> What your product is, what it is made of and what you can
+          prove are yours to state: a customer's desire is not evidence of a
+          capability. So this fills one segment at a time, each from its own
+          research — and every one of them lives inside this same product. A
+          second product is for a second thing to sell, not a second audience.</p>
         <p class=hint style="margin:0 0 10px">Evidence only: it records what
           customers said, never what to do about it. That is <i>Product ×
           segment strategy</i>, below. Every suggestion arrives as
           <i>ai&nbsp;suggested</i> for you to accept, edit or reject, and fields
           you have already approved are left alone.</p>
         <div class=row style="margin-bottom:9px">
-          <div><label>Segment</label><select id=en_seg></select></div>
+          <div><label>Segment on this product</label><select id=en_seg></select></div>
           <div><label>&nbsp;</label>
             <div style="display:flex;gap:8px">
               <button class="btn ghost" id=en_preview style="flex:1;white-space:nowrap">Preview prompt</button>
@@ -1547,7 +1554,7 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
           are excluded and listed — strategy built on unreviewed evidence is what
           running §6 first exists to prevent.</p>
         <div class=row style="margin-bottom:9px">
-          <div><label>Segment</label><select id=sy_seg></select></div>
+          <div><label>Segment on this product</label><select id=sy_seg></select></div>
           <div><label>&nbsp;</label>
             <div style="display:flex;gap:8px">
               <button class="btn ghost" id=sy_preview style="flex:1;white-space:nowrap">Preview prompt</button>
@@ -4449,6 +4456,87 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+# Where the app records that it has run before. A dotfile, so projects() — which
+# skips names beginning "." or "_" — never mistakes it for a project.
+STORAGE_MARKER = "projects/.storage.json"
+
+# Shipped in the repository, therefore present in the image and only visible when
+# nothing is mounted over projects/. Its presence is the one thing that can say
+# "this is the container's own disk" without waiting for a deploy to prove it.
+IMAGE_MARKER = "projects/.in-the-image"
+
+
+def storage_report(now=None, marker=STORAGE_MARKER, image_marker=IMAGE_MARKER):
+    """Whether the work put here will still be here after the next deploy.
+
+    A container's filesystem is discarded on every deploy. Mount a volume and the
+    work persists; forget to, or mount it at the wrong path, and everything looks
+    perfect until a deploy takes it — after which the app comes back up showing
+    the bundled example project and nothing else, which is indistinguishable from
+    a healthy first boot. That ambiguity is the whole problem: the person who
+    lost a day cannot tell which of the two happened, and neither could this app.
+
+    Two independent signals, because neither alone is enough:
+
+      - A boot record written here. Finding it proves the directory survived a
+        restart. Missing, it proves nothing on its own — a first boot and a wipe
+        look identical, so this is reported as UNKNOWN and never as reassurance.
+      - A file shipped inside the image. If it is visible, nothing is mounted
+        over this directory and the work is on the container's own disk, which
+        will be destroyed. That is a definite answer available immediately,
+        without waiting for a deploy to demonstrate it.
+
+    Returns (line, ok). ok is False whenever loss is certain or already happened.
+    """
+    stamp = (now or datetime.datetime.now()).isoformat(timespec="seconds")
+    here = sorted(projects())
+    on_image_disk = store.exists(image_marker)
+
+    previous = None
+    try:
+        if store.exists(marker):
+            candidate = store.read_json(marker, None)
+            if isinstance(candidate, dict):
+                previous = candidate
+    except Exception:
+        previous = None
+
+    if previous is None:
+        record = {"boots": 1, "first_seen": stamp, "last_seen": stamp, "projects": here}
+    else:
+        record = {"boots": int(previous.get("boots") or 0) + 1,
+                  "first_seen": previous.get("first_seen") or stamp,
+                  "last_seen": stamp, "projects": here}
+
+    try:
+        store.write_json(marker, record)
+    except Exception as error:
+        return (f"  Storage: NOT WRITABLE ({error}) — nothing done here can be "
+                f"saved."), False
+
+    # The definite answer first: it does not depend on history.
+    if on_image_disk:
+        return (f"  Storage: EPHEMERAL — {os.path.join(ROOT, 'projects')} is the "
+                f"container's own disk, not a volume. Every project, brief and "
+                f"render here is destroyed by the next deploy. Mount a volume at "
+                f"that path."), False
+
+    if previous is None:
+        return (f"  Storage: UNKNOWN — a volume is mounted, but this is the first "
+                f"boot to leave a record. If you have used this deployment before, "
+                f"its work did not survive. The next boot will say for certain."), True
+
+    was = [name for name in (previous.get("projects") or []) if isinstance(name, str)]
+    lost = [name for name in was if name not in here]
+    if lost:
+        return (f"  Storage: LOST {len(lost)} project(s) since boot "
+                f"{previous.get('boots')} — {', '.join(lost)}. Persisted work has "
+                f"disappeared; check the volume before doing anything else."), False
+
+    return (f"  Storage: persistent — boot {record['boots']} since "
+            f"{record['first_seen']}, {len(here)} project(s) kept."), True
+
+
 def credential_line():
     """Which providers have a key, and where a key typed in Settings will land.
 
@@ -4482,7 +4570,11 @@ def main():
     print(f"\n  adpipe studio  →  {url}" if HOST == "127.0.0.1"
           else f"\n  adpipe studio  →  {HOST}:{PORT}")
     print(f"  {n} reference ads · {len(projects())} project(s)")
+    storage, storage_ok = storage_report()
+    print(storage)
     print(credential_line())
+    if not storage_ok:
+        print("  ! Work is being lost between deploys. Nothing below will survive.")
     print("  Ctrl-C to stop.\n")
     # Double-clicking Ad Studio.command should pop the browser; a supervisor that
     # opens its own preview pane should not get a second stray window, and a

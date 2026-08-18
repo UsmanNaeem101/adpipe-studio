@@ -1,0 +1,6 @@
+This file is shipped in the image.
+
+If it is visible at runtime then nothing is mounted over projects/, so the work
+kept here is on the container disk and the next deploy destroys it. app.py reads
+its presence as the definite answer to "is this storage ephemeral?" — see
+storage_report(). Do not add it to a volume, and do not delete it from the repo.
