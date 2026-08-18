@@ -6,8 +6,9 @@ Sends the image model TWO images — a reference ad from your swipe file and a p
 of your product — plus an instruction ("recreate this layout with my product,
 headline = X, subtext = Y"). The model returns a complete ad, text included.
 
-This is the alternative to the render.py compositor. Compared to it:
-  + uses ANY of the 221 reference ads, not just the 6 hand-built templates
+One whole ad from one call, which is what replaced compositing text over a
+template with a headless browser. Worth knowing about it:
+  + uses ANY of the reference ads, not just a handful of hand-built templates
   + no template authoring — the reference image IS the template
   - the model writes the text as pixels, so qa.py CANNOT verify it is claim-safe.
     YOU must read every output against the compliance rules before shipping.

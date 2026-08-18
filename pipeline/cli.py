@@ -10,8 +10,7 @@ adpipe — raw Reddit VOC in, launch-ready static ads out.
     ./adpipe concepts <segment>         10 concepts + hooks + layouts  (model)
     ./adpipe brief   <segment>          production briefs              (model)
     ./adpipe qa      <segment>          compliance gate                (code)
-    ./adpipe render  <segment>          composite PNGs                 (code)
-    ./adpipe run     <segment>          extract -> ... -> render
+    ./adpipe run     <segment>          extract -> ... -> brief
 
 Every model stage prints a cost estimate and waits for confirmation; pass --yes to
 skip the prompt. -p/--project selects the project (default: montisella).
@@ -5871,15 +5870,8 @@ Set "evidence_file" to "{os.path.relpath(evidence_path(cfg, args.segment), ROOT)
 
 
 def _templates():
-    d = os.path.join(ROOT, "pipeline", "templates")
-    import render
-    lines = []
-    for f in store.names_in(d):
-        if f.endswith(".html") and not f.startswith("_"):
-            slots = [s for s in render.template_slots(os.path.join(d, f))
-                     if s not in ("logo_text",) and "image" not in s and "avatar" not in s]
-            lines.append(f"    {f[:-5]} — slots: {', '.join(slots)}")
-    return "\n".join(lines)
+    import layouts
+    return layouts.catalogue()
 
 
 def cmd_brief(cfg, args):
@@ -5943,12 +5935,6 @@ def cmd_qa(cfg, args):
     sys.exit(_script(cfg, args, "qa.py"))
 
 
-def cmd_render(cfg, args):
-    if _script(cfg, args, "qa.py") != 0 and not args.force:
-        sys.exit("QA failed — fix the copy before rendering (--force to override).")
-    sys.exit(_script(cfg, args, "render.py"))
-
-
 def cmd_studio(cfg, args):
     """Launch the browser UI. Everything the CLI does is reachable from there."""
     import app
@@ -5961,8 +5947,6 @@ def cmd_run(cfg, args):
         step(cfg, args)
     print("\n=== QA ===")
     _script(cfg, args, "qa.py")
-    print("\n=== RENDER ===")
-    _script(cfg, args, "render.py")
 
 
 # ------------------------------------------------------------------ main
@@ -6043,7 +6027,7 @@ def main():
     s.add_argument("source", help="a zip of audience markdown files, or a directory of them")
     s.set_defaults(fn=cmd_import)
     for name, fn in (("extract", cmd_extract), ("picc", cmd_picc), ("concepts", cmd_concepts),
-                     ("brief", cmd_brief), ("qa", cmd_qa), ("render", cmd_render),
+                     ("brief", cmd_brief), ("qa", cmd_qa),
                      ("run", cmd_run)):
         s = common(sub.add_parser(name)); s.add_argument("segment"); s.set_defaults(fn=fn)
         if name in ("extract", "run"):

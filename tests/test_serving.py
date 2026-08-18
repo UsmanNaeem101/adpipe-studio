@@ -1,11 +1,14 @@
 """Running as a service rather than on a desk.
 
-Four things differ on a container and each one is silent when it is wrong: the
-port it listens on, the address it binds to, the browser it screenshots ads
-with, and where its API keys are kept. A studio bound to loopback inside a
-container is simply unreachable, with no error to read; a missing browser fails
-only when someone renders; and a credential store off the mounted volume works
-perfectly until the next deploy wipes it.
+Three things differ on a container and each one is silent when it is wrong: the
+port it listens on, the address it binds to, and where its API keys are kept. A
+studio bound to loopback inside a container is simply unreachable, with no error
+to read; and a credential store off the mounted volume works perfectly until the
+next deploy wipes it.
+
+There used to be a fourth — finding the browser that screenshotted ads. Ads are
+built by image models now, so there is no browser to find, and no apt install
+standing between a push and a running service.
 """
 
 import os
@@ -18,46 +21,6 @@ sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 
 import app  # noqa: E402
 import credentials  # noqa: E402
-import render  # noqa: E402
-
-
-class ChromeDiscoveryTests(unittest.TestCase):
-    def test_the_chrome_variable_is_honoured(self):
-        # The error message has told people to set this for a long time and
-        # nothing read it. On a container it is the only way to name a browser
-        # that is neither in /Applications nor first on PATH.
-        with mock.patch.dict(os.environ, {"CHROME": sys.executable}):
-            self.assertEqual(render.find_chrome(), sys.executable)
-
-    def test_a_chrome_variable_pointing_nowhere_says_so(self):
-        # Falling back silently would render every ad with the wrong browser,
-        # or none, long after the person who set it stopped watching.
-        with mock.patch.dict(os.environ, {"CHROME": "/no/such/browser"}):
-            with self.assertRaises(SystemExit) as caught:
-                render.find_chrome()
-            self.assertIn("/no/such/browser", str(caught.exception))
-
-    def test_it_still_finds_a_browser_without_the_variable(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch.object(render, "CHROME_CANDIDATES", []):
-                with mock.patch.object(render.shutil, "which",
-                                       side_effect=lambda name: "/usr/bin/chromium"
-                                       if name == "chromium" else None):
-                    self.assertEqual(render.find_chrome(), "/usr/bin/chromium")
-
-    def test_renders_run_without_a_sandbox(self):
-        # Chromium as root in a container refuses to start otherwise, and the
-        # error it gives does not mention the sandbox.
-        recorded = {}
-
-        def fake_run(cmd, **kwargs):
-            recorded["cmd"] = cmd
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
-        with mock.patch.object(render.subprocess, "run", fake_run):
-            render.chrome_run("/usr/bin/chromium", "/tmp/a.html", ["--screenshot=/tmp/a.png"])
-        self.assertIn("--no-sandbox", recorded["cmd"])
-        self.assertIn("--headless", recorded["cmd"])
 
 
 class ListenAddressTests(unittest.TestCase):

@@ -141,9 +141,9 @@ adpipe                    launcher (uses .venv)
 pipeline/
   cli.py                  stage orchestrator
   llm.py                  Claude API layer — caching, batching, cost, errors
-  render.py  qa.py        compositor + compliance gate
+  layouts.py qa.py        layout vocabulary + compliance gate
   presets.py              60 execution presets — parse, prompt block, conflicts
-  templates/              6 shared ad layouts
+  templates/              shared ad layouts — read for their slots, not rendered
   brand.json  facts.json  brand tokens · the only numbers allowed in an ad
 skills/                   27 skill files — source of truth for each stage
 reference_docs/           execution_levers.md — the 60-preset lever library
@@ -165,13 +165,22 @@ ship complete with no photography at all. To upgrade, generate plates
 (`pipeline/plates.py`, see `docs/IMAGE_SETUP.md`), wire them in, and re-render —
 the templates switch modes automatically.
 
-## The compositor
+## Layouts
 
-Image models cannot spell, so **no headline ever goes through one**. The model
-generates the background/product *plate*; `render.py` composites real text over it
-in a slotted HTML template and screenshots it with headless Chrome. A second
-measuring pass fails the build when a slot's text is clipped — a sliced headline is
-a dead ad, and that should be a build error, not a discovery on Meta.
+A concept has to say what shape it is — a hook over a product shot is a different
+brief from a before-and-after — and the template files are where those shapes and
+their text slots are written down. `layouts.py` reads them for their slot names,
+which is the vocabulary the concepts stage picks from.
+
+They used to be rendered: text composited into the slots and screenshotted with
+headless Chrome, with a measuring pass that failed the build on a clipped
+headline. That compositor is gone, along with the several hundred megabytes of
+Chromium a deploy had to fetch before it could start. Ads are assembled by image
+models now — `remix.py` returns a whole one from a reference ad and a product
+photo — or downstream in the node Studio.
+
+Image models still cannot spell, so the old warning stands: read every generated
+headline before it ships. `qa.py` checks copy, and cannot check pixels.
 
 | Template | Framework | Use when |
 |---|---|---|
