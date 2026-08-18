@@ -994,7 +994,13 @@ def safe_project_file(rel):
     return full
 
 
-def compliance_notes(project="montisella"):
+def compliance_notes(project=""):
+    """This project's compliance notes, or none.
+
+    The default used to name the bundled example project, so a fresh deployment
+    with no projects of its own silently showed somebody else's medical-claim
+    rules as though they were its own.
+    """
     try:
         cfg = json.load(open(os.path.join(ROOT, "projects", project, "project.json"),
                              encoding="utf-8"))
