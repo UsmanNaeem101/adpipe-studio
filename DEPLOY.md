@@ -79,6 +79,13 @@ write goes through Postgres and Supabase Storage instead of the disk — the vol
 becomes optional and the service is no longer pinned to one machine. Leave them
 unset and nothing changes.
 
+Everything a project is made of goes there: the project's own `project.json` and
+`facts.json`, the VOC corpora, the stage-06 evidence files (imported or produced),
+every extraction, the PICC cards, the concepts, the briefs, the product sheets and
+their segment sheets, and the rendered ads. What stays on the disk is what has to
+be: the credential store, the page Chromium screenshots, and the templates and
+skills that ship inside the image and are never written.
+
 Text goes in a table, so a brief or a product sheet stays readable in the table
 editor. Anything over **512KB** goes to the `adpipe-media` bucket instead, with a
 marker row left behind so listings still answer from one place. That threshold
