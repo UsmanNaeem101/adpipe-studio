@@ -1666,6 +1666,10 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 
 <!-- ================= PIPELINE ================= -->
 <section id=t-pipeline class=hide>
+  <div class=card id=storagewarn style="display:none;border-color:var(--signal)">
+    <b id=storagewarnhead style="color:var(--signal)"></b>
+    <p class=hint id=storagewarnline style="margin:6px 0 0"></p>
+  </div>
   <div class=card>
     <h2>Run a stage</h2>
     <div class=row style="margin-bottom:16px">
@@ -1962,6 +1966,7 @@ $$('.tab').forEach(b=>b.onclick=()=>{
   if(b.dataset.t==='settings' && typeof renderProjectList==='function'){
     renderProjectList(); renderStorage();
   }
+  if(b.dataset.t==='pipeline') checkStorageBeforeSpending();
   if(b.dataset.t==='product' && typeof loadProducts==='function'){ loadProducts(); renderNewProduct(); loadNewProjectPicker(); }
 });
 
@@ -3744,6 +3749,28 @@ $('#limportfile')&&($('#limportfile').onchange=async e=>{
   $('#lstate').innerHTML+=` · imported ${r.saved.length}`+(r.failed.length?` · ${r.failed.length} failed`:'');
 });
 
+
+/* The warning belongs here rather than only in Settings, because this is the
+   tab where money is spent. Twenty extractions across thirty-seven segments is
+   a real bill, and finding out afterwards that it was written to a disk the
+   next deploy discards is the one outcome worth interrupting someone for. */
+async function checkStorageBeforeSpending(){
+  const box=$('#storagewarn'), line=$('#storagewarnline'); if(!box)return;
+  let s; try{ s=await (await fetch('/storage')).json(); }catch(e){ return; }
+  if(s.kind!=='local' && s.ok){ box.style.display='none'; return; }
+  box.style.display='';
+  // A volume keeps the work; it is worth saying where it is going, but saying
+  // "this will not be kept" about a volume would be plainly untrue, and a
+  // warning that is wrong once stops being read.
+  const head=$('#storagewarnhead');
+  if(head) head.textContent = s.durable
+    ? '⚠ This work is not going to Supabase'
+    : '⚠ This work will not be kept';
+  line.innerHTML = s.kind==='local'
+    ? `${s.detail}<br>Stages will run and their output will be written here. `+
+      `Check <b>Settings → Where this is saved</b> before spending on a long one.`
+    : `<b>Supabase is configured but not working.</b> ${s.detail}`;
+}
 
 /* ================= where this is saved =================
    The one question that costs money to get wrong. A project on the container's
