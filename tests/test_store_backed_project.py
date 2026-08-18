@@ -248,6 +248,69 @@ class ImportAndExtractTests(StoreBackedProject):
         self.assertIn("3pm", merged)
 
 
+class TheImageIsNotAProjectTests(StoreBackedProject):
+    """What the underlay is for, and what it must never answer.
+
+    Reads fall through to the container image so the skills, ad templates and
+    reference ads are visible without being copied into the store. A project is
+    not that: it is written by whoever is using the app, and the only durable
+    place for it is the store.
+
+    Merged, the two made a project sitting on the container's own disk look
+    exactly like one safely in Postgres — the app listed its segments, that read
+    as "it worked", and the next deploy took it. The cost of getting this wrong
+    is not the project: it is the twenty paid extractions somebody runs against
+    it first.
+    """
+
+    def ghost(self, name="ghost"):
+        """A project that exists only on the disk, as a pre-Supabase import did."""
+        evidence = os.path.join(self.project(name), "research", "evidence")
+        os.makedirs(evidence, exist_ok=True)
+        with open(os.path.join(self.project(name), "project.json"), "w") as fh:
+            fh.write('{"name": "%s"}' % name)
+        for slug in ("01_desk_workers", "02_new_parents"):
+            with open(os.path.join(evidence, slug + ".txt"), "w") as fh:
+                fh.write("DESK WORKERS\nverbatim\n")
+
+    def test_a_project_only_on_the_disk_is_not_listed(self):
+        self.ghost()
+        self.assertEqual(self.supabase.rows, {})
+        self.assertEqual(app.projects(), [])
+
+    def test_its_segments_are_not_listed_either(self):
+        # This is the specific claim somebody checks before running extract.
+        self.ghost()
+        self.assertEqual(app.segments("ghost"), [])
+
+    def test_its_files_do_not_read_back(self):
+        self.ghost()
+        self.assertIsNone(store_module.read_json(
+            os.path.join(self.project("ghost"), "project.json")))
+        self.assertFalse(store_module.exists(self.project("ghost")))
+
+    def test_the_skills_still_come_from_the_image(self):
+        # The other half of the same rule: everything outside projects/ still
+        # falls through, which is the only reason extract can find skill 07.
+        import cli
+
+        name, body = cli.skill(7)
+        self.assertTrue(name.startswith("07_"))
+        self.assertGreater(len(body), 100)
+
+    def test_templates_and_references_still_come_from_the_image(self):
+        self.assertGreater(
+            len(store_module.names_in(os.path.join(ROOT, "pipeline", "templates"))), 0)
+        self.assertTrue(store_module.exists(os.path.join(ROOT, "skills")))
+
+    def test_a_real_project_is_unaffected(self):
+        app.create_project("probe", "cushions", "desk workers")
+        self.assertEqual(app.projects(), ["probe"])
+        self.assertEqual(
+            store_module.read_json(
+                os.path.join(self.project(), "project.json"))["name"], "probe")
+
+
 class UploadThenImportTests(StoreBackedProject):
     """The browser's route from a ChatGPT export to evidence files.
 

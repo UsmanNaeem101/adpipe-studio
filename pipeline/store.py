@@ -67,6 +67,30 @@ def is_binary_key(key):
     return key.lower().endswith(BINARY_SUFFIXES)
 
 
+# What the image never ships, and so must never be answered from it.
+#
+# The underlay exists for read-only material that arrives inside the container:
+# the skills, the ad templates, the reference ads. A project is not that. It is
+# written by whoever is using the app, and on a deployment the only durable
+# place for it is the store.
+#
+# Merging the two under here made a project held on the container's own disk —
+# an import that ran before Supabase was configured, or any write that still
+# bypasses the store — indistinguishable from one safely in Postgres. The app
+# listed its segments, the person read that as "it worked", and the next deploy
+# took it. Answering "not there" is the honest answer and it arrives before the
+# money is spent rather than after.
+PROJECT_PREFIX = "projects/"
+
+
+def is_project_state(key):
+    # The bare prefix counts. "projects" is how the listing that builds the
+    # project list is asked, and matching only "projects/..." let that one
+    # listing — the one that answers "is my work here?" — still merge the disk.
+    tidy = normalise(key)
+    return tidy == PROJECT_PREFIX.rstrip("/") or tidy.startswith(PROJECT_PREFIX)
+
+
 def data_root():
     """
     The directory keys are relative to.
@@ -287,7 +311,7 @@ class SupabaseStore:
                 return True
             if self.list_keys(given):
                 return True
-        return self.underlay.exists(given)
+        return False if is_project_state(given) else self.underlay.exists(given)
 
     def read_text(self, key):
         # The key as asked is kept for the underlay. Normalising strips the data
@@ -303,10 +327,10 @@ class SupabaseStore:
             "GET", "?key=eq.%s&select=content" % urllib.parse.quote(key, safe="")
         )
         if status != 200:
-            return self.underlay.read_text(given)
+            return self._beneath(given, "read_text")
         rows = json.loads(payload or b"[]")
         if not rows:
-            return self.underlay.read_text(given)
+            return self._beneath(given, "read_text")
         content = rows[0]["content"]
         if isinstance(content, str) and content.startswith(OVERFLOW_PREFIX):
             status, payload = self._request("GET", self._object_path(key))
@@ -323,7 +347,7 @@ class SupabaseStore:
             text = self.read_text(given)
             return None if text is None else text.encode("utf-8")
         status, payload = self._request("GET", self._object_path(key))
-        return payload if status == 200 else self.underlay.read_bytes(given)
+        return payload if status == 200 else self._beneath(given, "read_bytes")
 
     # -- writes -----------------------------------------------------------
 
@@ -446,7 +470,8 @@ class SupabaseStore:
                 keys.add(given + "/" + rest)
             else:
                 keys.add(key)
-        keys.update(self.underlay.list_keys(prefix))
+        if not is_project_state(given):
+            keys.update(self.underlay.list_keys(prefix))
         return sorted(keys)
 
     def stat(self, key):
@@ -467,14 +492,14 @@ class SupabaseStore:
             status, payload = self._request("GET", self._object_path(tidy))
             if status == 200:
                 return {"size": len(payload), "mtime": 0}
-            return self.underlay.stat(given)
+            return self._beneath(given, "stat")
 
         status, payload = self._rest(
             "GET",
             "?key=eq.%s&select=content,updated_at" % urllib.parse.quote(tidy, safe=""))
         rows = json.loads(payload or b"[]") if status == 200 else []
         if not rows:
-            return self.underlay.stat(given)
+            return self._beneath(given, "stat")
 
         content = rows[0].get("content") or ""
         if isinstance(content, str) and content.startswith(OVERFLOW_PREFIX):
@@ -485,6 +510,12 @@ class SupabaseStore:
         else:
             size = len(content.encode("utf-8"))
         return {"size": size, "mtime": _epoch(rows[0].get("updated_at"))}
+
+    def _beneath(self, key, method):
+        """The image, unless the key is a project's own state. See is_project_state."""
+        if is_project_state(key):
+            return None
+        return getattr(self.underlay, method)(key)
 
     def _object_path(self, key):
         return "/storage/v1/object/%s/%s" % (self.bucket, urllib.parse.quote(key))
