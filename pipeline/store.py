@@ -511,6 +511,34 @@ class SupabaseStore:
             size = len(content.encode("utf-8"))
         return {"size": size, "mtime": _epoch(rows[0].get("updated_at"))}
 
+    def health(self):
+        """One request, and it distinguishes the ways this is usually wrong.
+
+        A missing table, a rejected key and an unreachable host all look the
+        same from inside the app — an empty project list — and all three are
+        settings somebody can fix in a minute once told which.
+        """
+        host = self.url.split("//")[-1].split(".")[0]
+        try:
+            status, payload = self._rest("GET", "?select=key&limit=1")
+        except Exception as error:
+            return {"kind": "supabase", "ok": False, "where": host,
+                    "detail": "cannot reach Supabase: %s" % error}
+        if status == 200:
+            return {"kind": "supabase", "ok": True, "where": host,
+                    "detail": "projects are held in Supabase; no volume needed"}
+        if status in (401, 403):
+            return {"kind": "supabase", "ok": False, "where": host,
+                    "detail": "Supabase rejected the key — SUPABASE_SERVICE_ROLE_KEY "
+                              "must be the service_role key, not the anon key"}
+        if status in (404, 400):
+            return {"kind": "supabase", "ok": False, "where": host,
+                    "detail": "the %s table is not there — run the migration in "
+                              "supabase/migrations/" % self.table}
+        return {"kind": "supabase", "ok": False, "where": host,
+                "detail": "Supabase answered %s: %s" % (status, payload[:120].decode(
+                    "utf-8", "replace"))}
+
     def _beneath(self, key, method):
         """The image, unless the key is a project's own state. See is_project_state."""
         if is_project_state(key):
@@ -519,6 +547,23 @@ class SupabaseStore:
 
     def _object_path(self, key):
         return "/storage/v1/object/%s/%s" % (self.bucket, urllib.parse.quote(key))
+
+
+def health(store_object=None):
+    """Is this store actually usable, and can it say why not?
+
+    Read-only on purpose. The startup banner answers the same question by
+    writing a boot record, which is right once per process and wrong for
+    anything a page can ask — and "where is my work going?" is exactly the
+    question somebody wants to ask without redeploying to read a log.
+    """
+    target = store_object or store()
+    if target.kind == "local":
+        root = target.root
+        return {"kind": "local", "ok": os.access(root, os.W_OK),
+                "where": root,
+                "detail": "the filesystem — a container discards this on deploy"}
+    return target.health()
 
 
 def build_store(environ=None):
