@@ -1459,6 +1459,29 @@ def _as_result(value):
 # whether it ran as one call or eighty.
 BUDGET_RETRY_FACTOR = 3
 
+# What one extraction is allowed to write, and how much of that thinking may
+# take. Both are defaults; project.json overrides either, and the Project
+# settings panel edits them.
+#
+# The share exists because reasoning and answer come out of ONE allowance. A
+# model left unbounded can spend the lot deciding what to say: a real run
+# reported 16,000 completion tokens of which 16,000 were reasoning and 0 were
+# answer, and raising the total only bought it more room to think in. Bounding
+# the reasoning half is what turns "the answer will probably fit" into "the
+# answer's room was never the model's to spend".
+EXTRACTION_MAX_TOKENS = 16000
+REASONING_SHARE_PERCENT = 40
+
+
+def extraction_budget(cfg):
+    """(total output tokens, ceiling on the reasoning half or None)."""
+    model = cfg.get("model") or {}
+    total = int(model.get("extraction_max_tokens") or EXTRACTION_MAX_TOKENS)
+    share = model.get("reasoning_share")
+    share = REASONING_SHARE_PERCENT if share is None else int(share)
+    # 0 is a real answer: leave the model's own default in charge.
+    return total, (int(total * share / 100) if share > 0 else None)
+
 # What a truncated extraction says about itself, in the file.
 #
 # Downstream stages read these as evidence and cannot tell a complete answer
@@ -5444,6 +5467,7 @@ def cmd_extract(cfg, args):
     print(f"  reading {label}: {source}")
     out = paths.extractions(cfg["_dir"], args.segment); os.makedirs(out, exist_ok=True)
 
+    budget, reasoning_cap = extraction_budget(cfg)
     picked = chosen_extractors(args)
     print(f"  {len(picked)} of {len(EXTRACTORS)} dimensions: "
           + ", ".join(SKILL_TITLES.get(n, str(n)) for n in picked))
@@ -5467,7 +5491,7 @@ def cmd_extract(cfg, args):
             f"{body}\n\n---\n\nApply this skill to the segment file. Output only the "
             f"skill's specified artefact in Markdown — no preamble, no meta-commentary."
             + (PACK_READING_RULE if layer == "pack" else "")
-        ), max_tokens=16000))
+        ), max_tokens=budget, reasoning_max_tokens=reasoning_cap))
 
     if not jobs:
         print(f"  all {len(picked)} selected extractions already present "
@@ -5515,7 +5539,12 @@ def cmd_extract(cfg, args):
             wider = c.one_result(
                 corpus, PREAMBLE, job.prompt, budget, job.schema,
                 job_id=job.id,
-                operation=f"extraction_short_retry_{attempt}")
+                operation=f"extraction_short_retry_{attempt}",
+                # Scaled with the budget, because a retry that raises the total
+                # and drops the ceiling is a retry that thinks three times as
+                # long and still writes nothing.
+                reasoning_max_tokens=(int(budget * reasoning_cap / job.max_tokens)
+                                      if reasoning_cap else None))
             if wider.text and wider.text.strip() and not wider.out_of_budget:
                 results[job.id] = wider.text
                 print(f"    {job.id}: recovered on retry {attempt}")
