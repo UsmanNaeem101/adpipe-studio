@@ -225,3 +225,86 @@ class TruncatedExtractionTests(ExtractRetryTests):
 
         self.assertEqual(fake.one_calls, [])
         self.assertEqual(written, "# Pain points\n- one")
+
+
+class OutputBudgetTests(unittest.TestCase):
+    """Reasoning and answer come out of one allowance.
+
+    A real run reported 16,000 completion tokens of which 16,000 were reasoning
+    and 0 were answer. The recovery raised the total to 48,000 — and, because it
+    passed no ceiling, bought the model three times as much room to think in and
+    still no obligation to write. Bounding the reasoning half is the fix; a
+    bigger number on its own is not.
+    """
+
+    def test_the_default_leaves_most_of_the_budget_for_the_answer(self):
+        total, cap = cli.extraction_budget({})
+        self.assertEqual(total, cli.EXTRACTION_MAX_TOKENS)
+        self.assertLess(cap, total / 2)
+
+    def test_a_project_can_raise_the_budget(self):
+        # Raising it costs nothing by itself: output is billed per token
+        # actually written, and a budget too small is how an answer stops
+        # mid-list.
+        total, _ = cli.extraction_budget({"model": {"extraction_max_tokens": 40000}})
+        self.assertEqual(total, 40000)
+
+    def test_a_share_of_zero_hands_the_decision_back_to_the_model(self):
+        # Not "no reasoning" — no ceiling. Some models need their own default.
+        _, cap = cli.extraction_budget({"model": {"reasoning_share": 0}})
+        self.assertIsNone(cap)
+
+    def test_the_share_is_of_the_configured_budget_not_the_default(self):
+        total, cap = cli.extraction_budget(
+            {"model": {"extraction_max_tokens": 32000, "reasoning_share": 25}})
+        self.assertEqual((total, cap), (32000, 8000))
+
+
+class ReasoningCeilingTravelsTests(ExtractRetryTests):
+    """The ceiling has to reach the request, on the first try and the retry."""
+
+    class Recording(FakeClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.jobs_seen = []
+
+        def batch(self, corpus, preamble, jobs):
+            self.jobs_seen.extend(jobs)
+            return super().batch(corpus, preamble, jobs)
+
+        def one_result(self, corpus, preamble, prompt, max_tokens=16000,
+                       schema=None, job_id="single", operation="pipeline_single",
+                       effort=None, reasoning_max_tokens=None):
+            self.one_calls.append((job_id, operation, max_tokens,
+                                   reasoning_max_tokens))
+            nxt = self.retry_texts.pop(0)
+            text, stop = nxt if isinstance(nxt, tuple) else (nxt, "end_turn")
+            return llm.BatchResult(text=text, stop_reason=stop)
+
+    def test_the_first_request_carries_a_reasoning_ceiling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.project(tmp)
+            fake = self.Recording(
+                batch_text=llm.BatchResult("# Pain points\n- one", "stop"))
+            self.run_extract(cfg, fake)
+
+        job = fake.jobs_seen[0]
+        self.assertEqual(job.max_tokens, cli.EXTRACTION_MAX_TOKENS)
+        self.assertTrue(job.reasoning_max_tokens)
+        self.assertLess(job.reasoning_max_tokens, job.max_tokens)
+
+    def test_the_retry_raises_the_total_and_keeps_the_ceiling(self):
+        # The specific failure: 3x the room and no bound is 3x the thinking.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.project(tmp)
+            fake = self.Recording(batch_text=llm.BatchResult("", "length"),
+                                  retry_texts=["# Pain points\nRecovered"])
+            self.run_extract(cfg, fake)
+
+        _job, _op, max_tokens, ceiling = fake.one_calls[0]
+        self.assertEqual(max_tokens, cli.EXTRACTION_MAX_TOKENS * cli.BUDGET_RETRY_FACTOR)
+        self.assertTrue(ceiling, "the retry dropped the reasoning ceiling")
+        # Scaled with the budget, so the answer keeps the same share of a
+        # bigger allowance rather than a shrinking one.
+        self.assertEqual(ceiling, cli.extraction_budget({})[1] * cli.BUDGET_RETRY_FACTOR)
+        self.assertLess(ceiling, max_tokens)

@@ -129,8 +129,20 @@ FIELDS = [
      "options": ["low", "medium", "high", "xhigh", "max"], "default": "high",
      "group": "Model", "label": "Reasoning effort"},
     {"path": ["model", "provider"], "kind": "choice",
-     "options": ["anthropic", "openrouter"], "default": "anthropic",
+     "options": ["anthropic", "openrouter", "deepseek"], "default": "anthropic",
      "group": "Model", "label": "Provider"},
+    {"path": ["model", "extraction_max_tokens"], "kind": "int",
+     "min": 2000, "max": 200000, "default": 16000, "group": "Model",
+     "label": "Output budget per extraction",
+     "help": "Room for one skill's answer. Raising it costs nothing on its own — "
+             "output is billed per token actually written — and a budget too "
+             "small is how an extraction stops mid-list."},
+    {"path": ["model", "reasoning_share"], "kind": "int",
+     "min": 0, "max": 90, "default": 40, "group": "Model",
+     "label": "Most of that budget reasoning may take (%)",
+     "help": "Reasoning is billed from the same allowance as the answer, so a "
+             "model left unbounded can spend all of it thinking and write "
+             "nothing. 0 leaves the model's own default in charge."},
 
     # ------------------------------------------------------------------ creative
     {"path": ["creative", "awareness"], "kind": "choice",
