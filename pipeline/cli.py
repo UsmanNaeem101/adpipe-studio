@@ -1451,6 +1451,13 @@ def _as_result(value):
 # 3x the budget. Batched stages use the same factor so a stage behaves the same
 # whether it ran as one call or eighty.
 BUDGET_RETRY_FACTOR = 3
+
+# What a truncated extraction says about itself, in the file.
+#
+# Downstream stages read these as evidence and cannot tell a complete answer
+# from one that stopped mid-sentence. Neither can a person skimming it.
+TRUNCATED_MARKER = ("> INCOMPLETE: this extraction was cut off at the model's "
+                    "output limit. Treat the list above as partial.")
 MAX_BATCH_REPAIR_ATTEMPTS = 1
 
 
@@ -5470,45 +5477,75 @@ def cmd_extract(cfg, args):
     # A provider can report a successful request while returning no text. Never
     # turn that into a misleading 0-byte extraction. Retry only the affected
     # skill immediately, keeping successful batch results intact.
-    failed = []
+    failed, partial = [], []
     for job in jobs:
         result = _as_result(results.get(job.id, ""))
         results[job.id] = result.text
-        if result.text.strip():
+        if result.text.strip() and not result.out_of_budget:
             continue
-        # An empty reply because the budget went on reasoning needs more ROOM,
-        # not another identical attempt. Same lesson as the batched JSON stages,
-        # and the stop reason is what makes it knowable here too.
+
+        # Two shortfalls, one cause. An empty reply means the budget went
+        # entirely on reasoning; a non-empty one that stopped at the budget
+        # means the answer was cut off partway. Both need more ROOM rather than
+        # another identical attempt, and `retryable` has always said so — but
+        # this loop only ever asked whether the text was empty, so a truncated
+        # extraction was written out and counted as a success. It is the worse
+        # of the two: an empty file is obvious, and one that stops mid-sentence
+        # reads as complete to everything downstream.
+        cut_off = bool(result.text.strip())
         budget = (job.max_tokens * BUDGET_RETRY_FACTOR if result.out_of_budget
                   else job.max_tokens)
-        why = ("hit its output token budget before writing anything"
+        why = ("was cut off at its output budget partway through the answer"
+               if cut_off else
+               "hit its output token budget before writing anything"
                if result.out_of_budget else "returned no content")
         print(f"  ! {job.id} {why}; retrying immediately at {budget:,} tokens, "
               f"up to {EMPTY_EXTRACTION_RETRIES} times")
+        best = result
         for attempt in range(1, EMPTY_EXTRACTION_RETRIES + 1):
             print(f"    {job.id}: retry {attempt}/{EMPTY_EXTRACTION_RETRIES}",
                   flush=True)
-            text = c.one(
+            wider = c.one_result(
                 corpus, PREAMBLE, job.prompt, budget, job.schema,
                 job_id=job.id,
-                operation=f"extraction_empty_retry_{attempt}")
-            if text and text.strip():
-                results[job.id] = text
+                operation=f"extraction_short_retry_{attempt}")
+            if wider.text and wider.text.strip() and not wider.out_of_budget:
+                results[job.id] = wider.text
                 print(f"    {job.id}: recovered on retry {attempt}")
                 break
+            # Still short. Keep whichever attempt got furthest rather than
+            # throwing away a longer partial for a shorter one.
+            if len(wider.text or "") > len(best.text or ""):
+                best = wider
         else:
-            results.pop(job.id, None)
-            failed.append(job.id)
+            if best.text and best.text.strip():
+                results[job.id] = best.text
+                partial.append(job.id)
+                print(f"    {job.id}: still truncated — keeping the longest "
+                      f"attempt and marking it incomplete")
+            else:
+                results.pop(job.id, None)
+                failed.append(job.id)
 
     written = 0
     for job in jobs:
         text = results.get(job.id, "")
         if not text or not text.strip():
             continue
+        if job.id in partial:
+            # In the file, because the file is what the next stage reads and it
+            # will not have seen this terminal.
+            text = text.rstrip() + "\n\n" + TRUNCATED_MARKER + "\n"
         with store.open_key(names[job.id], "w", encoding="utf-8") as fh:
             fh.write(text)
         written += 1
-    print(f"\n  {written}/{len(jobs)} written -> {out}   (${c.actual_usd():.2f})")
+    note = f", {len(partial)} incomplete" if partial else ""
+    print(f"\n  {written}/{len(jobs)} written{note} -> {out}   (${c.actual_usd():.2f})")
+    if partial:
+        print(f"  ! Incomplete: {', '.join(partial)}. The model stopped at its "
+              f"output limit even at {BUDGET_RETRY_FACTOR}x the budget. Each "
+              f"file says so at the end. A model with a larger output budget, "
+              f"or --skills to rerun one at a time, is the way out.")
     if failed:
         labels = ", ".join(failed)
         raise SystemExit(
