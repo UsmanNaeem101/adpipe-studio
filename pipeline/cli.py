@@ -321,6 +321,13 @@ def client(cfg, args):
     provider = (getattr(args, "provider", None) or m.get("provider") or "anthropic").lower()
     effort = args.effort or m.get("effort", "high")
     name = getattr(args, "model", None) or m.get("id")
+    if provider == "deepseek":
+        # DeepSeek's own API. Same wire format as OpenRouter, different host,
+        # and reasoning chosen by model id rather than by a parameter — so the
+        # ceiling is declared the same way, per project.
+        import deepseek
+        return deepseek.Client(model=name or deepseek.DEFAULT_MODEL, effort=effort,
+                               max_output=m.get("max_output_tokens"))
     if provider == "openrouter":
         import openrouter
         # OpenRouter fronts hundreds of third-party routes whose output ceilings
@@ -5997,7 +6004,7 @@ def main():
     ap.add_argument("--yes", action="store_true", help="skip cost confirmations")
     ap.add_argument("--force", action="store_true", help="redo work that already exists")
     ap.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
-    ap.add_argument("--provider", choices=["anthropic", "openrouter"],
+    ap.add_argument("--provider", choices=["anthropic", "openrouter", "deepseek"],
                     help="which API to run model stages on")
     ap.add_argument("--model", help="model id, e.g. claude-opus-5 or "
                                     "deepseek/deepseek-v4-flash")
@@ -6012,7 +6019,8 @@ def main():
         # overwrites a value already parsed from the global position, so
         # `adpipe --provider openrouter extract seg` would silently fall back.
         S = argparse.SUPPRESS
-        sp.add_argument("--provider", choices=["anthropic", "openrouter"], default=S)
+        sp.add_argument("--provider", choices=["anthropic", "openrouter", "deepseek"],
+                        default=S)
         sp.add_argument("--model", default=S)
         sp.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"],
                         default=S)

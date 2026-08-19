@@ -40,6 +40,7 @@ deploy — the container filesystem does not survive one.
 | `ADPIPE_CREDENTIALS_FILE` | `/app/projects/.credentials.json` | puts the credential store **on the volume**; see below |
 | `ADPIPE_SHARED_SECRET` | a long random string | must match Topic Atlas's; see below |
 | `OPENROUTER_API_KEY` | your key | `credentials.resolve()` prefers the environment over its stored file |
+| `DEEPSEEK_API_KEY` | your key | DeepSeek's own API, rather than their models via OpenRouter |
 | `OPENAI_API_KEY` | your key | only if you use it |
 | `ANTHROPIC_API_KEY` | your key | only if you use it |
 
@@ -103,6 +104,32 @@ Both are needed. With only one set the app runs on the disk, and Settings →
 **Where this is saved** says which of the two is missing. That line is the place
 to check: it names the Supabase project when it is working, and names the remedy
 when it is not — a rejected key, a missing table, an unreachable host.
+
+### DeepSeek
+
+`--provider deepseek` (or the Pipeline tab's provider list) talks to
+api.deepseek.com directly instead of routing through OpenRouter. Two things
+differ from every other provider and both cost money to learn the hard way:
+
+- **Reasoning is the model id, not the effort setting.** `deepseek-chat` does
+  not reason; `deepseek-reasoner` does, and spends part of the same output
+  budget doing it. A 16,000-token extraction that gives 2,545 tokens to thinking
+  has 13,455 left to write with, and stops mid-list when that runs out.
+- **Structured stages get JSON mode, not a schema.** DeepSeek constrains output
+  to valid JSON without constraining its shape, so the schema is put in the
+  prompt instead. The local validation was always the real gate.
+
+Three variables override what could not be verified from the machine this was
+written on, which could not reach DeepSeek's documentation:
+
+| Variable | Default |
+|---|---|
+| `DEEPSEEK_URL` | `https://api.deepseek.com/chat/completions` |
+| `DEEPSEEK_MODEL` | `deepseek-chat` |
+| `DEEPSEEK_JSON_MODE` | `json_object` |
+
+If a request is rejected for its path, its model or its `response_format`, one
+of those three is the fix and none of them needs a deploy.
 
 **API keys do not move with it.** The credential store is a `0600` file written
 straight to disk on purpose — a secret does not belong in a shared table or

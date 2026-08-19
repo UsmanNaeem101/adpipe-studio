@@ -1746,6 +1746,7 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
       <div class=row>
         <div><label>Provider</label><select id=provider>
           <option value=openrouter selected>OpenRouter</option>
+          <option value=deepseek>DeepSeek (direct)</option>
           <option value=anthropic>Anthropic</option></select></div>
         <div><label>Model</label><input id=modelid value="deepseek/deepseek-v4-flash"></div>
       </div>
@@ -1915,6 +1916,17 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
       batch discount</b> — the corpus is re-sent on every request, so cost scales with
       requests x corpus rather than corpus + requests.</p>
 
+    <label>DeepSeek — the same models, direct</label>
+    <div class=keyrow>
+      <input type=password id=k_deepseek placeholder="sk-...">
+      <span class="pill no" id=p_deepseek>not set</span>
+    </div>
+    <p class=hint style="margin:0 0 18px">platform.deepseek.com/api_keys · billed by
+      DeepSeek rather than routed, and they discount a cached context on a repeat
+      request. Reasoning is chosen by <b>model id</b>, not by the effort setting:
+      <code>deepseek-chat</code> does not reason, <code>deepseek-reasoner</code> does —
+      and reasoning is billed out of the same output budget as the answer.</p>
+
     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
       <button class=btn id=savekeys>Save keys</button>
       <button class="btn ghost" id=clearkeys>Clear</button>
@@ -1978,30 +1990,39 @@ $$('.tab').forEach(b=>b.onclick=()=>{
 });
 
 // ---------- settings ----------
-function setPill(which,on){ const p=$('#p_'+which);
+/* The providers, once. This list was written out by hand in four places — the
+   save body, the pills after saving, the field reset, and the clear request —
+   and a fifth provider meant finding all four. The backend already derives
+   them from credentials.PROVIDER_ENV; this is the same idea on this side. */
+const KEY_PROVIDERS=['openai','anthropic','openrouter','deepseek'];
+function setPill(which,on){ const p=$('#p_'+which); if(!p)return;
   p.textContent=on?'set':'not set'; p.className='pill '+(on?'ok':'no'); }
-async function pushKeys(){
-  const body={openai:$('#k_openai').value.trim(),anthropic:$('#k_anthropic').value.trim(),
-      openrouter:$('#k_openrouter').value.trim()};
+function keyField(which){ return $('#k_'+which); }
+function showPills(j){ KEY_PROVIDERS.forEach(n=>setPill(n,j[n])); }
+function clearFields(){ KEY_PROVIDERS.forEach(n=>{ const f=keyField(n); if(f)f.value=''; }); }
+async function postKeys(body,failure){
   const r=await fetch('/keys',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)});
   const j=await r.json();
-  if(!r.ok||j.error){ $('#keymsg').textContent='Could not save keys: '+(j.error||r.status); return false; }
-  setPill('openai',j.openai); setPill('anthropic',j.anthropic);
-  setPill('openrouter',j.openrouter);
-  $('#k_openai').value=''; $('#k_anthropic').value=''; $('#k_openrouter').value='';
+  if(!r.ok||j.error){ $('#keymsg').textContent=failure+(j.error||r.status); return null; }
+  return j;
+}
+async function pushKeys(){
+  const body={};
+  KEY_PROVIDERS.forEach(n=>{ const f=keyField(n); if(f)body[n]=f.value.trim(); });
+  const j=await postKeys(body,'Could not save keys: ');
+  if(!j)return false;
+  showPills(j); clearFields();
   $('#keymsg').textContent='Saved privately for Studio and CLI · '+new Date().toLocaleTimeString();
   return true;
 }
 $('#savekeys').onclick=pushKeys;
-$('#clearkeys').onclick=async()=>{ $('#k_openai').value=''; $('#k_anthropic').value='';
-  $('#k_openrouter').value='';
-  const r=await fetch('/keys',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({clear:['openai','anthropic','openrouter']})});
-  const j=await r.json();
-  if(!r.ok||j.error){ $('#keymsg').textContent='Could not clear keys: '+(j.error||r.status); return; }
+$('#clearkeys').onclick=async()=>{
+  clearFields();
+  const j=await postKeys({clear:KEY_PROVIDERS},'Could not clear keys: ');
+  if(!j)return;
   localStorage.removeItem('adpipe_keys');
-  setPill('openai',j.openai);setPill('anthropic',j.anthropic);setPill('openrouter',j.openrouter);
+  showPills(j);
   $('#keymsg').textContent='Saved AdPipe keys cleared. Environment variables, if set, still override.'; };
 (async function(){
   // Older Studio versions kept opt-in credentials in localStorage. Move them
@@ -2024,8 +2045,7 @@ $('#clearkeys').onclick=async()=>{ $('#k_openai').value=''; $('#k_anthropic').va
   }
   fetch('/keys').then(r=>r.json()).then(j=>{
     if(j.error){ $('#keymsg').textContent='Could not read saved keys: '+j.error; return; }
-    setPill('openai',j.openai);setPill('anthropic',j.anthropic);
-    setPill('openrouter',j.openrouter);});
+    showPills(j);});
 })();
 
 // ---------- remix ----------
@@ -3384,12 +3404,23 @@ function showOpts(name){
   if(name==='concepts'||name==='run')$('#opt_concepts').hidden=false;
   if(name==='brief'||name==='run')$('#opt_brief').hidden=false;
 }
+/* Each provider gets its default model and the one thing about it that costs
+   money to learn the hard way. DeepSeek's is that effort does nothing: it picks
+   reasoning by model id, and reasoning comes out of the same output budget as
+   the answer — which is how a 16,000-token extraction spent 2,545 thinking and
+   was cut off mid-list. */
+const PROVIDER_NOTE={
+  openrouter:['deepseek/deepseek-v4-flash',
+    'Cheap per token, but <b>no prompt caching and no batch discount</b> — the corpus is re-sent on every request. Verify the exact model id at openrouter.ai/models.'],
+  deepseek:['deepseek-chat',
+    'Billed by DeepSeek directly; they discount a cached context on a repeat request. Reasoning is the <b>model id</b>, not the effort setting — <code>deepseek-chat</code> does not reason, <code>deepseek-reasoner</code> does and spends part of the output budget doing it.'],
+  anthropic:['claude-opus-5',
+    'Prompt caching + Batch API: the corpus is paid for roughly once across all 20 extractions.'],
+};
 $('#provider')&&($('#provider').onchange=()=>{
-  const or=$('#provider').value==='openrouter';
-  $('#modelid').value=or?'deepseek/deepseek-v4-flash':'claude-opus-5';
-  $('#modelhint').innerHTML=or
-    ?'Cheap per token, but <b>no prompt caching and no batch discount</b> — the corpus is re-sent on every request. Verify the exact model id at openrouter.ai/models.'
-    :'Prompt caching + Batch API: the corpus is paid for roughly once across all 20 extractions.';
+  const [model,note]=PROVIDER_NOTE[$('#provider').value]||PROVIDER_NOTE.openrouter;
+  $('#modelid').value=model;
+  $('#modelhint').innerHTML=note;
 });
 $('#provider')&&$('#provider').dispatchEvent(new Event('change'));
 

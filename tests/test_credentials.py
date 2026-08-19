@@ -65,11 +65,19 @@ class CredentialStoreTests(unittest.TestCase):
         self.assertEqual(credentials.resolve(
             "openrouter", path=self.path, environ={}), "openrouter-secret")
 
+    def expected(self, **held):
+        """Every known provider, only the named ones true.
+
+        Derived from PROVIDER_ENV rather than written out, because a provider
+        added to the store should not need this file edited to keep passing —
+        and because writing the list twice is how the two drift.
+        """
+        return {name: held.get(name, False) for name in credentials.PROVIDER_ENV}
+
     def test_store_is_private_and_status_is_redacted(self):
         secret = "sk-should-never-be-in-an-api-response"
         state = self.save(openrouter=secret)
-        self.assertEqual(state, {
-            "openai": False, "anthropic": False, "openrouter": True})
+        self.assertEqual(state, self.expected(openrouter=True))
         self.assertNotIn(secret, json.dumps(state))
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
         self.assertEqual(
@@ -79,8 +87,7 @@ class CredentialStoreTests(unittest.TestCase):
         self.save(anthropic="a", openrouter="o")
         state = credentials.update(
             {}, clear=["openrouter"], path=self.path, environ={})
-        self.assertEqual(state, {
-            "openai": False, "anthropic": True, "openrouter": False})
+        self.assertEqual(state, self.expected(anthropic=True))
 
 
 class ProviderIntegrationTests(unittest.TestCase):

@@ -102,38 +102,85 @@ def _provider_safe_schema(schema):
 
 
 class Estimate:
-    def __init__(self, jobs, corpus_tokens, prompt_tokens, out_tokens, model):
+    def __init__(self, jobs, corpus_tokens, prompt_tokens, out_tokens, model,
+                 pricing=None, label="OpenRouter", where="openrouter.ai",
+                 caching_note="re-sent on EACH request (no prompt caching)"):
         self.jobs, self.model = jobs, model
         self.corpus_tokens = corpus_tokens
         self.prompt_tokens = prompt_tokens
         self.out_tokens = out_tokens
+        # Whose price list, and whose name to print. A shared estimator that
+        # says "OpenRouter" while billing DeepSeek is worse than no estimate:
+        # the number is the thing somebody approves a spend against.
+        self.pricing = pricing or PRICING
+        self.label, self.where = label, where
+        self.caching_note = caching_note
 
     @property
     def usd(self):
-        p = PRICING.get(self.model, PRICING["_default"])
+        p = self.pricing.get(self.model, self.pricing["_default"])
         # No caching: every job re-sends the whole corpus.
         return ((self.corpus_tokens * self.jobs + self.prompt_tokens) * p["in"]
                 + self.out_tokens * p["out"]) / 1e6
 
     def explain(self):
         return (
-            f"  provider         OpenRouter\n"
+            f"  provider         {self.label}\n"
             f"  model            {self.model}\n"
             f"  requests         {self.jobs}  (no batch discount available)\n"
-            f"  corpus           {self.corpus_tokens:,} tokens, re-sent on EACH "
-            f"request (no prompt caching)\n"
+            f"  corpus           {self.corpus_tokens:,} tokens, "
+            f"{self.caching_note}\n"
             f"  instructions     {self.prompt_tokens:,} tokens\n"
             f"  est. output      {self.out_tokens:,} tokens\n"
             f"  ESTIMATE         ${self.usd:,.2f}   (list prices move — verify on "
-            f"openrouter.ai)")
+            f"{self.where})")
 
 
 class Client:
-    """Drop-in for llm.Client. Same method names so cli.py doesn't branch."""
+    """Drop-in for llm.Client. Same method names so cli.py doesn't branch.
 
-    def __init__(self, model=DEFAULT_MODEL, effort="high", verbose=True, api_key=None,
+    Also the base for any other provider speaking OpenAI chat completions.
+    Everything below that is OpenRouter's rather than the wire format's is a
+    class attribute or a hook, so a sibling changes those and inherits the rest
+    — the retry ladder, the token-ceiling recovery, the usage accounting and
+    the audit trail are the same work whoever is being asked.
+    """
+
+    # -- what a provider owns -------------------------------------------
+    PROVIDER = "openrouter"          # audit label and credential name
+    ENDPOINT = None                  # None means "the module's API constant"
+    KEY_HELP = ("No OpenRouter key. Add one on the Settings tab of the studio, or:\n"
+                "  export OPENROUTER_API_KEY=sk-or-...\n"
+                "Get one at https://openrouter.ai/keys")
+
+    def _extra_headers(self):
+        return {
+            # Observability only: this surfaces the selected endpoint and
+            # fallback attempts without influencing routing.
+            "X-OpenRouter-Metadata": "enabled",
+            "HTTP-Referer": "https://localhost/adpipe",
+            "X-Title": "adpipe",
+        }
+
+    def _apply_reasoning(self, body, reasoning):
+        """OpenRouter's own extension. A provider that picks its reasoning by
+        model id has nowhere to put this and must not send it."""
+        body["reasoning"] = reasoning
+
+    def _apply_schema(self, body, messages, schema):
+        # Require a route that supports structured output. Without
+        # require_parameters OpenRouter may select a provider that silently
+        # drops response_format, leaving the caller with prose instead of the
+        # JSON contract it asked for.
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "result", "strict": True,
+                            "schema": _provider_safe_schema(schema)}}
+        body["provider"] = {"require_parameters": True}
+
+    def __init__(self, model=None, effort="high", verbose=True, api_key=None,
                  max_output=None):
-        self.model = model or DEFAULT_MODEL
+        self.model = model or self.default_model()
         self.effort = effort
         self.verbose = verbose
         # Declared, never guessed. OpenRouter routes to third-party providers
@@ -144,15 +191,11 @@ class Client:
             # An explicit constructor value is useful to callers that already
             # resolved a key. Otherwise use the same env -> private-store
             # precedence as the Studio backend and every other CLI provider.
-            self.key = api_key or credentials.resolve("openrouter")
+            self.key = api_key or credentials.resolve(self.PROVIDER)
         except credentials.CredentialStoreError as error:
             sys.exit(str(error))
         if not self.key:
-            sys.exit(
-                "No OpenRouter key. Add one on the Settings tab of the studio, or:\n"
-                "  export OPENROUTER_API_KEY=sk-or-...\n"
-                "Get one at https://openrouter.ai/keys"
-            )
+            sys.exit(self.KEY_HELP)
         self.spent = {"in": 0, "out": 0, "reasoning": 0,
                       "cache_write": 0, "cache_read": 0}
 
@@ -193,28 +236,18 @@ class Client:
             # Without this the route reasons at its own default. This is the
             # setting whose absence broke stage 01: `effort` was accepted by the
             # constructor and then never sent.
-            body["reasoning"] = reasoning
+            self._apply_reasoning(body, reasoning)
         if schema:
-            # Require a route that supports structured output. Without
-            # require_parameters OpenRouter may select a provider that silently
-            # drops response_format, leaving the caller with prose instead of the
-            # JSON contract it asked for.
-            body["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {"name": "result", "strict": True,
-                                "schema": _provider_safe_schema(schema)}}
-            body["provider"] = {"require_parameters": True}
-        audit = auditlog.start("openrouter", self.model, operation, body, job_id,
-                               {"endpoint": API, "retries": retries})
+            self._apply_schema(body, messages, schema)
+        endpoint = self.endpoint()
+        audit = auditlog.start(self.PROVIDER, self.model, operation, body, job_id,
+                               {"endpoint": endpoint, "retries": retries})
+        headers = {"Authorization": f"Bearer {self.key}",
+                   "Content-Type": "application/json"}
+        headers.update(self._extra_headers())
         req = urllib.request.Request(
-            API, data=json.dumps(body).encode(), method="POST",
-            headers={"Authorization": f"Bearer {self.key}",
-                     "Content-Type": "application/json",
-                     # Observability only: this surfaces the selected endpoint
-                     # and fallback attempts without influencing routing.
-                     "X-OpenRouter-Metadata": "enabled",
-                     "HTTP-Referer": "https://localhost/adpipe",
-                     "X-Title": "adpipe"})
+            endpoint, data=json.dumps(body).encode(), method="POST",
+            headers=headers)
         for attempt in range(retries):
             try:
                 with urllib.request.urlopen(req, timeout=600) as r:
@@ -350,6 +383,18 @@ class Client:
                 raise
         sys.exit("  Gave up after retries.")
 
+    @classmethod
+    def default_model(cls):
+        return DEFAULT_MODEL
+
+    @classmethod
+    def endpoint(cls):
+        return cls.ENDPOINT or API
+
+    @classmethod
+    def pricing(cls):
+        return PRICING
+
     @staticmethod
     def _tokens(text):
         """No count_tokens endpoint here — approximate at ~4 chars/token. Good
@@ -359,8 +404,12 @@ class Client:
     # -------------------------------------------------------------- interface
 
     def actual_usd(self):
-        p = PRICING.get(self.model, PRICING["_default"])
+        p = self.pricing().get(self.model, self.pricing()["_default"])
         return (self.spent["in"] * p["in"] + self.spent["out"] * p["out"]) / 1e6
+
+    ESTIMATE_LABEL = "OpenRouter"
+    ESTIMATE_WHERE = "openrouter.ai"
+    CACHING_NOTE = "re-sent on EACH request (no prompt caching)"
 
     def estimate(self, corpus, preamble, jobs, batched=False):
         return Estimate(
@@ -368,7 +417,9 @@ class Client:
             corpus_tokens=self._tokens(corpus) + self._tokens(preamble),
             prompt_tokens=sum(self._tokens(j.prompt) for j in jobs),
             out_tokens=sum(int(j.max_tokens * 0.55) for j in jobs),
-            model=self.model)
+            model=self.model, pricing=self.pricing(),
+            label=self.ESTIMATE_LABEL, where=self.ESTIMATE_WHERE,
+            caching_note=self.CACHING_NOTE)
 
     def max_output_tokens(self):
         """The declared ceiling for this route, or None if none was declared."""
