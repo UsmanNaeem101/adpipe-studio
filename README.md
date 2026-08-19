@@ -141,6 +141,7 @@ adpipe                    launcher (uses .venv)
 pipeline/
   cli.py                  stage orchestrator
   llm.py                  Claude API layer — caching, batching, cost, errors
+  openrouter.py           OpenAI-shaped chat completions; deepseek.py subclasses it
   layouts.py qa.py        layout vocabulary + compliance gate
   presets.py              60 execution presets — parse, prompt block, conflicts
   templates/              shared ad layouts — read for their slots, not rendered
