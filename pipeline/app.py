@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import hmac
 import http.server
 import io
 import json
@@ -31,6 +32,7 @@ import shutil
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.parse
 import webbrowser
@@ -62,6 +64,18 @@ PORT = int(os.environ.get("STUDIO_PORT") or os.environ.get("PORT") or "8765")
 # A container has to bind 0.0.0.0 to be reachable at all, and there it sits on a
 # private network behind Topic Atlas, which is what checks the session.
 HOST = os.environ.get("STUDIO_HOST", "127.0.0.1")
+
+# The only door this service has. Topic Atlas sends the same value as
+# X-AdPipe-Token on every proxied request; on a private network, anything else
+# that can reach this port is a stranger. Unset means a laptop, where the
+# loopback bind is the door.
+SHARED_SECRET_ENV = "ADPIPE_SHARED_SECRET"
+TOKEN_HEADER = "X-AdPipe-Token"
+
+# Largest request body read before answering. Uploads arrive base64-encoded
+# JSON, so a 16MB VOC dump is ~22MB on the wire; this leaves room for a big
+# reference import while refusing to buffer a body the size of the disk.
+MAX_BODY_BYTES = int(os.environ.get("ADPIPE_MAX_BODY_BYTES") or str(96 * 1024 * 1024))
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 SIZES = {"4:5 portrait": "1024x1536", "1:1 square": "1024x1024",
          "1.91:1 landscape": "1536x1024"}
@@ -136,6 +150,16 @@ def segments(project):
 
 
 SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
+
+# What a /run option may look like on its way to the CLI's argv: a model id,
+# a preset number, a segment slug, a skill list. No leading dash — argparse
+# would read "--force" as a flag, not a value — no control characters, and a
+# length no real value approaches.
+SAFE_OPTION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/,@+=-]{0,199}$")
+
+# Stages in flight, by project, under _lock. Two runs on one project race on
+# the same output files, and neither would know the other had won.
+_running = {}
 
 # What a name may be made of, and how a rejection explains itself.
 #
@@ -483,6 +507,18 @@ def project_archive(name):
         raise ValueError(f"no project {name!r}")
     filename, blob, count = archive.bundle(os.path.join(ROOT, "projects", name), name)
     return filename, blob, count
+
+
+def project_archive_file(name):
+    """The same zip, written to a temporary file the caller streams and removes.
+
+    A project archive runs to hundreds of megabytes, and holding it in memory
+    once for the zip and again for the response body is what took the server
+    down on the projects big enough to be worth backing up.
+    """
+    if name not in projects():
+        raise ValueError(f"no project {name!r}")
+    return archive.bundle_to_file(os.path.join(ROOT, "projects", name), name)
 
 
 def project_cleanup(name):
@@ -856,6 +892,9 @@ _dims_mem = None
 
 
 def _dims_cache():
+    """The cache dict. Callers hold `_lock` while reading or writing it: the
+    server is threaded, and two /library requests racing on a plain dict
+    lose entries or dump a half-written one to disk."""
     global _dims_mem
     if _dims_mem is None:
         try:
@@ -868,7 +907,10 @@ def _dims_cache():
 def _dims_save():
     try:
         os.makedirs(os.path.dirname(DIMCACHE), exist_ok=True)
-        json.dump(_dims_mem, open(DIMCACHE, "w", encoding="utf-8"))
+        with _lock:
+            snapshot = json.dumps(_dims_mem)
+        with open(DIMCACHE, "w", encoding="utf-8") as fh:
+            fh.write(snapshot)
     except Exception:
         pass
 
@@ -978,13 +1020,15 @@ def library():
             w, h = image_dims(full)
             fmt = real_format(full)
             if not w:
-                cache = _dims_cache()
                 key = f"{rel}:{os.path.getmtime(full):.0f}"
-                if key in cache:
-                    w, h = cache[key]
+                with _lock:
+                    hit = _dims_cache().get(key)
+                if hit:
+                    w, h = hit
                 else:
                     w, h = sips_dims(full)
-                    cache[key] = [w, h]
+                    with _lock:
+                        _dims_cache()[key] = [w, h]
                     dirty = True
             digest = hashlib.sha256(store.read_bytes(full) or b"").hexdigest()
             hashes.setdefault(digest, []).append(rel)
@@ -1072,6 +1116,40 @@ def safe_project_file(rel):
     if not full.startswith(base + os.sep) or not store.exists(full):
         raise remix.RemixError("path outside projects/")
     return full
+
+
+def import_source(project, source):
+    """The zip or folder an import reads, confined to the project importing it.
+
+    The path comes from the browser, and the stage copies whatever it names
+    into the project — where the file endpoint then serves it. Existence was
+    the only check, so the credential store or /proc/self/environ was one
+    request from being readable. Stricter than safe_project_file on purpose:
+    another project's export is not this project's to adopt either.
+    """
+    base = os.path.realpath(os.path.join(ROOT, "projects", project))
+    full = os.path.realpath(os.path.join(ROOT, source))
+    if not full.startswith(base + os.sep):
+        raise remix.RemixError("Import source must be inside this project.")
+    if not (store.exists(full) or os.path.isdir(full)):
+        raise remix.RemixError("Import source not found.")
+    return full
+
+
+def _stop(proc, grace=10):
+    """End a child CLI that nobody is waiting on any more, and reap it."""
+    if proc is None:
+        return
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def compliance_notes(project=""):
@@ -1968,6 +2046,11 @@ Calm premium bedding brand, deep green accent. Spell 'Montisella' exactly."></te
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 var LIB,LSEL,LDUPE,SKILLS,SKILLMAP={};
+// Every value that reaches innerHTML and did not originate in this script goes
+// through here: filenames, preset text, model output, error messages. The page
+// is served on Topic Atlas's origin, so markup in a label would run with its
+// session, not on a throwaway one.
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 // ---------- tabs ----------
 $$('.tab').forEach(b=>b.onclick=()=>{
@@ -2068,7 +2151,7 @@ fetch('/references').then(r=>r.json()).then(refs=>{
   for(const [cat,files] of Object.entries(refs)){
     const nice=cat.replace(/^\d+_/,'').replace(/_/g,' ');
     const box=document.createElement('div'); box.className='cat';
-    box.innerHTML=`<h3>${nice} · ${files.length}</h3>`;
+    box.innerHTML=`<h3>${esc(nice)} · ${files.length}</h3>`;
     const g=document.createElement('div'); g.className='thumbs';
     files.forEach(fn=>{ const rel=cat+'/'+fn;
       const t=document.createElement('div'); t.className='thumb';
@@ -2112,13 +2195,13 @@ function describePreset(note){
   const p=PRESETS[$('#preset_sel').value], w=$('#presetwhy');
   if(!p){ w.textContent='No preset — the image model decides execution from your '+
     'brief and the reference alone.'; return; }
-  w.innerHTML=(note?`<b style=color:var(--accent)>${note}</b><br>`:'')+
-    `<b>${p.name}</b> — ${p.purpose}`+
-    (p.reaction?`<br><i>Reader should think: “${p.reaction}”</i>`:'')+
-    `<br><span style=color:var(--soft)>${p.visual['Visual Style']} · hero:
-      ${p.visual['Hero Image Type']} · people: ${p.visual['Human Presence']} ·
-      product: ${p.visual['Product Visibility']} · density:
-      ${p.visual['Information Density']}</span>`;
+  w.innerHTML=(note?`<b style=color:var(--accent)>${esc(note)}</b><br>`:'')+
+    `<b>${esc(p.name)}</b> — ${esc(p.purpose)}`+
+    (p.reaction?`<br><i>Reader should think: “${esc(p.reaction)}”</i>`:'')+
+    `<br><span style=color:var(--soft)>${esc(p.visual['Visual Style'])} · hero:
+      ${esc(p.visual['Hero Image Type'])} · people: ${esc(p.visual['Human Presence'])} ·
+      product: ${esc(p.visual['Product Visibility'])} · density:
+      ${esc(p.visual['Information Density'])}</span>`;
 }
 /* Debounced: selecting layouts fires this on every click. */
 function refreshConflicts(){ clearTimeout(cfTimer); cfTimer=setTimeout(doConflicts,180); }
@@ -2142,9 +2225,9 @@ async function doConflicts(){
     agg.get(k).files.push(rel.split('/').pop());
   }));
   $('#cflist').innerHTML=[...agg.values()].map(a=>
-    `<div style=margin-bottom:7px>· <b>${a.lever}</b> (${a.value}) — ${a.note}
+    `<div style=margin-bottom:7px>· <b>${esc(a.lever)}</b> (${esc(a.value)}) — ${esc(a.note)}
       <span style=color:var(--soft)>[${a.files.length} layout${a.files.length>1?'s':''}:
-      ${a.files.slice(0,2).join(', ')}${a.files.length>2?', …':''}]</span></div>`).join('');
+      ${esc(a.files.slice(0,2).join(', '))}${a.files.length>2?', …':''}]</span></div>`).join('');
 }
 $('#presetauto').onclick=async()=>{
   const b=$('#presetauto'); b.disabled=true; const was=b.textContent;
@@ -2155,11 +2238,11 @@ $('#presetauto').onclick=async()=>{
       body:JSON.stringify({project:$('#rx_proj').value,segment:$('#rx_seg').value,
         brief:$('#brief').value.trim(),
         reference:selected.size?[...selected.keys()][0]:''})})).json();
-    if(j.error){ $('#presetwhy').innerHTML=`<b style=color:var(--signal)>⚠ ${j.error}</b>`; }
+    if(j.error){ $('#presetwhy').innerHTML=`<b style=color:var(--signal)>⚠ ${esc(j.error)}</b>`; }
     else{ $('#preset_sel').value=j.id;
       describePreset(`AI picked ${j.id} ${j.name} (${j.model}) — ${j.why}`);
       refreshConflicts(); }
-  }catch(e){ $('#presetwhy').innerHTML=`<b style=color:var(--signal)>⚠ ${e}</b>`; }
+  }catch(e){ $('#presetwhy').innerHTML=`<b style=color:var(--signal)>⚠ ${esc(e)}</b>`; }
   b.disabled=false; b.textContent=was;
 };
 
@@ -2204,28 +2287,27 @@ function renderLevers(){
     const wrap=document.createElement('div'); wrap.className='lev';
     const req=d.required?'<span class=req>*</span> ':'';
     if(!d.present){
-      wrap.innerHTML=`<label>${req}${d.label}</label>
+      wrap.innerHTML=`<label>${req}${esc(d.label)}</label>
         <small>not extracted — skill ${String(d.skill).padStart(2,'0')} hasn't run</small>`;
       box.appendChild(wrap); return;
     }
     if(!d.items.length){
-      wrap.innerHTML=`<label>${req}${d.label}</label>
+      wrap.innerHTML=`<label>${req}${esc(d.label)}</label>
         <small>⚠ file present but no items could be read —
         <a href="/file?path=${encodeURIComponent(d.file)}" target=_blank>open it</a></small>`;
       box.appendChild(wrap); return;
     }
     const opts=d.items.map(i=>`<option value="${esc(i.name)}">${esc(i.name)}</option>`).join('');
-    wrap.innerHTML=`<label>${req}${d.label} <span style="color:var(--soft);font-weight:400">
+    wrap.innerHTML=`<label>${req}${esc(d.label)} <span style="color:var(--soft);font-weight:400">
       (${d.items.length})</span></label>`+
-      (d.multi?`<select multiple size=${Math.min(4,d.items.length)} data-dim="${d.key}">${opts}</select>`
-             :`<select data-dim="${d.key}"><option value="">—</option>${opts}</select>`);
+      (d.multi?`<select multiple size=${Math.min(4,d.items.length)} data-dim="${esc(d.key)}">${opts}</select>`
+             :`<select data-dim="${esc(d.key)}"><option value="">—</option>${opts}</select>`);
     const sel=wrap.querySelector('select');
     sel.onchange=()=>{ wrap.classList.toggle('set',!!picked(sel).length); refreshRemix(); };
     box.appendChild(wrap);
   });
   refreshRemix();
 }
-const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const picked=sel=>[...sel.selectedOptions].map(o=>o.value).filter(Boolean);
 function chosenLevers(){
   const out={};
@@ -2243,11 +2325,11 @@ let LVSCHEMA=[];
 fetch('/leverschema').then(r=>r.json()).then(j=>{
   LVSCHEMA=j.groups||[];
   const box=$('#lvbox');
-  if(j.error){ box.innerHTML=`<p class=hint>⚠ ${j.error}</p>`; return; }
+  if(j.error){ box.innerHTML=`<p class=hint>⚠ ${esc(j.error)}</p>`; return; }
   box.innerHTML='';
   LVSCHEMA.forEach(g=>{
     const d=document.createElement('details'); d.className='lvg';
-    d.innerHTML=`<summary>${g.label}<span class=lvn data-g="${esc(g.label)}"></span></summary>`;
+    d.innerHTML=`<summary>${esc(g.label)}<span class=lvn data-g="${esc(g.label)}"></span></summary>`;
     const body=document.createElement('div'); body.className='body';
     g.levers.forEach(l=>{
       const row=document.createElement('div'); row.className='lev';
@@ -2418,22 +2500,22 @@ $('#pmgo').onclick=async()=>{
       const r=await fetch('/generate',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify(body)});
       const j=await r.json();
-      if(j.error) cards[i].innerHTML=`<div class=err>✕ ${j.error}</div>`;
+      if(j.error) cards[i].innerHTML=`<div class=err>✕ ${esc(j.error)}</div>`;
       else{ const nm=rel.split('/').pop().replace(/\.[^.]+$/,'');
         const badge = j.meta
           ? `<div style="font-size:11px;padding:5px 8px;border-radius:6px;margin-top:6px;
                background:${j.meta.stripped?'var(--accent-soft)':'var(--surface)'};
                color:${j.meta.stripped?'var(--accent)':'var(--soft)'}"
                title="Publishing hygiene only — does not remove C2PA credentials and does not defeat AI detection.">
-               ${j.meta.stripped?'✓':'—'} ${j.meta.detail}</div>`
+               ${j.meta.stripped?'✓':'—'} ${esc(j.meta.detail)}</div>`
           : '';
         const pres = j.preset
           ? `<div style="font-size:11px;padding:5px 8px;border-radius:6px;margin-top:6px;
-               background:var(--accent-soft);color:var(--accent)">▣ ${j.preset}</div>`
+               background:var(--accent-soft);color:var(--accent)">▣ ${esc(j.preset)}</div>`
           : '';
-        cards[i].innerHTML=`<img src="${j.image}"><div class=meta><span>${esc(nice)}</span>`+
-          `<a download="remix_${nm}.png" href="${j.image}">download</a></div>${pres}${badge}`;}
-    }catch(e){ cards[i].innerHTML=`<div class=err>✕ ${e}</div>`; }
+        cards[i].innerHTML=`<img src="${esc(j.image)}"><div class=meta><span>${esc(nice)}</span>`+
+          `<a download="remix_${esc(nm)}.png" href="${esc(j.image)}">download</a></div>${pres}${badge}`;}
+    }catch(e){ cards[i].innerHTML=`<div class=err>✕ ${esc(e)}</div>`; }
   }
   $('#go').disabled=false;
 };
@@ -3057,9 +3139,9 @@ let stage=null;
 const STAGES=__STAGES__;
 (function(){ const el=$('#stages');
   STAGES.forEach(s=>{ const d=document.createElement('div'); d.className='stage';
-    d.innerHTML=`<b>${s.name}</b><small>${s.desc}</small>`+
+    d.innerHTML=`<b>${esc(s.name)}</b><small>${esc(s.desc)}</small>`+
       (s.costs?'<div class=costs>COSTS API CREDIT</div>':'')+
-      `<div class=stageskills id=sk-${s.name}></div>`;
+      `<div class=stageskills id="sk-${esc(s.name)}"></div>`;
     d.onclick=()=>{ stage=s; $$('.stage').forEach(x=>x.classList.remove('on'));
       d.classList.add('on'); $('#ingestbox').classList.toggle('hide',!s.source);
       const showSeg = s.name==='segment';
@@ -3078,13 +3160,13 @@ const STAGES=__STAGES__;
     el.appendChild(d);});
 })();
 fetch('/projects').then(r=>r.json()).then(j=>{
-  const p=$('#proj'); p.innerHTML=j.projects.map(x=>`<option>${x}</option>`).join('');
+  const p=$('#proj'); p.innerHTML=j.projects.map(x=>`<option>${esc(x)}</option>`).join('');
   p.onchange=loadSegs; loadSegs();
 });
 async function loadSegs(){
   const r=await fetch('/segments?project='+encodeURIComponent($('#proj').value));
   const j=await r.json();
-  $('#seg').innerHTML=j.segments.length?j.segments.map(x=>`<option>${x}</option>`).join('')
+  $('#seg').innerHTML=j.segments.length?j.segments.map(x=>`<option>${esc(x)}</option>`).join('')
     :'<option value="">— none yet —</option>';
   $('#seg').onchange=loadPiccs;
   if(stage&&stage.name==='segment')loadVocFiles();
@@ -3133,7 +3215,7 @@ async function loadPiccs(){
     $('#piccwhy').innerHTML=mine
       ? `★ marks this segment's own card. Leave it on default to use that, or pick `+
         `another of the ${cards.length} card(s) in this project.`
-      : `<b>No card for <code>${seg}</code> yet</b> — run the picc stage for it, or `+
+      : `<b>No card for <code>${esc(seg)}</code> yet</b> — run the picc stage for it, or `+
         `pick one of the ${cards.length} card(s) from another segment.`;
   }catch(e){ $('#piccwhy').textContent='Could not load PICC cards: '+e; }
 }
@@ -3344,7 +3426,7 @@ function loadSettings(){
     SETSCHEMA.forEach(f=>{ let g=groups.find(x=>x.name===f.group);
       if(!g){ g={name:f.group,fields:[]}; groups.push(g); } g.fields.push(f); });
     $('#settingsfields').innerHTML=groups.map(g=>
-      `<div class=setgroup><h4>${g.name}</h4>`+
+      `<div class=setgroup><h4>${esc(g.name)}</h4>`+
       g.fields.map(settingsField).join('')+`</div>`).join('');
     $('#settingsmsg').textContent='';
   });
@@ -3380,9 +3462,9 @@ fetch('/skills').then(r=>r.json()).then(j=>{
       (missing?` · <b class=bad>${missing} missing</b>`:'')+`</span>`+
       `<div class=skillrows>`+rows.map(r=>
         `<div class=skillrow${r.present?'':' bad'}>`+
-        `<code>${r.file||'(not found)'}</code>`+
-        `<span>${r.label}</span>`+
-        `<small>${r.purpose||''}</small>`+
+        `<code>${esc(r.file||'(not found)')}</code>`+
+        `<span>${esc(r.label)}</span>`+
+        `<small>${esc(r.purpose||'')}</small>`+
         `<em>${r.present?r.lines+' lines':'MISSING'}</em></div>`).join('')+
       `</div>`;
     box.querySelector('.skilltoggle').onclick=e=>{
@@ -3649,9 +3731,9 @@ LIB=null; LSEL=new Set(); LDUPE=false; var LSHOWN=0, LCUR=null, LZOOM=1;
 async function loadLibrary(){
   LIB=await (await fetch('/library')).json();
   if($('#lcat').options.length<2)
-    $('#lcat').innerHTML=['(all)',...LIB.categories].map(c=>`<option>${c}</option>`).join('');
+    $('#lcat').innerHTML=['(all)',...LIB.categories].map(c=>`<option>${esc(c)}</option>`).join('');
   if($('#limportcat').options.length<1)
-    $('#limportcat').innerHTML=LIB.categories.map(c=>`<option>${c}</option>`).join('');
+    $('#limportcat').innerHTML=LIB.categories.map(c=>`<option>${esc(c)}</option>`).join('');
   renderLibrary();
 }
 function visibleItems(){
@@ -3671,9 +3753,9 @@ function renderLibrary(){
   /* Thumbnails stay clean — no text burned over the artwork. Everything about a
      file lives in the sidebar, where it can be read. */
   $('#lgrid').innerHTML=items.map(i=>
-    `<div class="thumb${LSEL.has(i.rel)?' sel':''}" data-rel="${i.rel}" title="${i.name}">
+    `<div class="thumb${LSEL.has(i.rel)?' sel':''}" data-rel="${esc(i.rel)}" title="${esc(i.name)}">
        <img loading=lazy src="/ref?thumb=1&path=${encodeURIComponent(i.rel)}">
-       <input type=checkbox class=lpick data-rel="${i.rel}" ${LSEL.has(i.rel)?'checked':''}
+       <input type=checkbox class=lpick data-rel="${esc(i.rel)}" ${LSEL.has(i.rel)?'checked':''}
          title="Select for deletion"
          style="position:absolute;top:5px;left:5px;width:19px;height:19px;z-index:2;
                 cursor:pointer;accent-color:var(--accent)">
@@ -3805,9 +3887,9 @@ async function checkStorageBeforeSpending(){
     ? '⚠ This work is not going to Supabase'
     : '⚠ This work will not be kept';
   line.innerHTML = s.kind==='local'
-    ? `${s.detail}<br>Stages will run and their output will be written here. `+
+    ? `${esc(s.detail)}<br>Stages will run and their output will be written here. `+
       `Check <b>Settings → Where this is saved</b> before spending on a long one.`
-    : `<b>Supabase is configured but not working.</b> ${s.detail}`;
+    : `<b>Supabase is configured but not working.</b> ${esc(s.detail)}`;
 }
 
 /* ================= where this is saved =================
@@ -3821,7 +3903,7 @@ async function renderStorage(){
   const good=s.ok && s.kind!=='local';
   el.style.color = good ? 'var(--accent)' : 'var(--signal)';
   if(s.kind==='local'){
-    el.innerHTML=`<b>Not Supabase</b> — ${s.detail}<br><code>${s.where}</code><br>`+
+    el.innerHTML=`<b>Not Supabase</b> — ${esc(s.detail)}<br><code>${esc(s.where)}</code><br>`+
       (s.durable
         ? `Work here survives a deploy but lives on one machine. Set `
         : `Nothing here survives a deploy. Set `)+
@@ -3829,9 +3911,9 @@ async function renderStorage(){
       `this service to move it into Postgres.`;
     return;
   }
-  el.innerHTML = (s.ok ? `<b>Supabase</b> (${s.where}) — ${s.detail}. `+
+  el.innerHTML = (s.ok ? `<b>Supabase</b> (${esc(s.where)}) — ${esc(s.detail)}. `+
       `${s.projects} project(s).`
-    : `<b>Supabase is configured but not working</b> (${s.where})<br>${s.detail}`);
+    : `<b>Supabase is configured but not working</b> (${esc(s.where)})<br>${esc(s.detail)}`);
 }
 
 /* ================= existing projects ================= */
@@ -3921,7 +4003,7 @@ async function deleteProject(name,s){
     headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})).json();
   const m=$('#npmsg');
   if(r.error){m.textContent='⚠ '+r.error;m.style.color='var(--signal)';return;}
-  m.innerHTML=`Archived <b>${name}</b> → <code>${r.archived_to}</code>`;
+  m.innerHTML=`Archived <b>${esc(name)}</b> → <code>${esc(r.archived_to)}</code>`;
   m.style.color='var(--accent)';
   await renderProjectList(); loadProjects&&loadProjects();
 }
@@ -3945,6 +4027,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, code, path, ctype, download=None, chunk=1 << 20):
+        """Stream a file off disk in chunks rather than reading it whole."""
+        size = os.path.getsize(path)
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        if download:
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{download}"')
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with open(path, "rb") as fh:
+            while True:
+                block = fh.read(chunk)
+                if not block:
+                    break
+                self.wfile.write(block)
+
     def _json(self):
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -3952,8 +4051,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _admit(self):
+        """Everything a request must pass before any route sees it.
+
+        Returns True when the request may proceed; otherwise the refusal has
+        already been sent. Runs first in every method so a new route cannot
+        forget it, and before the body is read so a refused request costs
+        nothing to refuse.
+        """
+        expected = os.environ.get(SHARED_SECRET_ENV) or ""
+        if expected:
+            presented = self.headers.get(TOKEN_HEADER) or ""
+            # Constant-time: the comparison must not tell a caller how many
+            # leading bytes it has right.
+            if not hmac.compare_digest(presented.encode("utf-8"),
+                                       expected.encode("utf-8")):
+                self._send(401, json.dumps({"error": "missing or wrong " + TOKEN_HEADER}))
+                return False
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > MAX_BODY_BYTES:
+            self._send(413, json.dumps(
+                {"error": f"request body over {MAX_BODY_BYTES} bytes"}))
+            return False
+        return True
+
     # ------------------------------------------------------------------ GET
     def do_GET(self):
+        if not self._admit():
+            return
         u = urllib.parse.urlparse(self.path)
         if u.path == "/":
             stages = [{"name": n, "desc": d, "costs": c, "source": s}
@@ -3985,10 +4113,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # into a tab's memory first, and these run to hundreds of megabytes.
             n = urllib.parse.parse_qs(u.query).get("project", [""])[0]
             try:
-                filename, blob, _ = project_archive(n)
+                filename, path, _ = project_archive_file(n)
             except ValueError as e:
                 return self._send(404, json.dumps({"error": str(e)}))
-            return self._send(200, blob, "application/zip", download=filename)
+            try:
+                return self._send_file(200, path, "application/zip", download=filename)
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
         if u.path == "/library":
             return self._send(200, json.dumps(library()))
         if u.path == "/products":
@@ -4176,6 +4310,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ----------------------------------------------------------------- POST
     def do_POST(self):
+        if not self._admit():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/settings":
             req = self._json()
@@ -4258,7 +4394,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     done.append(rel); before += r["before"]; after += r["after"]
             global _dims_mem
-            _dims_mem = {}          # dimensions/format cache is now stale
+            with _lock:
+                _dims_mem = {}      # dimensions/format cache is now stale
             return self._send(200, json.dumps(
                 {"converted": len(done), "failed": failed, "skipped": len(skipped),
                  "before_bytes": before, "after_bytes": after}))
@@ -4604,30 +4741,94 @@ class Handler(http.server.BaseHTTPRequestHandler):
         valid = {n for n, _, _, _ in STAGES}
         if stage not in valid:
             return self._send(400, json.dumps({"error": "unknown stage"}))
+        project = req.get("project") or ""
+        # Looked up, never joined: the name goes straight into the CLI's -p.
+        if not SAFE_NAME.match(project) or project not in projects():
+            return self._send(400, json.dumps({"error": "unknown project"}))
 
+        def option(key):
+            """A string the CLI will see as an argv value, or None if absent."""
+            value = req.get(key)
+            if value in (None, "", False):
+                return None
+            text = str(value)
+            if not SAFE_OPTION.match(text):
+                raise ValueError(f"{key}: not a valid value")
+            return text
+
+        try:
+            cmd = self._run_command(stage, project, req, option)
+        except ValueError as error:
+            return self._send(400, json.dumps({"error": str(error)}))
+        if not isinstance(cmd, list):
+            return cmd            # a refusal already answered as text
+
+        # One stage per project at a time. The slot is taken before the
+        # response starts, so a second click gets a plain answer rather than
+        # two CLIs writing the same files.
+        with _lock:
+            if project in _running:
+                return self._send(409, json.dumps(
+                    {"error": f"{project} already has a stage running"}))
+            _running[project] = None
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        proc = None
+        try:
+            # The child CLI resolves env -> private store itself. Do not copy a
+            # secret through Studio process state or construct a second policy.
+            proc = subprocess.Popen(cmd, cwd=ROOT, env=dict(os.environ), stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, bufsize=1, text=True)
+            with _lock:
+                _running[project] = proc
+            for line in proc.stdout:
+                self.wfile.write(line.encode("utf-8", "replace"))
+                self.wfile.flush()
+            proc.wait()
+            self.wfile.write(f"\n— finished (exit {proc.returncode}) —\n".encode())
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            try:
+                self.wfile.write(f"\nrunner error: {e}\n".encode())
+            except Exception:
+                pass
+        finally:
+            with _lock:
+                _running.pop(project, None)
+            # A closed tab is the operator walking away. A stage left running
+            # spends tokens with nobody reading the answer, and a finished
+            # one nobody waited on is a zombie.
+            _stop(proc)
+
+    def _run_command(self, stage, project, req, option):
+        """The CLI argv for a validated request, or a text refusal already sent."""
         cmd = [sys.executable, os.path.join(ROOT, "pipeline", "cli.py"),
-               "-p", req.get("project") or "montisella"]
+               "-p", project]
         if req.get("approve"):
             cmd.append("--yes")
         cmd.append(stage)
         if req.get("force"):
             cmd.append("--force")
-        if req.get("provider"):
-            cmd += ["--provider", str(req["provider"])]
-        if req.get("model"):
-            cmd += ["--model", str(req["model"])]
+        if option("provider"):
+            cmd += ["--provider", option("provider")]
+        if option("model"):
+            cmd += ["--model", option("model")]
         if stage in ("extract", "run"):
-            if req.get("skills"):
-                cmd += ["--skills", str(req["skills"])]
-            elif req.get("preset"):
-                cmd += ["--preset", str(req["preset"])]
+            if option("skills"):
+                cmd += ["--skills", option("skills")]
+            elif option("preset"):
+                cmd += ["--preset", option("preset")]
         if stage in ("concepts", "run"):
             if req.get("n_concepts"):
                 cmd += ["--concepts", str(int(req["n_concepts"]))]
             if req.get("n_hooks"):
                 cmd += ["--hooks", str(int(req["n_hooks"]))]
-            if req.get("picc"):
-                cmd += ["--picc", str(req["picc"])]
+            if option("picc"):
+                cmd += ["--picc", option("picc")]
         if stage in ("brief", "run"):
             if req.get("n_briefs"):
                 cmd += ["--briefs", str(int(req["n_briefs"]))]
@@ -4635,8 +4836,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # the one the operator picked; the CLI resolves the single product when "")
         # is sent, so multi-product projects must make an explicit choice.
         if stage in ("picc", "concepts", "brief", "run"):
-            if req.get("product"):
-                cmd += ["--product", str(req["product"])]
+            if option("product"):
+                cmd += ["--product", option("product")]
         if stage == "import":
             source = req.get("source") or ""
             # Asked of the store, matching where _upload put it and how the CLI
@@ -4647,6 +4848,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not (source and (store.exists(source) or os.path.isdir(source))):
                 return self._send(200, "Nothing uploaded to import yet.\n",
                                   "text/plain; charset=utf-8")
+            try:
+                source = import_source(project, source)
+            except remix.RemixError as error:
+                return self._send(200, f"{error}\n", "text/plain; charset=utf-8")
             # The browser has already been shown the plan and pressed Run, so
             # the CLI's own confirmation would be a second prompt with no
             # terminal to answer it.
@@ -4667,7 +4872,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             src = req.get("refine_source") or ""
             if src:
                 allowed = {os.path.realpath(row["path"])
-                           for row in refine_voc_files(req.get("project") or "")}
+                           for row in refine_voc_files(project)}
                 src = os.path.realpath(src)
                 if src not in allowed:
                     return self._send(
@@ -4675,7 +4880,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "text/plain; charset=utf-8")
                 cmd += ["--source", src]
         elif stage != "segment":
-            seg = req.get("segment") or ""
+            seg = option("segment")
             if not seg:
                 return self._send(200, "No segment selected.\n",
                                   "text/plain; charset=utf-8")
@@ -4687,28 +4892,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self._send(200, f"VOC source not found:\n  {vsrc}\n",
                                       "text/plain; charset=utf-8")
                 cmd += ["--source", vsrc]
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        try:
-            # The child CLI resolves env -> private store itself. Do not copy a
-            # secret through Studio process state or construct a second policy.
-            proc = subprocess.Popen(cmd, cwd=ROOT, env=dict(os.environ), stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, bufsize=1, text=True)
-            for line in proc.stdout:
-                self.wfile.write(line.encode("utf-8", "replace"))
-                self.wfile.flush()
-            proc.wait()
-            self.wfile.write(f"\n— finished (exit {proc.returncode}) —\n".encode())
-        except BrokenPipeError:
-            pass
-        except Exception as e:
-            try:
-                self.wfile.write(f"\nrunner error: {e}\n".encode())
-            except Exception:
-                pass
+        return cmd
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):

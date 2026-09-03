@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import io
 import os
+import tempfile
 import zipfile
 
 import paths
@@ -101,16 +102,11 @@ def spent_files(project_dir):
     return sorted(unique.values())
 
 
-def bundle(project_dir, project_name):
-    """The whole project as a zip, so nothing is removed before it is held.
-
-    Everything, not only the spent corpora: a backup taken before deleting is
-    the wrong moment to be selective about what it contains.
-    """
+def _write_bundle(project_dir, project_name, handle):
+    """Zip every file of the project into an open binary handle."""
     base = paths.project_dir(project_dir)
-    buffer = io.BytesIO()
     written = 0
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED) as archive:
         for key in store.list_keys(base):
             full = key if os.path.isabs(str(key)) else os.path.join(base, key)
             try:
@@ -122,7 +118,44 @@ def bundle(project_dir, project_name):
             name = os.path.relpath(str(full), str(base)).replace(os.sep, "/")
             archive.writestr("%s/%s" % (project_name, name), data)
             written += 1
+    return written
+
+
+def bundle(project_dir, project_name):
+    """The whole project as a zip, so nothing is removed before it is held.
+
+    Everything, not only the spent corpora: a backup taken before deleting is
+    the wrong moment to be selective about what it contains.
+
+    Returns the bytes; the CLI writes them straight to a file. A server should
+    use bundle_to_file and stream it: a project runs to hundreds of megabytes,
+    and the bytes plus the response body would be two copies of that per
+    download.
+    """
+    buffer = io.BytesIO()
+    written = _write_bundle(project_dir, project_name, buffer)
     return "%s.zip" % project_name, buffer.getvalue(), written
+
+
+def bundle_to_file(project_dir, project_name):
+    """The same zip written to a temporary file: (filename, path, count).
+
+    The caller owns the file and removes it once sent. Only one file's bytes
+    are ever in memory at a time; the rest is on disk, where a download this
+    size belongs.
+    """
+    handle = tempfile.NamedTemporaryFile(prefix="adpipe-archive-", suffix=".zip",
+                                         delete=False)
+    try:
+        with handle:
+            written = _write_bundle(project_dir, project_name, handle)
+    except Exception:
+        try:
+            os.remove(handle.name)
+        except OSError:
+            pass
+        raise
+    return "%s.zip" % project_name, handle.name, written
 
 
 def remove(project_dir):

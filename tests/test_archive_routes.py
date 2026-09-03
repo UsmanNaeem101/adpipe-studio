@@ -145,6 +145,12 @@ class RoutingTests(RouteFixture):
             self.sent = {"code": code, "body": body, "ctype": ctype,
                          "download": download}
 
+        def _send_file(self, code, path, ctype, download=None, chunk=1 << 20):
+            # The archive is streamed from a temp file; record it as a body so
+            # the assertions read the same either way.
+            with open(path, "rb") as fh:
+                self._send(code, fh.read(), ctype, download)
+
         def json(self):
             return json.loads(self.sent["body"])
 
@@ -159,6 +165,15 @@ class RoutingTests(RouteFixture):
         self.assertEqual(handler.sent["ctype"], "application/zip")
         self.assertEqual(handler.sent["download"], "demo.zip")
         self.assertTrue(handler.sent["body"].startswith(b"PK"))
+
+    def test_the_archive_route_leaves_no_temp_file_behind(self):
+        before = {n for n in os.listdir(tempfile.gettempdir())
+                  if n.startswith("adpipe-archive-")}
+        handler = self.Recorder("/project/archive?project=demo")
+        handler.do_GET()
+        after = {n for n in os.listdir(tempfile.gettempdir())
+                 if n.startswith("adpipe-archive-")}
+        self.assertEqual(after - before, set())
 
     def test_the_archive_route_404s_on_an_unknown_project(self):
         handler = self.Recorder("/project/archive?project=nope")
