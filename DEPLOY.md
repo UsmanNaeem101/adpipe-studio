@@ -38,7 +38,7 @@ deploy — the container filesystem does not survive one.
 | `STUDIO_HOST` | `0.0.0.0` | a container bound to loopback is unreachable, with no error to read |
 | `STUDIO_NO_BROWSER` | `1` | there is no browser to open and nobody to look at it |
 | `ADPIPE_CREDENTIALS_FILE` | `/app/projects/.credentials.json` | puts the credential store **on the volume**; see below |
-| `ADPIPE_SHARED_SECRET` | a long random string | must match Topic Atlas's; see below |
+| `ADPIPE_SHARED_SECRET` | a long random string | must match Topic Atlas's; see below. Once set, every request without a matching `X-AdPipe-Token` header is answered 401 — there is no unauthenticated path, not even a health check |
 | `OPENROUTER_API_KEY` | your key | `credentials.resolve()` prefers the environment over its stored file |
 | `DEEPSEEK_API_KEY` | your key | DeepSeek's own API, rather than their models via OpenRouter |
 | `OPENAI_API_KEY` | your key | only if you use it |
@@ -62,6 +62,13 @@ twenty minutes into a stage.
 
 **Do not** give this service a public domain. If Railway has already generated
 one, remove it.
+
+The secret is the only check the service makes itself. With it set, a request
+must carry the same value as `X-AdPipe-Token` or it is refused before any route
+runs — so anything else on the private network that finds the port gets a 401,
+not the studio. Leave it unset only on a laptop, where the loopback bind is the
+door. Bodies over 96MB (set `ADPIPE_MAX_BODY_BYTES` to change it) are refused
+with 413 before they are read.
 
 ## 3. Topic Atlas
 
