@@ -41,7 +41,7 @@ class FakeClient:
         if self.batch_stop is None:
             return {jobs[0].id: self.batch_text}
         return {jobs[0].id: llm.BatchResult(
-            id=jobs[0].id, text=self.batch_text, stop_reason=self.batch_stop)}
+            text=self.batch_text, stop_reason=self.batch_stop)}
 
     def one_result(self, corpus, preamble, prompt, max_tokens=16000, schema=None,
                    job_id="single", operation="pipeline_single", effort=None,
@@ -131,6 +131,34 @@ class ExtractRetryTests(unittest.TestCase):
 
         # Jobs are created at 16000; the budget-aware retry asks for 3x.
         self.assertEqual([call[2] for call in fake.one_calls], [48000])
+
+    def test_a_truncated_extraction_is_redone_on_the_next_run(self):
+        """The file ends in the marker, so it is a partial, not a result."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.project(tmp)
+            dest = os.path.join(
+                cfg["_dir"], "research", "extractions", "shoulder", "07_pain_points.md")
+            os.makedirs(os.path.dirname(dest))
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write("# Pain points\n- one\n\n" + cli.TRUNCATED_MARKER + "\n")
+            fake = FakeClient(batch_text="# Pain points\n- one\n- two\n- three")
+            self.run_extract(cfg, fake)
+            with open(dest, encoding="utf-8") as fh:
+                written = fh.read()
+        self.assertEqual(written, "# Pain points\n- one\n- two\n- three")
+
+    def test_a_refusal_is_not_retried(self):
+        """Re-sending the corpus three times only pays to be blocked three times."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.project(tmp)
+            fake = FakeClient(batch_text="", batch_stop="refusal",
+                              retry_texts=["should never be asked for"])
+            with self.assertRaisesRegex(SystemExit, "07_pain_points"):
+                self.run_extract(cfg, fake)
+            dest = os.path.join(
+                cfg["_dir"], "research", "extractions", "shoulder", "07_pain_points.md")
+            self.assertFalse(os.path.exists(dest))
+        self.assertEqual(fake.one_calls, [])
 
     def test_existing_zero_byte_file_is_not_treated_as_complete(self):
         with tempfile.TemporaryDirectory() as tmp:

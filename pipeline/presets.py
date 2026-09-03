@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -467,39 +468,55 @@ _PICK_SYSTEM = (
     "Reply with JSON only: {\"id\": \"NN\", \"why\": \"one short sentence\"}")
 
 
-def _post_json(url, headers, body, timeout=60, label="auto-pick"):
+# Retried the way the pipeline client retries: a rate limit or a provider
+# outage mid-way through a 24-plate remix used to lose the run on the first 429.
+RETRY_STATUSES = (429, 500, 502, 503)
+
+
+def _post_json(url, headers, body, timeout=60, label="auto-pick", retries=3):
     """POST JSON and return the parsed reply. `label` names the caller in error
     text so a failure says which feature broke, not always "auto-pick"."""
     provider = "anthropic" if "anthropic.com" in url else "openrouter"
     audit = auditlog.start(provider, body.get("model", ""), label, body,
-                           metadata={"endpoint": url})
+                           metadata={"endpoint": url, "retries": retries})
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  method="POST", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            payload = json.load(r)
-        if provider == "anthropic":
-            text = "".join(b.get("text", "") for b in payload.get("content", []))
-        else:
-            text = ((payload.get("choices") or [{}])[0].get("message") or {}).get(
-                "content", "") or ""
-        audit.response(payload, text=text, usage=payload.get("usage"))
-        return payload
-    except urllib.error.HTTPError as e:
-        detail_full = e.read().decode("utf-8", "replace")
-        detail = detail_full[:300]
-        audit.event("http_error", detail_full, status=e.code)
-        if e.code == 401:
-            raise PresetError(f"the key for {label} was rejected (401).")
-        if e.code == 402:
-            raise PresetError("that account has insufficient credit (402).")
-        raise PresetError(f"{label} failed — HTTP {e.code}: {detail}")
-    except urllib.error.URLError as e:
-        audit.event("network_error", str(e.reason))
-        raise PresetError(f"{label} failed — network error: {e.reason}")
-    except Exception as e:
-        audit.error(e)
-        raise
+    for attempt in range(retries):
+        last = attempt == retries - 1
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                payload = json.load(r)
+            if provider == "anthropic":
+                text = "".join(b.get("text", "") for b in payload.get("content", []))
+            else:
+                text = ((payload.get("choices") or [{}])[0].get("message") or {}).get(
+                    "content", "") or ""
+            audit.response(payload, text=text, usage=payload.get("usage"))
+            return payload
+        except urllib.error.HTTPError as e:
+            detail_full = e.read().decode("utf-8", "replace")
+            detail = detail_full[:300]
+            retrying = e.code in RETRY_STATUSES and not last
+            audit.event("http_error", detail_full, status=e.code,
+                        attempt=attempt + 1, will_retry=retrying)
+            if retrying:
+                time.sleep(2 ** attempt * 5)
+                continue
+            if e.code == 401:
+                raise PresetError(f"the key for {label} was rejected (401).")
+            if e.code == 402:
+                raise PresetError("that account has insufficient credit (402).")
+            raise PresetError(f"{label} failed — HTTP {e.code}: {detail}")
+        except urllib.error.URLError as e:
+            audit.event("network_error", str(e.reason), attempt=attempt + 1,
+                        will_retry=not last)
+            if not last:
+                time.sleep(5)
+                continue
+            raise PresetError(f"{label} failed — network error: {e.reason}")
+        except Exception as e:
+            audit.error(e)
+            raise
 
 
 def _json_end(raw, start):

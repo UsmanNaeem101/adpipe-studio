@@ -168,8 +168,16 @@ class BoilerplateTests(unittest.TestCase):
 
     def test_real_page_furniture_is_still_rejected(self):
         for chrome in ("Welcome to Reddit", "I am a bot", "AutoModerator",
-                       "Privacy Policy", "Create an account"):
+                       "Privacy Policy", "Create an account",
+                       "log in or sign up in seconds", "Sign up · Log in",
+                       "LOG IN SIGN UP", "sign up or log in to comment"):
             self.assertIsNotNone(cli.BOILER.search(chrome), chrome)
+
+    def test_a_customer_who_signed_up_for_something_is_not_chrome(self):
+        for comment in ("I had to sign up for the sleep clinic and wait months",
+                        "every time I log in to the app my back is worse",
+                        "signed up, logged in, still no relief"):
+            self.assertIsNone(cli.BOILER.search(comment), comment)
 
 
 if __name__ == "__main__":

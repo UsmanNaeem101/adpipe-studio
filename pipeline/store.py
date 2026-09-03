@@ -145,9 +145,10 @@ def normalise(key, root=None):
         if part in ("", "."):
             continue
         if part == "..":
-            if parts:
-                parts.pop()
-            continue
+            # Refused rather than collapsed. A `..` that climbs is an escape
+            # attempt and one that does not is a key nobody meant to write;
+            # silently landing either somewhere else is the worse outcome.
+            raise ValueError("key may not contain '..': %r" % key)
         parts.append(part)
     return "/".join(parts)
 
@@ -199,7 +200,10 @@ class LocalStore:
 
     def read_text(self, key):
         raw = self.read_bytes(key)
-        return None if raw is None else raw.decode("utf-8")
+        # A raw VOC dump is whatever the scraper saved: one Windows-1252 curly
+        # quote used to abort the whole ingest before parsing. A replacement
+        # character in one comment beats no comments at all.
+        return None if raw is None else raw.decode("utf-8", "replace")
 
     def write_bytes(self, key, data):
         path = self._path(key)
@@ -335,7 +339,7 @@ class SupabaseStore:
         given, key = key, normalise(key)
         if is_binary_key(key):
             raw = self.read_bytes(given)
-            return None if raw is None else raw.decode("utf-8")
+            return None if raw is None else raw.decode("utf-8", "replace")
         status, payload = self._rest(
             "GET", "?key=eq.%s&select=content" % urllib.parse.quote(key, safe="")
         )
@@ -348,7 +352,7 @@ class SupabaseStore:
         if isinstance(content, str) and content.startswith(OVERFLOW_PREFIX):
             status, payload = self._request("GET", self._object_path(key))
             if status == 200:
-                return payload.decode("utf-8")
+                return payload.decode("utf-8", "replace")
             # The row says the bytes exist and the bucket disagrees. Say so
             # rather than returning the marker as if it were the file.
             raise IOError("%s is recorded as stored but its object is missing" % key)

@@ -30,9 +30,12 @@ class NormaliseTests(unittest.TestCase):
         for messy in ["a//b", "./a/b", "a/b/", "a/./b", "a\\b"]:
             self.assertEqual(store_module.normalise(messy), "a/b", messy)
 
-    def test_cannot_climb_out(self):
-        self.assertEqual(store_module.normalise("../../etc/passwd"), "etc/passwd")
-        self.assertEqual(store_module.normalise("a/../b"), "b")
+    def test_dot_dot_is_refused_not_collapsed(self):
+        # Dropping the `..` used to land the key somewhere the caller never
+        # named; a key that tries to climb is an error, not a suggestion.
+        for messy in ("../../etc/passwd", "a/../b", "projects/../x"):
+            with self.assertRaises(ValueError, msg=messy):
+                store_module.normalise(messy)
 
     def test_binary_is_decided_by_suffix(self):
         self.assertTrue(store_module.is_binary_key("projects/x/assets/ad.PNG"))
@@ -105,9 +108,18 @@ class LocalStoreTests(unittest.TestCase):
 
     def test_a_key_cannot_escape_the_root(self):
         outside = os.path.join(self.dir, "..", "escaped.txt")
-        self.store.write_text("../escaped.txt", "no")
+        with self.assertRaises(ValueError):
+            self.store.write_text("../escaped.txt", "no")
         self.assertFalse(os.path.exists(os.path.abspath(outside)))
-        self.assertTrue(self.store.exists("escaped.txt"))
+        self.assertFalse(self.store.exists("escaped.txt"))
+
+    def test_non_utf8_bytes_read_as_text_rather_than_crashing(self):
+        # A Windows-1252 curly quote in a raw VOC dump used to abort ingest
+        # before parsing. It reads as a replacement character instead.
+        self.store.write_bytes("projects/p/research/voc/raw.txt",
+                               b"I can\x92t sleep on my side")
+        text = self.store.read_text("projects/p/research/voc/raw.txt")
+        self.assertEqual(text, "I can\ufffdt sleep on my side")
 
 
 class StubSupabase(store_module.SupabaseStore):
