@@ -1132,10 +1132,12 @@ def _run_stage01_adaptive(client_, corpus, preamble, jobs, diagnostics_dir,
 
 
 def _run_stage02_adaptive(client_, corpus, preamble, jobs, diagnostics_dir,
-                          wave_size=1, stats=None, debug=False):
+                          wave_size=1, stats=None, debug=False,
+                          row_validator=None):
     return _run_adaptive_stage(
         client_, corpus, preamble, jobs, diagnostics_dir, stage="02",
-        key="groups", wave_size=wave_size, stats=stats, debug=debug)
+        key="groups", wave_size=wave_size, stats=stats, debug=debug,
+        row_validator=row_validator)
 
 
 def _json_object(text):
@@ -1488,6 +1490,14 @@ def extraction_budget(cfg):
 # from one that stopped mid-sentence. Neither can a person skimming it.
 TRUNCATED_MARKER = ("> INCOMPLETE: this extraction was cut off at the model's "
                     "output limit. Treat the list above as partial.")
+
+
+def extraction_complete(text):
+    """True when a stored extraction is finished work rather than a placeholder."""
+    body = (text or "").rstrip()
+    return bool(body) and not body.endswith(TRUNCATED_MARKER)
+
+
 MAX_BATCH_REPAIR_ATTEMPTS = 1
 
 
@@ -1843,11 +1853,80 @@ def _require_exact_ids(rows, expected_ids, label):
 # split_old_reddit existed to cut them out properly. Anything the splitter
 # leaves behind is one item's worth of junk, which skill 01 rejects as
 # `interface_chrome` at a cost of one record instead of a thread.
+#
+# "sign up" and "log in" only count as chrome in the pairing Reddit's furniture
+# uses — "log in or sign up", "sign up · log in" — never on their own. "I had to
+# sign up for the sleep clinic" is a customer's sentence, and matching the bare
+# phrase dropped it uncounted and unaudited.
 BOILER = re.compile(
-    r"welcome to reddit|become a redditor|create an account|sign up|log in|"
+    r"welcome to reddit|become a redditor|create an account|"
+    r"(?:sign up|log in)\W{1,5}(?:or\s+)?(?:log in|sign up)\b|"
+    r"log in or sign up|sign up or log in|"
     r"this is an archived post|i am a bot|automoderator|"
     r"privacy policy|user agreement|content policy|"
     r"submission guidelines|weekly thread|link to wiki", re.I)
+
+
+# Where the pre-pass records what it dropped, and why.
+PREPASS_DROPPED_FILE = "prepass_dropped.jsonl"
+
+# Where evidence ids are pinned to the records that own them.
+EVIDENCE_IDS_FILE = "evidence_ids.json"
+
+
+class _EvidenceIds:
+    """Evidence ids that survive a re-ingest.
+
+    Ids used to be positions in the surviving list, so any change to the
+    pre-pass — a boilerplate phrase removed, a community excluded — shifted
+    every id after the first affected record, and every citation in every
+    extraction silently pointed at the wrong comment. The ids are now pinned:
+    a record keeps the id its url and text were first given, a new record
+    takes the next unused one, and a record that no longer survives leaves its
+    id retired rather than reassigned. A project ingested before this map
+    existed is numbered on first sight exactly as before, so nothing already
+    cited moves.
+    """
+
+    def __init__(self, known=None):
+        self.known = dict(known or {})
+        self.next_id = max(self.known.values(), default=0) + 1
+        self.seen = set()
+
+    @staticmethod
+    def fingerprint(url, text):
+        return hashlib.sha256(f"{url or ''}\n{text}".encode()).hexdigest()
+
+    @classmethod
+    def load(cls, voc):
+        path = os.path.join(voc, EVIDENCE_IDS_FILE)
+        if not store.exists(path):
+            return cls()
+        return cls(json.loads(store.read_text(path) or "{}"))
+
+    def assign(self, url, text):
+        key = self.fingerprint(url, text)
+        self.seen.add(key)
+        if key not in self.known:
+            self.known[key] = self.next_id
+            self.next_id += 1
+        return self.known[key]
+
+    def save(self, voc, pre):
+        """Persist the map and say, loudly, if any pinned record is gone."""
+        gone = sorted(self.known[k] for k in self.known if k not in self.seen)
+        if gone:
+            shown = ", ".join(str(i) for i in gone[:20])
+            more = f" … (+{len(gone) - 20} more)" if len(gone) > 20 else ""
+            print(f"  ! WARNING: {len(gone):,} previously numbered record(s) did "
+                  f"not survive this ingest: ids {shown}{more}.\n"
+                  f"    Their ids are retired, not reused, but any existing "
+                  f"extraction that cites them now points at nothing. Re-run "
+                  f"extract for segments built on this corpus.")
+        # Ids keep their first assignment even when the input order changes,
+        # so `pre` may not be sorted by id. Nothing downstream requires it to
+        # be, and re-sorting here would make the order depend on history.
+        _json_atomic(os.path.join(voc, EVIDENCE_IDS_FILE), self.known)
 
 
 def reddit_source_fields(url):
@@ -1875,13 +1954,16 @@ def _read_jsonl(path):
 
 
 def _write_jsonl_atomic(path, rows):
-    """Write stable JSONL without leaving a half-written canonical export."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    temporary = path + ".tmp"
-    with store.open_key(temporary, "w", encoding="utf-8", newline="\n") as fh:
+    """Write stable JSONL without leaving a half-written canonical export.
+
+    Atomicity comes from the store, not from a temp file: `open_key` buffers a
+    write and lands it once on a clean exit. The temp-file-and-`os.replace`
+    dance this used to do wrote the `.tmp` through the store and then renamed
+    it on the local filesystem — where, under Supabase, it did not exist.
+    """
+    with store.open_key(path, "w", encoding="utf-8", newline="\n") as fh:
         for row in rows:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-    os.replace(temporary, path)
 
 
 def refine_voc(cfg, input_path=None, groups_path=None, announce=True):
@@ -2059,23 +2141,40 @@ def cmd_ingest(cfg, args):
     # every record the project has already decided it does not want.
     pre, seen, dropped = [], {}, Counter()
     excluded_communities = Counter()
+    # Every pre-pass drop is written out with its reason. The model's verdicts
+    # are audited record by record; a deterministic rule that deletes a real
+    # comment must be at least as visible, or it is the one filter nobody can
+    # check.
+    prepass_dropped = []
+    ids = _EvidenceIds.load(voc)
     for item in blocks:
         text = re.sub(r"\s+", " ", item["text"]).strip()
+        reason = None
         if len(text.split()) < cfg["filter"].get("min_words", 8):
-            dropped["too_short"] += 1; continue
-        if BOILER.search(text):
-            dropped["interface_chrome"] += 1; continue
-        subreddit, _thread = reddit_source_fields(item.get("url"))
-        if corpus_policy.subreddit_excluded(subreddit, cfg):
-            dropped[corpus_policy.OUT_OF_SCOPE_SUBREDDIT] += 1
-            excluded_communities[f"r/{subreddit}"] += 1
+            reason = "too_short"
+        elif BOILER.search(text):
+            reason = "interface_chrome"
+        else:
+            subreddit, _thread = reddit_source_fields(item.get("url"))
+            if corpus_policy.subreddit_excluded(subreddit, cfg):
+                reason = corpus_policy.OUT_OF_SCOPE_SUBREDDIT
+                excluded_communities[f"r/{subreddit}"] += 1
+        if reason is None:
+            h = hashlib.sha256(text.lower().encode()).hexdigest()
+            if h in seen:
+                reason = "exact_duplicate"
+            else:
+                seen[h] = True
+        if reason:
+            dropped[reason] += 1
+            prepass_dropped.append({"reason": reason, "text": text,
+                                    "url": item.get("url", ""),
+                                    "title": item.get("title", "")})
             continue
-        h = hashlib.sha256(text.lower().encode()).hexdigest()
-        if h in seen:
-            dropped["exact_duplicate"] += 1; continue
-        seen[h] = True
-        pre.append({"id": len(pre) + 1, "text": text,
+        pre.append({"id": ids.assign(item.get("url", ""), text), "text": text,
                     "url": item.get("url", ""), "title": item.get("title", "")})
+    _write_jsonl(os.path.join(voc, PREPASS_DROPPED_FILE), prepass_dropped)
+    ids.save(voc, pre)
 
     print(f"  parsed {len(blocks):,} records")
     if excluded_communities:
@@ -2184,6 +2283,9 @@ def cmd_ingest(cfg, args):
                  effort=stage02_effort)
              for n, ch in enumerate(dchunks)]
 
+    validate_groups = _dedup_row_validator({j.id: {r["id"] for r in ch}
+                                            for j, ch in zip(djobs, dchunks)})
+
     dprefix = f"{s02}\n\n---\n\n{ctx}"
     print(f"\n  02 deduplicate: {len(retained):,} records in {len(djobs)} chunks "
           f"({ADAPTIVE_TOKEN_TIERS[0]:,} output tokens initially, "
@@ -2196,18 +2298,19 @@ def cmd_ingest(cfg, args):
     dedup_results, djobs = _run_stage02_adaptive(
         c, dprefix, PREAMBLE, djobs, dedup_failures,
         wave_size=_adaptive_wave_size(c), stats=dedup_stats,
-        debug=getattr(args, "stage02_debug", False))
-    drop = set()
+        debug=getattr(args, "stage02_debug", False),
+        row_validator=validate_groups)
     groups = _batch_rows(
         dedup_results, djobs, "groups", dedup_failures,
         repair=lambda failed: _repair_batch(c, dprefix, PREAMBLE, failed, "groups"),
         rerun=lambda failed, factor: _rerun_batch(c, dprefix, PREAMBLE, failed, factor),
         # Budget stops have already been retried through the tier state machine.
         # Other retryable failures keep the existing recovery without widening.
-        rerun_factor=1, adaptive_stats=dedup_stats)
+        rerun_factor=1, adaptive_stats=dedup_stats,
+        row_validator=validate_groups)
     _print_adaptive_summary(dedup_stats)
-    for g in groups:
-        drop.update(i for i in g["duplicate_ids"] if i != g["canonical_id"])
+    groups = resolve_duplicate_groups(groups)
+    drop = {i for g in groups for i in g["duplicate_ids"]}
 
     deduped = [r for r in retained if r["id"] not in drop]
     _write_jsonl(os.path.join(voc, "deduplicated_voc.jsonl"), deduped)
@@ -2227,6 +2330,80 @@ def cmd_ingest(cfg, args):
              if types else ""))
     print(f"\n  {len(deduped):,} deduplicated evidence items -> {voc}/deduplicated_voc.jsonl")
     print("  (legacy rich copy retained as filtered_voc.jsonl)")
+
+
+def _dedup_row_validator(chunk_ids):
+    """Reject a duplicate group that names a record the chunk never showed.
+
+    Skill 02 sees one chunk at a time, so an id from outside it is invented,
+    and acting on it deletes a record that was judged elsewhere. A canonical
+    listed among its own duplicates, or an empty group, is the same class of
+    answer: not a judgement about the records, and not something to merge.
+    """
+    def validate(job, rows):
+        allowed = chunk_ids.get(job.id, set())
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ids = [row.get("canonical_id")] + list(row.get("duplicate_ids") or [])
+            unknown = sorted({i for i in ids if i not in allowed}, key=str)
+            if unknown:
+                raise ValueError(
+                    f"duplicate group names records not in this chunk: {unknown}")
+            if not row.get("duplicate_ids"):
+                raise ValueError("duplicate group with no duplicates")
+            if row["canonical_id"] in row["duplicate_ids"]:
+                raise ValueError(
+                    f"record {row['canonical_id']} is listed as its own duplicate")
+    return validate
+
+
+def resolve_duplicate_groups(groups):
+    """Collapse overlapping groups so every record is dropped at most once.
+
+    Groups arrive from independent chunks and the model is free to name a
+    canonical in one group that another group lists as a duplicate — or to
+    return A→B and B→A, the exact pair skill 02 warns about, which taken
+    literally deletes both. Union-find joins every record a group connects,
+    and the lowest id in each component is kept. One group comes out per
+    component, so `duplicate_groups.jsonl` says what was actually done.
+    """
+    parent = {}
+
+    def find(i):
+        parent.setdefault(i, i)
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for g in groups:
+        for i in g["duplicate_ids"]:
+            union(g["canonical_id"], i)
+
+    members, types, rationales = defaultdict(set), defaultdict(Counter), defaultdict(list)
+    for g in groups:
+        root = find(g["canonical_id"])
+        members[root].update([g["canonical_id"], *g["duplicate_ids"]])
+        types[root][g["duplicate_type"]] += 1
+        if g.get("rationale"):
+            rationales[root].append(g["rationale"])
+
+    resolved = []
+    for root in sorted(members):
+        canonical = min(members[root])
+        duplicates = sorted(members[root] - {canonical})
+        if not duplicates:
+            continue
+        resolved.append({"canonical_id": canonical, "duplicate_ids": duplicates,
+                         "duplicate_type": types[root].most_common(1)[0][0],
+                         "rationale": " | ".join(rationales[root])})
+    return resolved
 
 
 def _write_jsonl(path, rows):
@@ -2738,12 +2915,11 @@ def _segment_force(args, step):
 
 
 def _json_atomic(path, value):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    temporary = path + ".tmp"
-    with store.open_key(temporary, "w", encoding="utf-8") as fh:
+    # Atomic through the store (see `_write_jsonl_atomic`): no local temp file,
+    # because on a Supabase deploy there is no local file to rename.
+    with store.open_key(path, "w", encoding="utf-8") as fh:
         json.dump(value, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
-    os.replace(temporary, path)
 
 
 def _load_json(path):
@@ -5476,12 +5652,13 @@ def cmd_extract(cfg, args):
         name, body = skill(n)
         dest = os.path.join(out, f"{name}.md")
         # A zero-byte/whitespace artefact is a failed extraction, not completed
-        # work. Pick it up automatically even without --force.
+        # work, and so is one that ends in the truncation marker: it was kept
+        # because a partial list beats none, not because the work was done.
+        # Both are picked up automatically even without --force.
         present = False
         if store.exists(dest):
             try:
-                with store.open_key(dest, encoding="utf-8") as fh:
-                    present = bool(fh.read().strip())
+                present = extraction_complete(store.read_text(dest) or "")
             except OSError:
                 present = False
         if present and not args.force:
@@ -5513,6 +5690,14 @@ def cmd_extract(cfg, args):
         result = _as_result(results.get(job.id, ""))
         results[job.id] = result.text
         if result.text.strip() and not result.out_of_budget:
+            continue
+        if result.stop_reason in NO_RETRY_STOP_REASONS:
+            # A refusal is a decision, not a shortfall. Re-sending the same
+            # corpus three times only pays to be refused three times.
+            print(f"  ! {job.id} was blocked by the provider "
+                  f"({result.stop_reason}); not retrying")
+            results.pop(job.id, None)
+            failed.append(job.id)
             continue
 
         # Two shortfalls, one cause. An empty reply means the budget went
@@ -5627,10 +5812,40 @@ def synth(cfg, args, stage, prompt, dest, max_tokens=16000, schema=None, corpus=
             os.path.join(os.path.dirname(dest), "_model_failures", stage))
         text = json.dumps(decoded, indent=2)
     else:
-        text = c.one(corpus, PREAMBLE, prompt, max_tokens, schema)
+        text = _synth_text(c, corpus, stage, prompt, max_tokens)
     store.write_text(dest, text)
     print(f"  -> {dest}   (${c.actual_usd():.2f})")
     return text
+
+
+def _synth_text(c, corpus, stage, prompt, max_tokens):
+    """An unstructured synthesis answer, or a failure — never a fragment.
+
+    The text-only path used to write whatever came back, and a reply that
+    stopped at the budget, or held nothing, was written all the same. The next
+    run then found the file and skipped the stage, so a truncated PICC card or
+    brief was never regenerated. Now a short reply is retried once with room
+    to finish, and if that is short too the stage fails without writing, which
+    is what leaves the re-run something to do.
+    """
+    result = _as_result(c.one_result(corpus, PREAMBLE, prompt, max_tokens,
+                                     job_id=stage, operation=f"synth_{stage}"))
+    if result.stop_reason in NO_RETRY_STOP_REASONS:
+        raise SystemExit(f"  {stage}: the provider blocked the request "
+                         f"({result.stop_reason}). Nothing was written.")
+    if result.text.strip() and not result.out_of_budget:
+        return result.text
+    wider = max_tokens * BUDGET_RETRY_FACTOR
+    why = ("was cut off at its output budget" if result.text.strip()
+           else "returned no content")
+    print(f"  ! {stage} {why}; retrying once at {wider:,} tokens")
+    result = _as_result(c.one_result(corpus, PREAMBLE, prompt, wider,
+                                     job_id=stage, operation=f"synth_{stage}_retry"))
+    if result.text.strip() and not result.out_of_budget:
+        return result.text
+    raise SystemExit(
+        f"  {stage}: the model {why} even at {wider:,} tokens. Nothing was "
+        f"written, so the next run will redo this stage rather than skip it.")
 
 
 RAMP_RULES = """

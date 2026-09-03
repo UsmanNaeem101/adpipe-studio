@@ -310,12 +310,19 @@ class Client:
                             print(f"  ! this OpenRouter route caps output at "
                                   f"{allowed:,} tokens (asked for {max_tokens:,}); "
                                   f"retrying at the cap")
+                        # The reasoning ceiling shrinks with the budget it was
+                        # sized against. Lowering max_tokens alone leaves a
+                        # ceiling above the total, which is the all-reasoning,
+                        # zero-answer failure the ceiling exists to prevent.
+                        capped_reasoning = (
+                            max(int(reasoning_max_tokens * allowed / max_tokens), 1)
+                            if reasoning_max_tokens else None)
                         return self._post(messages, allowed, schema=schema,
                                           retries=retries, job_id=job_id,
                                           operation=operation + "_capped",
                                           effort=effort,
                                           send_reasoning=send_reasoning,
-                                          reasoning_max_tokens=reasoning_max_tokens)
+                                          reasoning_max_tokens=capped_reasoning)
                     sys.exit(
                         f"  This OpenRouter route rejected max_tokens={max_tokens:,} "
                         f"and did not state its limit.\n"

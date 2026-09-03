@@ -76,7 +76,26 @@ SIMPLE = audience("Golfers", [
 ], facets=[("In physical therapy / physiotherapy", 14), ("Chiropractic users", 1)])
 
 
+# A comment that pastes a snippet: the bare ``` inside it used to end the
+# comment there, and everything after it became structure.
+FENCED_TEXT = ("I tried this stretch routine:\n"
+               "```\n"
+               "cat-cow x10\n"
+               "```\n"
+               "and my lower back still locks up every morning")
+
+FENCED = audience("Stretchers", [
+    {"id": 1, "text": FENCED_TEXT},
+    {"id": 2, "text": "Second person, unaffected."},
+])
+
+
 class ParsingTests(unittest.TestCase):
+    def test_a_code_fence_inside_a_comment_does_not_end_it(self):
+        doc = importer.parse_audience_file(FENCED)
+        self.assertEqual([c["text"] for c in doc["comments"]],
+                         [FENCED_TEXT, "Second person, unaffected."])
+
     def test_every_comment_is_found(self):
         doc = importer.parse_audience_file(SIMPLE)
         self.assertEqual(doc["name"], "Golfers")

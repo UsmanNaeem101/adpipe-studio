@@ -70,6 +70,18 @@ def slugify(name):
     return s[:64]
 
 
+def _closes_fence(lines, index):
+    """Whether a ``` at `index - 1` ends the comment rather than a snippet in it."""
+    while index < len(lines):
+        nxt = lines[index].rstrip()
+        if nxt == "":
+            index += 1
+            continue
+        return bool(COMMENT_HEAD.match(nxt) or nxt.startswith("#")
+                    or BULLET.match(nxt) or nxt == TEXT_MARKER)
+    return True
+
+
 def parse_audience_file(text):
     """One markdown audience file -> its name, scope, facet tally and comments.
 
@@ -82,11 +94,17 @@ def parse_audience_file(text):
     section = "header"
     fenced = awaiting_text = False
 
-    for raw in str(text or "").split("\n"):
+    lines = str(text or "").split("\n")
+    for index, raw in enumerate(lines):
         line = raw.rstrip()
 
         if fenced:
-            if line == FENCE_CLOSE:
+            # A comment may itself contain a code fence — people paste
+            # snippets — and the first bare ``` used to end the comment there.
+            # The export's own closing fence is always followed by a blank
+            # line, the next comment, or the end of the file; a fence inside
+            # the comment is followed by more of the comment.
+            if line == FENCE_CLOSE and _closes_fence(lines, index + 1):
                 fenced = False
             else:
                 comment["text"].append(raw)

@@ -142,7 +142,12 @@ FIELDS = [
      "label": "Most of that budget reasoning may take (%)",
      "help": "Reasoning is billed from the same allowance as the answer, so a "
              "model left unbounded can spend all of it thinking and write "
-             "nothing. 0 leaves the model's own default in charge."},
+             "nothing. 0 leaves the model's own default in charge. Enforced "
+             "where the provider takes a reasoning ceiling: OpenRouter routes "
+             "that accept one, and Anthropic models up to the 4.6 generation. "
+             "Later Anthropic models and DeepSeek cannot be sent one, so there "
+             "this is advisory only — lower the reasoning effort, or pick a "
+             "non-reasoning model, to bound it."},
 
     # ------------------------------------------------------------------ creative
     {"path": ["creative", "awareness"], "kind": "choice",

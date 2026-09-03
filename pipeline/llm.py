@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -47,6 +48,23 @@ BATCH = 0.50            # Batch API discount
 
 CACHE_MIN_TOKENS = 512  # Opus 5 minimum cacheable prefix; below this it silently won't cache
 HAIKU_THINKING_BUDGET = 4096
+
+# Which Anthropic models take an explicit thinking budget. Haiku 4.5 requires
+# one; every model up to the 4.6 generation accepts one; from 4.7 on, and on
+# every 5-series model, `budget_tokens` is rejected outright and adaptive
+# thinking has no ceiling to set. A stage's reasoning cap is therefore
+# enforceable on the first group and only advisory on the second — and the
+# setting must say so rather than be shown, saved, and silently ignored.
+_ANTHROPIC_VERSION = re.compile(r"^claude-(?:opus|sonnet|haiku)-(\d+)(?:-(\d+))?")
+
+
+def anthropic_enforces_reasoning_cap(model):
+    """True when `thinking.budget_tokens` is a valid request on this model."""
+    m = _ANTHROPIC_VERSION.match(model or "")
+    if not m:
+        return False
+    major, minor = int(m.group(1)), int(m.group(2) or 0)
+    return major < 4 or (major == 4 and minor <= 6)
 
 # The maximum `max_tokens` each model will accept, per Anthropic's published
 # limits. A recovery ladder is only a ladder if its top rung can be stood on:
@@ -317,7 +335,15 @@ class Client:
         is_haiku_45 = self.model.startswith("claude-haiku-4-5")
         supports_effort = not is_haiku_45
         thinking_disabled = (effort or "").lower() == "none"
-        if is_haiku_45 and not thinking_disabled:
+        # A stage's ceiling is sent as an explicit budget wherever the model
+        # takes one, not only on Haiku: Opus and Sonnet went out as adaptive
+        # thinking with no budget and the cap did nothing. Where the model
+        # rejects budgets the cap cannot reach the wire, and that is said once.
+        explicit_cap = bool(reasoning_max_tokens) and not thinking_disabled
+        if explicit_cap and not is_haiku_45 and not anthropic_enforces_reasoning_cap(self.model):
+            self._note_unenforced_cap()
+            explicit_cap = False
+        if (is_haiku_45 or explicit_cap) and not thinking_disabled:
             requested = reasoning_max_tokens or HAIKU_THINKING_BUDGET
             # Anthropic requires at least 1,024 thinking tokens and room for an
             # answer inside max_tokens. Stage 03E uses 12k, so its default is
@@ -348,6 +374,13 @@ class Client:
         if output_config:
             p["output_config"] = output_config
         return p
+
+    def _note_unenforced_cap(self):
+        if getattr(self, "_cap_noted", False) or not self.verbose:
+            return
+        self._cap_noted = True
+        print(f"  ! {self.model} takes no explicit thinking budget; the reasoning "
+              f"cap is advisory here. Lower the reasoning effort to bound it.")
 
     def _track(self, usage):
         self.spent["in"] += getattr(usage, "input_tokens", 0) or 0

@@ -20,6 +20,7 @@ Nothing syncs automatically with an external SDK folder.
 
 | Skill | Stage | Called from | Reads | Writes |
 |---|---|---|---|---|
+| deterministic pre-pass | `ingest` | `cmd_ingest()` | raw dump | `voc/prepass_dropped.jsonl` (every rule drop, with its reason) · `voc/evidence_ids.json` (ids pinned to url+text so a re-ingest never renumbers citations) |
 | **01** filter_voc | `ingest` | `cmd_ingest()` | raw dump | `voc/retained_voc.jsonl` · `rejected_voc.jsonl` |
 | **02** deduplicate_voc | `ingest` | `cmd_ingest()` | retained | `voc/deduplicated_voc.jsonl` · `duplicate_groups.jsonl` |
 | deterministic refinement | `ingest` / `refine-voc` | `refine_voc()` | deduplicated + duplicate groups | `voc/production_voc.jsonl` · `audit_voc.jsonl` |
