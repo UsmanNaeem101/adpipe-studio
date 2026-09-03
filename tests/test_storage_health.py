@@ -188,6 +188,7 @@ class EndpointTests(HealthTests):
         class Recorder(app.Handler):
             def __init__(self):
                 self.path = "/storage"
+                self.headers = {}
 
             def _send(self, code, body, ctype="application/json", download=None):
                 captured.update(json.loads(body))

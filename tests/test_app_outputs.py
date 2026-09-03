@@ -153,7 +153,7 @@ class AppOutputTests(unittest.TestCase):
         self.assertIn("fetch('/skills')", app.PAGE)
         self.assertIn("body.skills=$('#extractskill').value", app.PAGE)
         self.assertIn("body.force=true", app.PAGE)
-        self.assertIn("--force", app.Handler._run.__code__.co_consts)
+        self.assertIn("--force", app.Handler._run_command.__code__.co_consts)
 
     def test_pipeline_exposes_force_redo_for_any_stage(self):
         self.assertIn('id=force', app.PAGE)
@@ -178,7 +178,10 @@ class AppOutputTests(unittest.TestCase):
         handler.wfile = io.BytesIO()
         proc = mock.Mock(stdout=[], returncode=0)
 
-        with mock.patch.object(app.subprocess, "Popen", return_value=proc) as popen:
+        # The project must exist to get past the name check; what is under
+        # test is the file check that follows it.
+        with mock.patch.object(app.subprocess, "Popen", return_value=proc) as popen, \
+                mock.patch.object(app, "projects", return_value=["shoulder"]):
             handler._run({
                 "stage": "refine-voc",
                 "project": "shoulder",
