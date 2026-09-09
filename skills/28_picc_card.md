@@ -16,6 +16,14 @@ is about. So the card must be right about what matters and honest about what it
 rests on. It is one model's compression of twenty dimensions, and a lossy card
 quietly drops the thing the ad should have been about.
 
+## This skill is product-agnostic
+
+Nothing in this file belongs to one product or category. The product's
+properties, what it may claim, the compliance ruleset and platform, and any
+operator notes all arrive in the prompt from the project. Where this file shows
+an example, it is the shape of a rule or a row, never a rule you should carry
+into a card for a product the example does not describe.
+
 ## The governing rule
 
 **Research dimensions are SELECTORS, not copy.** Most fields on this card never
@@ -70,8 +78,8 @@ temperature are given to you; you do not choose them from the research. What you
 do is state, in one line, what this stage means for *this* segment: what they
 already know, what they have already tried, and therefore what the ad does not
 need to explain. A problem-aware cold audience does not need to be told they
-have neck pain; a solution-aware one does not need the mechanism introduced from
-scratch.
+have the problem; a solution-aware one does not need the mechanism introduced
+from scratch.
 
 The **avatar** is a two-line person, drawn from the segment definition and the
 evidence: who they are, what their day looks like where the problem bites. Not
@@ -107,41 +115,46 @@ objection handled     18   which objection the ad pre-empts, and how cheaply
 Two of those are deliberately reasoned rather than lifted. **Bias** is not an
 extraction; state which proof and presentation the segment demonstrably responds
 to, and cite the 20 and 18 items that show it. **Mechanism reframe** must be the
-felt mechanism customers describe, not the medical one — see constraints.
+mechanism as customers describe it in 19, in their terms — never a mechanism the
+product sheet or your own knowledge supplies, and never one the project's
+compliance ruleset forbids claiming.
 
 ### Part C — constraints
 
 The product decides which angles survive before you choose one. Write them as
-rules that fire:
+rules that fire, each one derived from a property the product context states
+and a barrier or criterion the research recorded:
 
 ```
-if product <has property>        -> <barrier or compliance rule> fires
-if fit depends on one fixed height -> the position-change barrier fires
-if it carries any premium          -> the cheap-alternative barrier fires (folded towel, £2 fix)
-if it claims a medical mechanism   -> COMPLIANCE fires: felt experience only
+if product <has property>            -> <barrier from 27 / 17 / 18> fires
+if fit is fixed rather than adjustable -> the "won't fit me" barrier fires
+if it costs more than a cheap substitute -> the cheap-alternative barrier fires
+if it claims a regulated outcome        -> the project's compliance ruleset fires
 ```
 
-Draw the product properties from the product context you are given, and the
-barriers from 27, 17 and 18. Then write the honest line the concepts stage
-needs: **what the product can actually be claimed to do**, in the customer's
-acceptance terms from 17, and what it cannot. The corpus says what would make
-them buy; only the product sheet says whether it is true. A demand in the
-research is not a claim you may make.
+Those are the shapes, not the rules: the real rules come from *this* product's
+properties and *this* segment's barriers, and a card for a different category
+will have different ones. Draw the product properties from the product context
+you are given, and the barriers from 27, 17 and 18. Then write the honest line
+the concepts stage needs: **what the product can actually be claimed to do**,
+in the customer's acceptance terms from 17, and what it cannot. The corpus says
+what would make them buy; only the product sheet says whether it is true. A
+demand in the research is not a claim you may make.
 
-Compliance is non-negotiable for a health-adjacent product on Meta. Say the felt
-experience — tension that won't switch off, waking up stiff, sleeping through,
-waking recovered. Never say corrects, realigns, relieves nerve compression,
-treats or cures a named condition, or any medical-causation claim. If a primary
-barrier can only be answered with a claim that cannot be substantiated, **flag
-it on the card** — that is a sign the angle is wrong for this product, not
-permission to overclaim.
+Compliance comes from the project, not from this skill. The prompt carries the
+project's ruleset, platform and operator notes; apply them as written. Whatever
+the ruleset, one rule holds everywhere: if a primary barrier can only be
+answered with a claim that cannot be substantiated, **flag it on the card** —
+that is a sign the angle is wrong for this product, not permission to
+overclaim.
 
 ### Part D — angle space
 
 Five angles, one line each, and each one pre-grounded. An angle is *which truth
 from the research the ad leads with* — a strategic argument, not copy. Keep the
-distinction: a **concept** is an observed customer reality (the 3am pillow flip,
-the pillow graveyard); an **angle** is the argument the ad makes about it. The
+distinction: a **concept** is an observed customer reality — a recurring moment
+from 08, a drawer of abandoned purchases from 14 — and an **angle** is the
+argument the ad makes about it. The
 five should span different families — pain-led, failed-solution, desired-outcome,
 mechanism, objection-busting — and none should be a rephrasing of another.
 
@@ -151,7 +164,7 @@ For each angle, record:
 Grounded in    the dimension items it rests on, with their counts (e.g. 07 pp1 28/21 · 08 m1 18/15)
 Suits          which product properties it needs to be true
 Wrong for      which products or claims it cannot honestly carry
-Must not say   the compliance and Part C prohibitions it is nearest to
+Must not say   the Part C rules and project compliance rules it is nearest to
 ```
 
 The **primary angle** on the card is the one whose grounding is broadest and whose
@@ -197,7 +210,7 @@ research browser read the card by these names:
 ❌ re-read the comments to check a count        ✅ inherit skill numbers, items, counts and IDs
 ❌ the most vivid item on every row              ✅ the most representative item at this stage
 ❌ a VOC phrase you tidied                       ✅ word-for-word from 24, present in the evidence
-❌ a mechanism the customer did not describe     ✅ the felt mechanism from 19, as they hold it
+❌ a mechanism the customer did not describe     ✅ the mechanism from 19, as they hold it
 ❌ five angles that are one angle reworded       ✅ five families, each grounded and constrained
 ❌ an angle the product cannot carry, kept       ✅ Part C kills it and the card says so
 ❌ a field quietly invented to fill the table    ✅ `—` and the name of the thin extraction

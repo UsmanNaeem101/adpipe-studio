@@ -18,6 +18,46 @@ sys.path.insert(0, os.path.join(ROOT, "pipeline"))
 import cli  # noqa: E402
 
 
+# One category's vocabulary, from the health-adjacent qa ruleset and the
+# project the pipeline was first built on. None of it may live in a skill.
+CATEGORY_WORDS = ("pillow", "neck", "spine", "nerve", "posture", "sleep",
+                  "shoulder", "towel", "mattress")
+
+
+class ProductAgnosticTests(unittest.TestCase):
+    def test_skill_28_names_no_product_or_category(self):
+        _, body = cli.skill(28)
+        found = [w for w in CATEGORY_WORDS if w in body.lower()]
+        self.assertEqual(found, [])
+        self.assertIn("product-agnostic", body)
+
+    def test_the_ramp_rules_carry_no_category_vocabulary(self):
+        found = [w for w in CATEGORY_WORDS if w in cli.RAMP_RULES.lower()]
+        self.assertEqual(found, [])
+
+    def test_compliance_comes_from_the_project_settings(self):
+        strict = cli.compliance_rules({"compliance": {
+            "profile": "health_adjacent", "platform": "tiktok",
+            "notes": "Never mention the trial length.\nNo before/after photos."}})
+        self.assertIn("Tiktok", strict)
+        self.assertIn("health-adjacent ruleset", strict)
+        self.assertIn("Never mention the trial length.", strict)
+        self.assertIn("No before/after photos.", strict)
+
+        general = cli.compliance_rules({"compliance": {"profile": "general",
+                                                       "platform": "google"}})
+        self.assertIn("general ruleset", general)
+        self.assertNotIn("realign", general)
+        self.assertNotIn("named condition", general)
+        self.assertNotIn("Project notes", general)
+
+    def test_an_old_project_without_compliance_settings_still_gets_a_ruleset(self):
+        text = cli.ramp_rules({"name": "old"})
+        self.assertIn("SELECTORS, not copy", text)
+        self.assertIn("COMPLIANCE", text)
+        self.assertIn("FLAG IT", text)
+
+
 class PiccSkillTests(unittest.TestCase):
     def test_skill_28_resolves_and_names_the_card_sections(self):
         name, body = cli.skill(28)
@@ -32,7 +72,9 @@ class PiccSkillTests(unittest.TestCase):
 
     def test_cmd_picc_sends_both_skills_and_the_creative_settings(self):
         cfg = {"name": "t", "_dir": "/nowhere",
-               "creative": {"awareness": "solution-aware", "traffic": "warm"}}
+               "creative": {"awareness": "solution-aware", "traffic": "warm"},
+               "compliance": {"profile": "general", "platform": "meta",
+                              "notes": "Say nothing about shipping times."}}
         args = SimpleNamespace(segment="s", force=False, yes=True, product=None)
         seen = {}
 
@@ -55,6 +97,11 @@ class PiccSkillTests(unittest.TestCase):
         self.assertIn("PRODUCT", seen["prompt"])
         self.assertIn("solution-aware", seen["prompt"])
         self.assertIn("warm", seen["prompt"])
+        # The project's ruleset and notes reach the card prompt; the strict
+        # health-adjacent block does not, because this project did not ask for it.
+        self.assertIn("general ruleset", seen["prompt"])
+        self.assertIn("Say nothing about shipping times.", seen["prompt"])
+        self.assertNotIn("health-adjacent ruleset", seen["prompt"])
         self.assertTrue(seen["dest"].endswith("01_picc_card.md"))
 
 

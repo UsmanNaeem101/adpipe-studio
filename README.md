@@ -4,6 +4,16 @@ Raw Reddit VOC in, launch-ready static ads out. Product-agnostic: the pipeline,
 the ad layouts and the compliance engine are shared; everything niche-specific
 lives in `projects/<name>/`.
 
+**The product-agnostic rule, stated so it is not re-litigated:** no skill in
+`skills/`, no prompt scaffold in `pipeline/cli.py`, and no shared code may
+carry one product's or one category's claims, vocabulary or compliance rules.
+The product's properties come from its product sheet, the claims it may make
+from that sheet, and the compliance ruleset, platform and notes from the
+project's settings (`compliance.profile`, `compliance.platform`,
+`compliance.notes`) — `compliance_rules(cfg)` renders them into every strategy
+prompt. An example inside a skill file is an illustration of a shape, never a
+rule to apply to a product it does not describe.
+
 **Double-click `Ad Studio.command`** — that's the whole app, in your browser. Three
 tabs: **Remix** (upload a product photo, write a brief, choose an execution preset,
 pick reference layouts → finished ads), **Pipeline** (run any stage, watch the

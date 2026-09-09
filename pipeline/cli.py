@@ -5867,17 +5867,61 @@ visible copy: headline, support line, proof element, CTA, visual idea.
   segment              -> selects which ad exists at all
 If a dimension is showing up as literal words in the headline, that is the classic
 mistake — put it back as a selector.
-
-COMPLIANCE (health-adjacent wellness product on Meta) — non-negotiable:
-  Say: felt experience — tension that won't switch off, waking up stiff, the day's
-  tightness following you to bed, sleeping through, waking recovered.
-  Never say: corrects posture, realigns spine/neck, relieves nerve compression,
-  treats or cures any named condition, or any medical-causation claim.
-  Mechanism (19) and proof (20) are where overclaim risk concentrates — deploy the
-  FELT mechanism, not the medical one. If a barrier can only be answered with a
-  claim that cannot be substantiated, FLAG IT — that means the angle is wrong, not
-  that you may overclaim.
 """
+
+# The compliance block used to be part of RAMP_RULES and named one category's
+# claims — posture, spine, nerves — for every project, so a project selling
+# anything else was told the wrong rules with "non-negotiable" on them. The
+# README's rule is that nothing niche-specific lives outside projects/<name>/;
+# the ruleset, platform and notes come from the project's compliance settings.
+COMPLIANCE_RULES = {
+    "health_adjacent": """
+COMPLIANCE ({platform}, health-adjacent ruleset) — non-negotiable:
+  Say: the felt experience the customers describe, in their own terms — how it
+  feels, when it bites, what a good day and a bad day are like, what changes.
+  Never say: corrects, realigns, treats, cures, heals, repairs, prevents, or
+  relieves any body part, symptom or named condition; no medical-causation
+  claim; no "clinically proven", regulatory approval or professional endorsement
+  without documented substantiation.
+  Mechanism (19) and proof (20) are where overclaim risk concentrates — deploy the
+  FELT mechanism as customers hold it, not a medical one. If a barrier can only
+  be answered with a claim that cannot be substantiated, FLAG IT — that means the
+  angle is wrong, not that you may overclaim.""",
+    "general": """
+COMPLIANCE ({platform}, general ruleset) — non-negotiable:
+  Claim only what the product sheet supports. No numbers, percentages, durations
+  or comparisons that are not in the product facts or the evidence file; no
+  "proven", "guaranteed", "#1", regulatory or endorsement claims without documented
+  substantiation; no promise of an outcome the product cannot deliver for this
+  segment. If a barrier can only be answered with a claim that cannot be
+  substantiated, FLAG IT — that means the angle is wrong, not that you may
+  overclaim.""",
+}
+
+
+def compliance_rules(cfg):
+    """The compliance block for this project, from its own settings.
+
+    `profile` picks the ruleset, `platform` names where it applies, and `notes`
+    carries whatever the operator has learned about this product's claims —
+    appended verbatim, because those notes are the one place category-specific
+    rules are allowed to live.
+    """
+    comp = cfg.get("compliance") or {}
+    profile = comp.get("profile") or "health_adjacent"
+    platform = comp.get("platform") or "meta"
+    block = COMPLIANCE_RULES.get(profile, COMPLIANCE_RULES["general"])
+    text = block.format(platform=platform.capitalize())
+    notes = (comp.get("notes") or "").strip()
+    if notes:
+        text += "\n  Project notes (from the operator, apply as written):\n" + "\n".join(
+            "    " + line for line in notes.splitlines())
+    return text
+
+
+def ramp_rules(cfg):
+    """RAMP rules plus this project's compliance block, for the strategy stages."""
+    return RAMP_RULES.rstrip() + "\n" + compliance_rules(cfg) + "\n"
 
 
 def cmd_picc(cfg, args):
@@ -5919,7 +5963,7 @@ STEP 2 — Apply skill 28 to build the PICC card for ONE segment at ONE awarenes
 stage — **{cr['awareness']}**, **{cr['traffic']}** traffic — with the primary
 buying barrier taken from your step 1, then the five angles.
 
-{RAMP_RULES}
+{ramp_rules(cfg)}
 
 Output Markdown in the order and with the headings skill 28 specifies.
 """
@@ -6133,7 +6177,7 @@ For each concept:
   "hook" slot. Keep every line short enough to read at thumbnail size — a hook is
   at most ~10 words, a subhead at most ~20.
 
-{RAMP_RULES}
+{ramp_rules(cfg)}
 
 Hard constraints on slot copy:
 - Any "quote" slot MUST be verbatim from the evidence file, word for word.
@@ -6199,7 +6243,7 @@ Per brief:
   background, product, scene. It must contain NO text, NO words, NO lettering, no
   signage, no UI. Text is composited separately; image models cannot spell.
 
-{RAMP_RULES}
+{ramp_rules(cfg)}
 
 Close with a QA checklist for this specific batch: headline readable · correct
 product · no hallucinated quotes or stats · mechanism accurate to evidence · no
