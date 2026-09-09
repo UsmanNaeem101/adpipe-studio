@@ -107,7 +107,7 @@ STAGES = [
     ("refine-voc", "Deterministic VOC refinement + export",    False, False),
     ("segment",  "Stages 03-09: research segments to commercial pack", True, False),
     ("extract",  "Skills 07-26: 20 dimensions, batched",       True,  False),
-    ("picc",     "Skills 27 + 28: barriers, PICC card, 5 angles", True,  False),
+    ("picc",     "Skills 27 + 28: barriers, segment PICC card, 5 angles", True, False),
     ("concepts", "10 concepts + hooks + layouts",             True,  False),
     ("brief",    "Production briefs",                         True,  False),
     ("qa",       "Compliance gate",                           False, False),
@@ -3151,7 +3151,7 @@ const STAGES=__STAGES__;
       $('#refinevocbox').classList.toggle('hide',!showRefine);
       if(showRefine) loadRefineVocFiles();
       $('#importbox').classList.toggle('hide',s.name!=='import');
-      const wantsProduct = ['picc','concepts','brief','run'].includes(s.name);
+      const wantsProduct = ['concepts','brief','run'].includes(s.name);
       $('#prodwrap').classList.toggle('hide',!wantsProduct);
       showOpts(s.name);
       $('#runbtn').disabled=false;
@@ -4832,10 +4832,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if stage in ("brief", "run"):
             if req.get("n_briefs"):
                 cmd += ["--briefs", str(int(req["n_briefs"]))]
-        # PICC/concepts/briefs build on a specific product in this project. Forward
+        # Concepts and briefs build on a specific product in this project. Forward
         # the one the operator picked; the CLI resolves the single product when "")
-        # is sent, so multi-product projects must make an explicit choice.
-        if stage in ("picc", "concepts", "brief", "run"):
+        # is sent, so multi-product projects must make an explicit choice. The
+        # PICC card is a segment document and takes no product.
+        if stage in ("concepts", "brief", "run"):
             if option("product"):
                 cmd += ["--product", option("product")]
         if stage == "import":

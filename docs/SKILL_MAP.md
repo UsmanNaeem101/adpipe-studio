@@ -36,7 +36,7 @@ Nothing syncs automatically with an external SDK folder.
 | commercial **09** research pack | `segment` | `render_research_pack()` | Stage-07/08 artifacts | `segments/final/` |
 | **07–26** the 20 extractors | `extract` | `cmd_extract()` via `EXTRACTORS` | one evidence file | `extractions/<segment>/<skill>.md` |
 | **27** rank_buying_barriers | `picc` | `cmd_picc()` | extractions 07–26 | `output/<segment>/01_picc_card.md` |
-| **28** picc_card | `picc` | `cmd_picc()` | extractions 07–26 + skill 27 ranking + product context | `output/<segment>/01_picc_card.md` |
+| **28** picc_card | `picc` | `cmd_picc()` | extractions 07–26 + skill 27 ranking (no product — a segment document) | `output/<segment>/01_picc_card.md` |
 
 Skills 07–26 are driven by `EXTRACTORS = list(range(7, 27))` — adding a new
 extractor file to `skills/` and widening that range is all it takes to add a

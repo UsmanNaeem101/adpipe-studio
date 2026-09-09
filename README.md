@@ -12,7 +12,10 @@ from that sheet, and the compliance ruleset, platform and notes from the
 project's settings (`compliance.profile`, `compliance.platform`,
 `compliance.notes`) — `compliance_rules(cfg)` renders them into every strategy
 prompt. An example inside a skill file is an illustration of a shape, never a
-rule to apply to a product it does not describe.
+rule to apply to a product it does not describe. The PICC card (skill 28) goes
+one step further: it is a **segment** document and takes no product at all — the
+product and the compliance ruleset enter at the concepts stage, where the card's
+bar is held against what the product can honestly do.
 
 **Double-click `Ad Studio.command`** — that's the whole app, in your browser. Three
 tabs: **Remix** (upload a product photo, write a brief, choose an execution preset,
