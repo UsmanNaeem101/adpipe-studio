@@ -5925,12 +5925,19 @@ def ramp_rules(cfg):
 
 
 def cmd_picc(cfg, args):
-    """Skill 27 ranks the barriers; skill 28 builds the PICC card and 5 angles."""
+    """Skill 27 ranks the barriers; skill 28 builds the PICC card and 5 angles.
+
+    The card is a segment document. No product sheet, no Customer Truth sheet
+    and no compliance ruleset go into this prompt: the card records what the
+    segment holds, and the product is held up against it at the concepts stage,
+    which is where product_context and compliance_rules enter. A card shaped
+    around one product cannot be reused for the next, and a card softened for
+    what may be claimed no longer says what the customers said.
+    """
     _, s27 = skill(27)
     _, s28 = skill(28)
     prior = read_extractions(cfg, args.segment)
     cr = cfg["creative"]
-    seg_ctx = segment_context(cfg, args.segment, getattr(args, "product", None))
     # Two skills, one call: the card's primary barrier is the top of the
     # ranking, so producing them together keeps the two from disagreeing about
     # which barrier that is. The card's judgement lives in skills/28_picc_card.md
@@ -5942,11 +5949,6 @@ def cmd_picc(cfg, args):
 {s28}
 
 ---
-
-{product_context(cfg, product=getattr(args, "product", None))}
-
----
-{(seg_ctx + chr(10) + chr(10) + '---' + chr(10)) if seg_ctx else ''}
 
 Below are this segment's completed extraction outputs (skills 07-26).
 
@@ -5961,9 +5963,10 @@ synthesis skill: read the extraction outputs above, never re-count the raw corpu
 
 STEP 2 — Apply skill 28 to build the PICC card for ONE segment at ONE awareness
 stage — **{cr['awareness']}**, **{cr['traffic']}** traffic — with the primary
-buying barrier taken from your step 1, then the five angles.
+buying barrier taken from your step 1, then the five angles. The card is about
+the segment: no product is described here on purpose.
 
-{ramp_rules(cfg)}
+{RAMP_RULES}
 
 Output Markdown in the order and with the headings skill 28 specifies.
 """
@@ -6373,7 +6376,7 @@ def main():
             s.add_argument("--evidence", action="store_true",
                            help="read Layer 1 (the segment evidence file) instead "
                                 "of the default Layer-2 research pack")
-        if name in ("picc", "concepts", "brief", "run"):
+        if name in ("concepts", "brief", "run"):
             s.add_argument("--product", help="which product in this project to "
                                              "build on (default: the only one)")
         if name in ("concepts", "run"):

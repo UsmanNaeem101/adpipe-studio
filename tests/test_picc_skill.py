@@ -29,7 +29,7 @@ class ProductAgnosticTests(unittest.TestCase):
         _, body = cli.skill(28)
         found = [w for w in CATEGORY_WORDS if w in body.lower()]
         self.assertEqual(found, [])
-        self.assertIn("product-agnostic", body)
+        self.assertIn("about the segment, not a product", body)
 
     def test_the_ramp_rules_carry_no_category_vocabulary(self):
         found = [w for w in CATEGORY_WORDS if w in cli.RAMP_RULES.lower()]
@@ -62,7 +62,7 @@ class PiccSkillTests(unittest.TestCase):
     def test_skill_28_resolves_and_names_the_card_sections(self):
         name, body = cli.skill(28)
         self.assertEqual(name, "28_picc_card")
-        for heading in ("## Buying barriers", "## PICC card", "## Constraints",
+        for heading in ("## Buying barriers", "## PICC card", "## The bar",
                         "## Angles", "## Leads with"):
             self.assertIn(heading, body)
         # The one field the brief stage builds a hook on must be verbatim.
@@ -75,16 +75,20 @@ class PiccSkillTests(unittest.TestCase):
                "creative": {"awareness": "solution-aware", "traffic": "warm"},
                "compliance": {"profile": "general", "platform": "meta",
                               "notes": "Say nothing about shipping times."}}
-        args = SimpleNamespace(segment="s", force=False, yes=True, product=None)
+        args = SimpleNamespace(segment="s", force=False, yes=True)
         seen = {}
 
         def fake_synth(cfg_, args_, stage, prompt, dest, max_tokens=16000, **_k):
             seen.update(stage=stage, prompt=prompt, dest=dest)
             return ""
 
+        def never(*_a, **_k):
+            raise AssertionError("the PICC card takes no product or compliance input")
+
         with mock.patch.object(cli, "read_extractions", return_value="EXTRACTIONS"), \
-                mock.patch.object(cli, "segment_context", return_value=""), \
-                mock.patch.object(cli, "product_context", return_value="PRODUCT"), \
+                mock.patch.object(cli, "segment_context", side_effect=never), \
+                mock.patch.object(cli, "product_context", side_effect=never), \
+                mock.patch.object(cli, "compliance_rules", side_effect=never), \
                 mock.patch.object(cli, "synth", side_effect=fake_synth):
             cli.cmd_picc(cfg, args)
 
@@ -94,15 +98,21 @@ class PiccSkillTests(unittest.TestCase):
         self.assertIn(s27.strip(), seen["prompt"])
         self.assertIn(s28.strip(), seen["prompt"])
         self.assertIn("EXTRACTIONS", seen["prompt"])
-        self.assertIn("PRODUCT", seen["prompt"])
         self.assertIn("solution-aware", seen["prompt"])
         self.assertIn("warm", seen["prompt"])
-        # The project's ruleset and notes reach the card prompt; the strict
-        # health-adjacent block does not, because this project did not ask for it.
-        self.assertIn("general ruleset", seen["prompt"])
-        self.assertIn("Say nothing about shipping times.", seen["prompt"])
-        self.assertNotIn("health-adjacent ruleset", seen["prompt"])
+        self.assertIn("SELECTORS, not copy", seen["prompt"])
+        # A segment document: nothing about a product, no compliance ruleset.
+        # Those enter at the concepts stage, where the product is judged.
+        self.assertNotIn("COMPLIANCE", seen["prompt"])
+        self.assertNotIn("Say nothing about shipping times.", seen["prompt"])
         self.assertTrue(seen["dest"].endswith("01_picc_card.md"))
+
+    def test_concepts_still_gets_the_product_and_the_ruleset(self):
+        # The product filter moved out of the card, not out of the pipeline.
+        src = open(os.path.join(ROOT, "pipeline", "cli.py"), encoding="utf-8").read()
+        concepts = src[src.index("def cmd_concepts"):src.index("def cmd_brief")]
+        self.assertIn("product_context(", concepts)
+        self.assertIn("ramp_rules(cfg)", concepts)
 
 
 if __name__ == "__main__":
