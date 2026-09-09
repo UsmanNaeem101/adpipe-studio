@@ -107,7 +107,7 @@ STAGES = [
     ("refine-voc", "Deterministic VOC refinement + export",    False, False),
     ("segment",  "Stages 03-09: research segments to commercial pack", True, False),
     ("extract",  "Skills 07-26: 20 dimensions, batched",       True,  False),
-    ("picc",     "Skill 27 + PICC card + 5 angles",            True,  False),
+    ("picc",     "Skills 27 + 28: barriers, PICC card, 5 angles", True,  False),
     ("concepts", "10 concepts + hooks + layouts",             True,  False),
     ("brief",    "Production briefs",                         True,  False),
     ("qa",       "Compliance gate",                           False, False),

@@ -1,6 +1,6 @@
 # Where every skill file runs
 
-The original 27 numbered skills are in `skills/` and wired to stages. Stage 03 is
+The 28 numbered skills are in `skills/` and wired to stages. Stage 03 is
 now an orchestration contract with 03A/03B/03E/03C production subskills for scalable
 discovery. Verified against the code, not from memory — re-run the audit any time:
 
@@ -8,7 +8,7 @@ discovery. Verified against the code, not from memory — re-run the audit any t
 .venv/bin/python -c "
 import re,os; src=open('pipeline/cli.py').read()
 n=set(int(m) for m in re.findall(r'skill\((\d+)\)',src)) | set(range(7,27))
-print(sorted(set(range(1,28))-n) or 'all 27 wired')"
+print(sorted(set(range(1,29))-n) or 'all 28 wired')"
 ```
 
 The segmentation contracts intentionally differ from the old monolithic Skill 03.
@@ -36,6 +36,7 @@ Nothing syncs automatically with an external SDK folder.
 | commercial **09** research pack | `segment` | `render_research_pack()` | Stage-07/08 artifacts | `segments/final/` |
 | **07–26** the 20 extractors | `extract` | `cmd_extract()` via `EXTRACTORS` | one evidence file | `extractions/<segment>/<skill>.md` |
 | **27** rank_buying_barriers | `picc` | `cmd_picc()` | extractions 07–26 | `output/<segment>/01_picc_card.md` |
+| **28** picc_card | `picc` | `cmd_picc()` | extractions 07–26 + skill 27 ranking + product context | `output/<segment>/01_picc_card.md` |
 
 Skills 07–26 are driven by `EXTRACTORS = list(range(7, 27))` — adding a new
 extractor file to `skills/` and widening that range is all it takes to add a
@@ -45,7 +46,7 @@ dimension.
 
 ## Which run on the model, and why
 
-Skills 01–05 and 07–27 contain model judgement; Stage 03 now invokes four bounded
+Skills 01–05 and 07–28 contain model judgement; Stage 03 now invokes four bounded
 model subskills. Stage 06 remains code. Two special cases do not call a model:
 
 - **06 build_segment_evidence_files** is wholly mechanical — join by evidence ID,
@@ -104,7 +105,7 @@ raw dump
   → research/segments/commercial/  (commercial 07/08 catalogue + synthesis)
   → research/segments/final/       (commercial 09 human research pack)
   → extractions/<segment>/*.md      (07–26)
-  → output/<segment>/01_picc_card.md (27)
+  → output/<segment>/01_picc_card.md (27 + 28)
 ```
 
 Each segmentation chunk has an input fingerprint and skips completed work on rerun.
