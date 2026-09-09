@@ -122,6 +122,8 @@ STAGE_SKILLS = {
     "picc": [
         ("27_rank_buying_barriers.md", "27 buying barriers",
          "one ranked stack of what blocks the sale"),
+        ("28_picc_card.md", "28 PICC card",
+         "the segment's research compressed into the one page an ad is built from"),
     ],
 }
 
@@ -5879,12 +5881,23 @@ COMPLIANCE (health-adjacent wellness product on Meta) — non-negotiable:
 
 
 def cmd_picc(cfg, args):
-    """Skill 27 + the quick PICC card + 5 angles."""
+    """Skill 27 ranks the barriers; skill 28 builds the PICC card and 5 angles."""
     _, s27 = skill(27)
+    _, s28 = skill(28)
     prior = read_extractions(cfg, args.segment)
     cr = cfg["creative"]
     seg_ctx = segment_context(cfg, args.segment, getattr(args, "product", None))
+    # Two skills, one call: the card's primary barrier is the top of the
+    # ranking, so producing them together keeps the two from disagreeing about
+    # which barrier that is. The card's judgement lives in skills/28_picc_card.md
+    # rather than here, so it can be reviewed and revised like any other skill.
     prompt = f"""{s27}
+
+---
+
+{s28}
+
+---
 
 {product_context(cfg, product=getattr(args, "product", None))}
 
@@ -5902,23 +5915,13 @@ Do two things, in order.
 STEP 1 — Apply skill 27 to rank this segment's buying barriers. Skill 27 is a
 synthesis skill: read the extraction outputs above, never re-count the raw corpus.
 
-STEP 2 — Fill the quick PICC card for ONE segment at ONE awareness stage
-({cr['awareness']}, {cr['traffic']} traffic), then write 5 angles.
+STEP 2 — Apply skill 28 to build the PICC card for ONE segment at ONE awareness
+stage — **{cr['awareness']}**, **{cr['traffic']}** traffic — with the primary
+buying barrier taken from your step 1, then the five angles.
 
 {RAMP_RULES}
 
-Card fields: segment, avatar, awareness, traffic temp, pain, pain moment,
-emotional state, limiting belief, assumed solution, solution doubt, mechanism
-reframe, primary buying barrier (from your step 1), driver, bias, primary angle,
-communication style, representative VOC phrase (VERBATIM from skill 24 — it must
-appear word-for-word in the evidence file), proof, objection handled, hook
-direction, CTA, destination.
-
-Then 5 distinct angles, one line each. An angle is which truth from the research
-the ad leads with — a strategic message, not copy yet. Usual families: pain-led,
-failed-solution, desired-outcome, mechanism, objection-busting.
-
-Output Markdown: the barrier ranking, then the card as a table, then the angles.
+Output Markdown in the order and with the headings skill 28 specifies.
 """
     synth(cfg, args, "picc", prompt,
           paths.assets(cfg["_dir"], args.segment, "01_picc_card.md"), 16000)
